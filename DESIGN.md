@@ -94,9 +94,11 @@ type ChannelConfig = {
 - **Reserve**: the min-UTxO of the channel's largest continuing output (the `Closed` datum,
   holding its currency), at current parameters and with every integer at its widest encoding:
   1.73 tADA for an ADA channel, 2.13 tADA for a token one (the datum names the token too).
-- **Capacity** (x402 `balance`): for an ADA channel, the lovelace minus the reserve, because every
-  continuing output must keep its own min-UTxO; an IOU above it cannot be redeemed unilaterally,
-  so the server never accepts one. For a token channel, all its tokens: its ADA is the reserve.
+- **Capacity** (x402 `balance`): `subbed` plus what the channel can still pay out, since IOUs are
+  cumulative. An ADA channel can pay out its lovelace minus the reserve, because every
+  continuing output must keep its own min-UTxO; an IOU above capacity cannot be redeemed
+  unilaterally, so the server never accepts one. A token channel can pay out all its tokens: its
+  ADA is the reserve. (Until step 6 the code left `subbed` out; RESULTS.md step 6.)
 - **A token channel's ADA.** The validator counts only the currency: a continuing output must
   hold ADA and the currency and nothing else, but how much ADA is left to the ledger's min-UTxO.
   A redemption can therefore take the channel's ADA down to that output's exact min-UTxO. So the
@@ -213,6 +215,8 @@ Error codes: `invalid_batch_settlement_cardano_*`, reusing the EVM/SVM suffixes 
 Scope: ADA channels, reading the reference script; `deposit` (open), `voucher`, corrective 402,
 batched `claim`, cooperative `refund`. Deferred: top-up by `Add`, the manager's automatic settle
 after a unilateral close, token channels (USDM), provider-key delegation, the upstream spec text.
+Since done (RESULTS.md): token channels in step 5, the spec draft
+(`specs/scheme_batch_settlement_cardano.md`), top-ups and the automatic settle in step 6.
 
 Code, in this repo:
 - `src/x402/`: shared types and checks; client scheme (`SchemeNetworkClient`); server scheme

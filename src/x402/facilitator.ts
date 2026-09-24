@@ -5,7 +5,7 @@ import type { PaymentPayload, PaymentRequirements, SchemeNetworkFacilitator, Set
 import { Address, Data, Transaction, TransactionHash } from "@evolution-sdk/evolution";
 import { capacityOf, channelStateOf, datumBindingError, readChannel, txHashOf, verifyVoucherSignature, type ChannelView } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
-import { checkDeposit, checkInputWitnesses, checkMutual, decodeTx, sortedInputRefs, spendRedeemers, TxCheckError } from "./txcheck.ts";
+import { channelOutputIndex, checkDeposit, checkInputWitnesses, checkMutual, checkTopUp, decodeTx, sortedInputRefs, spendRedeemers, TxCheckError } from "./txcheck.ts";
 import {
   Err,
   PayloadError,
@@ -108,7 +108,43 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     }
   }
 
+  /**
+   * A top-up: a deposit on a channel that already exists, named by `voucher.channelRef`. The
+   * facilitator finds the channel open, checks the transaction's shape, has the evaluator run
+   * the validator, and answers with the channel's state before the top-up, as EVM does.
+   */
+  private async checkTopUp(p: DepositPayload, req: PaymentRequirements, extra: BatchExtra): Promise<Verified> {
+    const payer = p.channelConfig.payer;
+    const found = await this.locate(p as unknown as VoucherPayload, extra);
+    if ("ok" in found) return found;
+    const ch = found;
+    if (ch.datum.stage.kind !== "opened") return bad(Err.channelClosed, `channel is ${ch.datum.stage.kind}`, payer);
+    const cpb = await this.chain.coinsPerUtxoByte();
+    const hex = fromBase64(p.deposit.transaction);
+    const t = checkTopUp(hex, req.network, ch, BigInt(p.deposit.amount), cpb);
+    const resolved = [];
+    for (const ref of t.otherInputRefs) {
+      const u = await this.chain.getUnspent(ref);
+      if (!u) return bad(Err.depositTransaction, `input ${ref} is spent or unknown`, payer);
+      resolved.push(u.address);
+    }
+    checkInputWitnesses(t.tx, hex, resolved, Err.depositTransaction);
+    try {
+      await this.chain.evaluate(hex);
+    } catch (e) {
+      return bad(Err.depositTransaction, `evaluation: ${(e as Error).message}`, payer);
+    }
+    const ceiling = BigInt(p.voucher.maxClaimableAmount);
+    if (ceiling > t.capacity) return bad(Err.cumulativeExceedsBalance, `voucher ${ceiling} exceeds capacity ${t.capacity} after the top-up`, payer);
+    if (ceiling <= ch.datum.stage.subbed) return bad(Err.cumulativeBelowClaimed, `voucher ${ceiling} is not above what was redeemed`, payer);
+    if (!verifyVoucherSignature(p.channelConfig.payerAuthorizer, p.voucher.channelId, ceiling, p.voucher.signature)) {
+      return bad(Err.voucherSignature, "voucher signature does not verify", payer);
+    }
+    return { ok: true, payer, extra: { ...channelStateOf(ch, cpb) } };
+  }
+
   private async checkDeposit(p: DepositPayload, req: PaymentRequirements, extra: BatchExtra): Promise<Verified> {
+    if (p.voucher.channelRef) return this.checkTopUp(p, req, extra);
     const cpb = await this.chain.coinsPerUtxoByte();
     const hex = fromBase64(p.deposit.transaction);
     const d = checkDeposit(hex, req.network, p.channelConfig, p.voucher.channelId, extra.scriptHash, BigInt(p.deposit.amount), cpb);
@@ -206,7 +242,7 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     const hex = fromBase64(p.deposit.transaction);
     const { txHash, confirmed } = await this.broadcast(hex);
     if (!confirmed) return { success: false, errorReason: SETTLEMENT_PENDING, transaction: txHash, network: req.network, payer };
-    const index = checkDeposit(hex, req.network, p.channelConfig, p.voucher.channelId, parseExtra(req).scriptHash, BigInt(p.deposit.amount), await this.chain.coinsPerUtxoByte()).outputIndex;
+    const index = channelOutputIndex(decodeTx(hex, Err.depositTransaction), parseExtra(req).scriptHash);
     const ch = await this.chain.followChannel(`${txHash}#${index}`, parseExtra(req).scriptHash, p.voucher.channelId);
     if (!ch) return { success: false, errorReason: Err.channelNotFound, errorMessage: "the opened channel is not readable", transaction: txHash, network: req.network, payer };
     return {
@@ -241,7 +277,7 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
   }
 
   /**
-   * A server-signed `Sub` over one or more channels: every spent channel of this script is
+   * A server-signed claim (`Sub`, or `Settle` for a closed channel) over one or more channels: every spent channel of this script is
    * redeemed through `Main`/`Defer`, never `Mutual`; the evaluator must accept every script.
    * The facilitator broadcasts and reports where each channel now sits.
    */

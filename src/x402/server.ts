@@ -165,6 +165,8 @@ interface RequestContext {
 type Payload = DeepReadonly<PaymentPayload>;
 
 const MIN_PENDING_TTL_MS = 5_000;
+/** How often a voucher above a channel's recorded balance may send the server back to the chain. */
+const RESYNC_MS = 30_000;
 const MAX_PENDING_TTL_MS = 10 * 60_000;
 
 export class BatchSettlementCardanoServer implements SchemeNetworkServer {
@@ -175,6 +177,8 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   readonly withdrawDelay: number;
   readonly storage: ChannelStorage;
   private readonly ttlMs: number;
+  /** When each channel was last re-read for a voucher above its recorded balance. */
+  private readonly resyncedAt = new Map<string, number>();
   private readonly contexts = new WeakMap<object, RequestContext>();
 
   constructor(private readonly config: ServerConfig) {
@@ -250,7 +254,7 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
         return { abort: true as const, reason: Err.cumulativeAmountMismatch, message: "voucher does not follow the server's count" };
       }
       this.merge(payload, { channelId, pendingId: randomUUID(), channelSnapshot: snapshot });
-      if (p.type === "voucher" && snapshot && this.fresh(snapshot)) {
+      if (p.type === "voucher" && snapshot && this.fresh(snapshot) && !this.resync(snapshot, p.voucher.maxClaimableAmount)) {
         const result = this.verifyLocally(p.channelConfig, p.voucher.maxClaimableAmount, p.voucher.signature, snapshot);
         this.merge(payload, { localVerify: true });
         return { skip: true as const, result };
@@ -457,6 +461,20 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
 
   stateOf(ch: ServerChannel): ChannelState {
     return { channelId: ch.channelId, channelRef: ch.channelRef, balance: ch.balance, totalClaimed: ch.totalClaimed, withdrawRequestedAt: ch.withdrawRequestedAt };
+  }
+
+  /**
+   * A voucher above the recorded balance may follow a top-up this server has not seen: one that
+   * reached a block after its request gave up, or an `Add` made outside x402. The facilitator
+   * then reads the channel (and the balance is taken from what it finds), at most once per
+   * RESYNC_MS for each channel; otherwise the voucher is refused locally.
+   */
+  private resync(ch: ServerChannel, ceiling: string): boolean {
+    if (BigInt(ceiling) <= BigInt(ch.balance)) return false;
+    const now = Date.now();
+    if (now - (this.resyncedAt.get(ch.channelId) ?? 0) < RESYNC_MS) return false;
+    this.resyncedAt.set(ch.channelId, now);
+    return true;
   }
 
   private fresh(ch: ServerChannel) {

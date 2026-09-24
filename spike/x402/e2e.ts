@@ -6,29 +6,35 @@
 //   pay [n]     n paid requests (default 200); the first opens the channel
 //   claim       the server redeems what it charged, one Sub through the facilitator
 //   corrective  the client's count is knocked one request off, both ways; the 402 resyncs it
-//   refund      claim, then the client closes the channel with Mutual
+//   refund [dir]  claim, then the client closes the channel with Mutual (dir: whose channels, default client)
 //   batch       10 more channels; claims of N = 10, 5 and 1 channels per transaction
 //   batch-refund  close the 10 batch channels with Mutual
+//   topup       a channel with room for 10 requests serves 15: a claim after the 5th, a top-up (Add) at the 11th
+//   autosettle  the consumer closes a channel alone; the server's watcher settles it; the consumer ends it
 //   report      every transaction's fee, and the wallets reconciled
 //
-// Usage: npm run x402 -- <phase|all>
+// Usage: npm run x402 -- <phase|all>   (`all` is step 4's sequence; topup and autosettle run on their own)
 // Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID; SUBBIT_CURRENCY=token prices the
-//        route in the sUSDM stand-in (`npm run mint -- mint`) instead of lovelace, state in out/x402-token/
+//        route in the sUSDM stand-in (`npm run mint -- mint`) instead of lovelace, state in out/x402-token/;
+//        X402_OUT=<name> keeps a run's state in out/<name>/ instead
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { rmSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { x402Facilitator } from "@x402/core/facilitator";
 import { HTTPFacilitatorClient, x402HTTPResourceServer, x402ResourceServer, type HTTPAdapter, type RoutesConfig } from "@x402/core/server";
-import { decodePaymentResponseHeader } from "@x402/core/http";
+import { decodePaymentRequiredHeader, decodePaymentResponseHeader } from "@x402/core/http";
+import type { PaymentRequirements } from "@x402/core/types";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
-import { Address, Assets } from "@evolution-sdk/evolution";
-import { SUBBIT_HASH } from "../../src/subbit.ts";
+import { Address, Assets, KeyHash } from "@evolution-sdk/evolution";
+import { Redeemer, Step, SUBBIT_HASH, inlineDatum, subbitScript, type Stage } from "../../src/subbit.ts";
+import { capacityOf, valueFor, type ChannelView } from "../../src/x402/cardano.ts";
 import { BlockfrostChain } from "../../src/x402/chain.ts";
-import { BatchSettlementCardanoClient, FileClientStorage, type ClientChannel } from "../../src/x402/client.ts";
+import { BatchSettlementCardanoClient, FileClientStorage, collateralTarget, signIou, signedHex, type ClientChannel } from "../../src/x402/client.ts";
 import { BatchSettlementCardanoFacilitator } from "../../src/x402/facilitator.ts";
 import { ChannelManager, type ClaimResult } from "../../src/x402/manager.ts";
 import { BatchSettlementCardanoServer, FileChannelStorage, walletProviderSigner } from "../../src/x402/server.ts";
-import { REF_STATE, BF_BASE, ada, bf, consumer, keyHashHex, load, log, must, provider, run, save } from "../chain.ts";
+import { Err, parseExtra, toBase64, type DepositPayload } from "../../src/x402/types.ts";
+import { REF_STATE, BF_BASE, ada, bf, consumer, expectEq, iso, keyHashHex, load, log, must, provider, run, save, scriptsFailed } from "../chain.ts";
 import { TOKEN, amountOf, token, unitName } from "../currency.ts";
 
 const NETWORK = "cardano:preprod" as const;
@@ -36,7 +42,7 @@ const PRICE = 1_000n;
 const FAC_PORT = 7413;
 const RES_PORT = 7411;
 const URL_DATA = `http://127.0.0.1:${RES_PORT}/data`;
-const OUT = new URL(TOKEN ? "../../out/x402-token/" : "../../out/x402/", import.meta.url);
+const OUT = new URL(`../../out/${process.env.X402_OUT ?? (TOKEN ? "x402-token" : "x402")}/`, import.meta.url);
 const ASSET = TOKEN ? token!.unit : "lovelace";
 const dir = (p: string) => fileURLToPath(new URL(p, OUT));
 const RESULTS = new URL("results.json", OUT);
@@ -56,6 +62,20 @@ interface Results {
   corrective?: Array<{ direction: string; httpCalls: number; ok: boolean }>;
   refunds?: Array<{ channelId: string; transaction: string }>;
   deposits?: Array<{ channelId: string; transaction: string }>;
+  topUps?: Array<{ channelId: string; transaction: string; ms: number; httpCalls: number; capacityBefore: string; capacityAfter: string }>;
+  /** The consumer's own transactions outside x402. */
+  exits?: Array<{ what: "close" | "end"; channelId: string; transaction: string }>;
+  autosettle?: { channelId: string; close: string; settle: string; end: string; closeToSettleSec: number; settleBeforeElapseSec: number; watchIntervalMs: number };
+  checks?: Array<{ phase: string; what: string; outcome: string }>;
+  /** Wallet housekeeping during the run (a `mint -- tidy`), so the report counts its fee. */
+  other?: Array<{ what: string; transaction: string }>;
+}
+
+/** Loads the results, applies `f`, saves: phases that call other phases never write over each other. */
+function record(f: (r: Results) => void) {
+  const r = load<Results>(RESULTS);
+  f(r);
+  save(RESULTS, r);
 }
 
 const chain = new BlockfrostChain(NETWORK, BF_BASE, must("BLOCKFROST_PROJECT_ID"));
@@ -133,6 +153,7 @@ async function stack() {
     payTo,
     storage,
     manager,
+    facilitator,
     close: async () => {
       await new Promise((r) => facServer.close(r));
       await new Promise((r) => resServer.close(r));
@@ -143,9 +164,9 @@ async function stack() {
 type Stack = Awaited<ReturnType<typeof stack>>;
 
 /** A paying client with its own channel store, counting the HTTP calls it makes. */
-function payer(storageDir: string, capacity: bigint) {
+function payer(storageDir: string, capacity: bigint, spent = spentInputs) {
   const storage = new FileClientStorage(dir(storageDir));
-  const scheme = new BatchSettlementCardanoClient({ wallet: consumer, storage, chain, capacity, maxDeposit: 20_000_000n, spentInputs });
+  const scheme = new BatchSettlementCardanoClient({ wallet: consumer, storage, chain, capacity, maxDeposit: 20_000_000n, spentInputs: spent });
   const client = x402Client.fromConfig({ schemes: [{ network: "cardano:*", client: scheme }], spendControls: false });
   let calls = 0;
   const counting: typeof fetch = (input, init) => {
@@ -275,12 +296,214 @@ async function phaseBatchRefund(s: Stack) {
   for (let i = 0; i < 10; i++) await phaseRefund(s, `batch/${i}`);
 }
 
+// ---- step 6: top-ups, and the consumer's own exit ---------------------------------------
+
+/**
+ * A channel with room for 10 requests serves 15. After the 5th the server claims, so the top-up
+ * comes after a redemption: request 11 finds the channel short and tops it up with `Add`, on the
+ * same channel id. Just before, `topUpChecks` has the facilitator look at that top-up without
+ * sending it. Then the server claims and the client takes the rest back.
+ */
+async function phaseTopUp(s: Stack) {
+  const before = await walletsAda();
+  record((r) => (r.before ??= before));
+  const p = payer("topup", 10n * PRICE);
+  let channelId = (await p.storage.list()).find((c) => c.status === "open")?.channelId ?? "";
+  let topUps = 0;
+  for (let i = 1; i <= 15; i++) {
+    const was = channelId ? await p.storage.get(channelId) : undefined;
+    const short = was !== undefined && BigInt(was.chargedCumulativeAmount) + PRICE > BigInt(was.balance);
+    if (short) await topUpChecks(s, was);
+    p.reset();
+    const t0 = performance.now();
+    const settle = await paid(p);
+    const ms = performance.now() - t0;
+    const state = settle.extra?.channelState as { channelId: string } | undefined;
+    if (!was) {
+      channelId = state?.channelId ?? "";
+      const opened = (await p.storage.get(channelId))!;
+      record((r) => (r.deposits ??= []).push({ channelId, transaction: settle.transaction }));
+      log(`topup: request ${i} opened channel ${channelId.slice(0, 16)}… in ${settle.transaction}, room for ${BigInt(opened.balance) / PRICE} requests`);
+    } else if (short) {
+      if (!settle.transaction) throw new Error(`request ${i} should have topped the channel up`);
+      expectEq("the top-up keeps the channel id", state?.channelId, channelId);
+      const now = (await p.storage.get(channelId))!;
+      const server = (await s.storage.get(channelId))!;
+      const view = (await chain.followChannel(server.channelRef, SUBBIT_HASH, channelId))!;
+      expectEq("the channel now sits at the top-up's output", server.channelRef.split("#")[0], settle.transaction);
+      expectEq("client and server agree on the new capacity", now.balance, server.balance);
+      expectEq("the capacity grew by the deposit", BigInt(now.balance) - BigInt(was.balance), BigInt(now.deposit) - BigInt(was.deposit));
+      expectEq("the chain agrees on the capacity", capacityOf(view, await chain.coinsPerUtxoByte()).toString(), now.balance);
+      topUps++;
+      record((r) =>
+        (r.topUps ??= []).push({ channelId, transaction: settle.transaction, ms, httpCalls: p.calls(), capacityBefore: was.balance, capacityAfter: now.balance }),
+      );
+      log(`topup: request ${i} topped channel ${channelId.slice(0, 16)}… up in ${settle.transaction} (${(ms / 1000).toFixed(1)} s, ${p.calls()} HTTP calls): room for ${BigInt(was.balance) / PRICE} → ${BigInt(now.balance) / PRICE} requests`);
+    } else if (settle.transaction !== "") throw new Error(`request ${i} settled on chain: ${settle.transaction}`);
+    if (i === 5) await phaseClaim(s, "claim before top-up", { channelIds: [channelId] });
+  }
+  const client = (await p.storage.get(channelId))!;
+  const server = (await s.storage.get(channelId))!;
+  expectEq("client and server count the same 15 requests", client.chargedCumulativeAmount, server.chargedCumulativeAmount);
+  log(`topup: 15 requests on one channel with ${topUps} top-up; charged ${ada(BigInt(server.chargedCumulativeAmount))} ${unitName}`);
+  await phaseRefund(s, "topup");
+}
+
+/**
+ * Before the first top-up goes out: a second client on the same records builds it without
+ * sending it, and the facilitator is asked about it (verify only, nothing is submitted). It
+ * accepts the top-up as built; refuses it with the deposit declared one unit high, or with the
+ * voucher one unit past the capacity the top-up makes; and a top-up whose datum records one
+ * unit more as redeemed is refused, by the validator if the evaluator says so, else by the
+ * facilitator's own datum rule.
+ */
+async function topUpChecks(s: Stack, ch: ClientChannel) {
+  // Its own spent-input list: what it builds is never sent, so the real top-up may reuse those inputs.
+  const probe = payer("topup", 10n * PRICE, new Map());
+  const req = await requirements();
+  const made = (await probe.scheme.createPaymentPayload(2, req)).payload as unknown as DepositPayload;
+  if (made.type !== "deposit" || !made.voucher.channelRef) throw new Error("expected a top-up");
+  const verify = (pl: DepositPayload) => s.facilitator.verify({ x402Version: 2, accepted: req, payload: pl as unknown as Record<string, unknown> }, req);
+  const note = (what: string, outcome: string) => {
+    log(`  ok  ${outcome}: ${what}`);
+    record((r) => (r.checks ??= []).push({ phase: "topup", what, outcome }));
+  };
+  const control = await verify(made);
+  if (!control.isValid) throw new Error(`the facilitator refused the top-up as built: ${control.invalidReason} ${control.invalidMessage ?? ""}`);
+  const add = BigInt(made.deposit.amount);
+  const after = BigInt(ch.balance) + add;
+  note(`the top-up as the client built it: Main([Add]), ${ada(add)} ${unitName} more, voucher for request ${BigInt(made.voucher.maxClaimableAmount) / PRICE}`, "accepted");
+  const refusedFor = async (what: string, pl: DepositPayload, reason: string) => {
+    const v = await verify(pl);
+    if (v.isValid) throw new Error(`${what}: the facilitator accepted it`);
+    if (v.invalidReason !== reason) throw new Error(`${what}: refused as ${v.invalidReason} (${v.invalidMessage ?? ""}), expected ${reason}`);
+    note(what, `refused, ${reason.replace("invalid_batch_settlement_cardano_", "")}`);
+  };
+  await refusedFor(`the deposit declares ${ada(add + 1n)}, one unit more than the transaction adds`, { ...made, deposit: { ...made.deposit, amount: (add + 1n).toString() } }, Err.depositTransaction);
+  await refusedFor(
+    `the voucher is for ${ada(after + 1n)}, one unit past the ${ada(after)} the top-up makes room for`,
+    { ...made, voucher: { ...made.voucher, maxClaimableAmount: (after + 1n).toString(), signature: signIou(ch, after + 1n) } },
+    Err.cumulativeExceedsBalance,
+  );
+  const view = (await chain.followChannel(made.voucher.channelRef, SUBBIT_HASH, ch.channelId))!;
+  if (view.datum.stage.kind !== "opened") throw new Error("the channel is not open");
+  const what = `a top-up whose datum records subbed = ${view.datum.stage.subbed + 1n}, one unit more than the channel's`;
+  let hex: string | undefined;
+  try {
+    hex = await buildTopUp(view, add, { kind: "opened", subbed: view.datum.stage.subbed + 1n }, parseExtra(req).referenceScript);
+  } catch (e) {
+    if (!scriptsFailed(e)) throw e;
+  }
+  if (hex === undefined) note(what, "refused by the validator");
+  else await refusedFor(`${what} (the validator accepts it)`, { ...made, deposit: { ...made.deposit, transaction: toBase64(hex) } }, Err.depositTransaction);
+}
+
+/** The consumer's `Main([Add])` on `view` with a datum of the caller's choosing; built and signed, not sent. */
+async function buildTopUp(view: ChannelView, add: bigint, stage: Stage, referenceScript?: string): Promise<string> {
+  const me = await consumer.address();
+  let tx = consumer.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.add()]) });
+  const ref = referenceScript ? await chain.getUnspent(referenceScript) : undefined;
+  tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
+  tx = tx
+    .payToAddress({ address: view.address, assets: valueFor(view.datum.constants.currency, view.amount + add, view.lovelace), datum: inlineDatum(view.datum.constants, stage) })
+    .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(me)) });
+  const all = await consumer.getWalletUtxos();
+  const adaOnly = all.filter((u) => Assets.hasOnlyLovelace(u.assets));
+  return signedHex(await tx.build({ changeAddress: me, availableUtxos: all, setCollateral: collateralTarget(adaOnly) }));
+}
+
+/**
+ * The consumer closes a channel alone, outside x402 (`Main([Close])`). The server's watcher
+ * sees the close on a later pass, refuses the channel's vouchers from then on, and settles the
+ * latest one (`Main([Settle])`) long before elapse_at; the consumer then ends the channel
+ * (`Main([End])`) and takes the rest back.
+ */
+async function phaseAutoSettle(s: Stack) {
+  const before = await walletsAda();
+  record((r) => (r.before ??= before));
+  const p = payer("autosettle", 20n * PRICE);
+  let ch = (await p.storage.list()).find((c) => c.status === "open" || c.status === "closing");
+  if (!ch) {
+    for (let i = 1; i <= 12; i++) {
+      const settle = await paid(p);
+      if (i > 1) continue;
+      const id = (settle.extra?.channelState as { channelId: string }).channelId;
+      record((r) => (r.deposits ??= []).push({ channelId: id, transaction: settle.transaction }));
+      log(`autosettle: request 1 opened channel ${id.slice(0, 16)}… in ${settle.transaction}`);
+    }
+    ch = (await p.storage.list()).find((c) => c.status === "open")!;
+    log(`autosettle: 12 requests paid, ${ada(BigInt(ch.chargedCumulativeAmount))} ${unitName} charged, none of it claimed`);
+  }
+  const channelId = ch.channelId;
+  const charged = BigInt(ch.chargedCumulativeAmount);
+  const intervalMs = 15_000;
+  const got: { settled?: ClaimResult } = {};
+  const watcher = s.manager.watch({
+    intervalMs,
+    onEvent: (e) => {
+      if (e.kind === "closed") log(`autosettle: watcher: ${e.channelId.slice(0, 16)}… closed by its consumer, elapse_at ${iso(e.elapseAt)}; its vouchers are refused from here on`);
+      else if (e.kind === "settled") {
+        for (const x of e.results) log(`autosettle: watcher: settled ${x.channels.length} channel(s) in ${x.transaction}`);
+        got.settled ??= e.results.find((x) => x.channels.some((c) => c.channelId === channelId));
+      } else if (e.kind === "gone") log(`autosettle: watcher: ${e.channelId.slice(0, 16)}… needs nothing more from the server; record dropped`);
+      else log(`autosettle: watcher: a pass failed, the next one retries: ${String((e.error as Error)?.message ?? e.error).slice(0, 240)}`);
+    },
+  });
+  let close: string;
+  let elapseAt: bigint;
+  try {
+    if (ch.status === "open") {
+      ({ transaction: close, elapseAt } = await p.scheme.close(channelId));
+      record((r) => (r.exits ??= []).push({ what: "close", channelId, transaction: close }));
+    } else {
+      close = load<Results>(RESULTS).exits?.find((x) => x.channelId === channelId && x.what === "close")?.transaction ?? "";
+      elapseAt = BigInt(ch.elapseAt!);
+    }
+    log(`autosettle: the consumer closed ${channelId.slice(0, 16)}… alone in ${close}; elapse_at ${iso(elapseAt)}`);
+    const deadline = Date.now() + 12 * 60_000;
+    while (!got.settled && Date.now() < deadline) await new Promise((res) => setTimeout(res, 3_000));
+  } finally {
+    watcher.stop();
+  }
+  if (!got.settled) throw new Error("the watcher did not settle the channel within 12 minutes");
+  const settle = got.settled.transaction;
+  const row = got.settled.channels.find((c) => c.channelId === channelId)!;
+  record((r) => (r.claims ??= []).push({ phase: "auto-settle", n: got.settled!.channels.length, transaction: settle }));
+  const [ct, st] = [await bf(`/txs/${close}`), await bf(`/txs/${settle}`)];
+  const closeToSettleSec = Number(st.block_time) - Number(ct.block_time);
+  const settleBeforeElapseSec = Number(elapseAt / 1000n) - Number(st.block_time);
+  expectEq("the settle took everything charged", row.taken, charged);
+  expectEq("the server dropped its record", await s.storage.get(channelId), undefined);
+  const { view } = await p.scheme.openView(channelId);
+  expectEq("the channel is settled on chain", view.datum.stage.kind, "settled");
+  log(`autosettle: the settle landed ${closeToSettleSec} s after the close, ${(settleBeforeElapseSec / 60).toFixed(1)} min before elapse_at; it took ${ada(row.taken)} ${unitName}`);
+  const end = await p.scheme.end(channelId);
+  record((r) => {
+    (r.exits ??= []).push({ what: "end", channelId, transaction: end });
+    r.autosettle = { channelId, close, settle, end, closeToSettleSec, settleBeforeElapseSec, watchIntervalMs: intervalMs };
+  });
+  log(`autosettle: the consumer ended ${channelId.slice(0, 16)}… in ${end}: ${ada(view.amount)} ${unitName}${TOKEN ? ` and ${ada(view.lovelace)} tADA` : ""} back`);
+}
+
+/** The route's payment requirements, as its 402 states them. */
+async function requirements(): Promise<PaymentRequirements> {
+  const res = await fetch(URL_DATA);
+  await res.text();
+  if (res.status !== 402) throw new Error(`expected a 402, got ${res.status}`);
+  const accept = decodePaymentRequiredHeader(res.headers.get("PAYMENT-REQUIRED") ?? "").accepts.find((a) => a.scheme === "batch-settlement");
+  if (!accept) throw new Error("no batch-settlement option");
+  return accept;
+}
+
 async function phaseReport() {
   const r = load<Results>(RESULTS);
   const txs = [
     ...(r.deposits ?? []).map((d) => ["deposit", d.transaction] as const),
+    ...(r.topUps ?? []).map((t) => ["top-up", t.transaction] as const),
     ...(r.claims ?? []).map((c) => [`${c.phase} (${c.n})`, c.transaction] as const),
     ...(r.refunds ?? []).map((f) => ["refund", f.transaction] as const),
+    ...(r.exits ?? []).map((x) => [x.what, x.transaction] as const),
+    ...(r.other ?? []).map((x) => [x.what, x.transaction] as const),
   ];
   let fees = 0n;
   for (const [what, hash] of txs) {
@@ -327,10 +550,10 @@ async function settledWallets() {
 async function openChannelValue(): Promise<{ lovelace: bigint; amount: bigint }> {
   let lovelace = 0n;
   let amount = 0n;
-  for (const d of ["client", ...Array.from({ length: 10 }, (_, i) => `batch/${i}`)]) {
+  for (const d of ["client", "topup", "autosettle", ...Array.from({ length: 10 }, (_, i) => `batch/${i}`)]) {
     if (!existsSync(dir(d))) continue;
     for (const c of await new FileClientStorage(dir(d)).list()) {
-      if (c.status !== "open" || !c.channelRef) continue;
+      if ((c.status !== "open" && c.status !== "closing") || !c.channelRef) continue;
       const v = await chain.followChannel(c.channelRef, SUBBIT_HASH, c.channelId);
       if (v) {
         lovelace += v.lovelace;
@@ -393,9 +616,11 @@ async function main() {
     if (phase === "pay" || phase === "all") await phasePay(s, Number(process.argv[3] ?? 200));
     if (phase === "claim" || phase === "all") await phaseClaim(s);
     if (phase === "corrective" || phase === "all") await phaseCorrective(s);
-    if (phase === "refund" || phase === "all") await phaseRefund(s);
+    if (phase === "refund" || phase === "all") await phaseRefund(s, phase === "refund" ? (process.argv[3] ?? "client") : "client");
     if (phase === "batch" || phase === "all") await phaseBatch(s);
     if (phase === "batch-refund" || phase === "all") await phaseBatchRefund(s);
+    if (phase === "topup") await phaseTopUp(s);
+    if (phase === "autosettle") await phaseAutoSettle(s);
     if (phase === "report" || phase === "all") await phaseReport();
   } finally {
     await s.close();

@@ -15,9 +15,24 @@ import type {
   SettleResponse,
 } from "@x402/core/types";
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
-import { Address, Assets, Client, KeyHash, ScriptHash, Transaction, TransactionHash, TransactionInput, TransactionWitnessSet, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
-import { Redeemer, channelAddress, iouBody, inlineDatum, newIouSigner, subbitScript, tagFromInput } from "../subbit.ts";
-import { amountIn, channelReserve, constantsOf, currencyOf, networkIdOf, refOf, txHashOf, valueFor, verifyVoucherSignature } from "./cardano.ts";
+import { Address, Assets, Client, InlineDatum, KeyHash, ScriptHash, Transaction, TransactionHash, TransactionInput, TransactionWitnessSet, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
+import { Redeemer, Step, channelAddress, iouBody, inlineDatum, newIouSigner, subbitScript, tagFromInput } from "../subbit.ts";
+import {
+  amountIn,
+  capacityOf,
+  channelReserve,
+  constantsOf,
+  currencyOf,
+  msOfSlot,
+  networkIdOf,
+  onlyCurrency,
+  refOf,
+  slotOfMs,
+  txHashOf,
+  valueFor,
+  verifyVoucherSignature,
+  type ChannelView,
+} from "./cardano.ts";
 import { retryQueries, type Chain } from "./chain.ts";
 import {
   Err,
@@ -49,13 +64,19 @@ export interface ClientChannel {
   deposit: string;
   balance: string;
   chargedCumulativeAmount: string;
-  /** `failed`: the opening transaction never reached the chain. */
-  status: "pending" | "open" | "closed" | "failed";
+  /** `failed`: the opening transaction never reached the chain. `closing`: closed on chain by this client, not yet ended. */
+  status: "pending" | "open" | "closing" | "closed" | "failed";
   openTx?: string;
   /** Position of the channel output in the opening transaction, and the inputs it spends. */
   openIndex?: number;
   openInputs?: string[];
   openedAt: number;
+  /** What the unilateral exit needs without a server: where the channel lives. */
+  network?: string;
+  scriptHash?: string;
+  referenceScript?: string;
+  /** Set once this client has closed the channel on its own. */
+  elapseAt?: string;
 }
 
 /** `{dir}/{channelId}.json`. The throwaway IOU keys live here, so the directory stays out of git. */
@@ -124,18 +145,57 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const amount = BigInt(req.amount);
     let ch = await this.o.storage.current(serverKey(req, extra));
     if (ch?.status === "pending") ch = await this.settlePending(ch, extra);
-    if (ch?.status === "open" && BigInt(ch.chargedCumulativeAmount) + amount <= BigInt(ch.balance)) {
+    if (ch?.status === "open") {
       const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
-      return {
-        x402Version,
-        payload: {
-          type: "voucher",
-          channelConfig: ch.channelConfig,
-          voucher: { channelId: ch.channelId, maxClaimableAmount: ceiling.toString(), signature: signIou(ch, ceiling), ...(ch.channelRef ? { channelRef: ch.channelRef } : {}) },
-        },
-      };
+      if (ceiling <= BigInt(ch.balance)) return { x402Version, payload: voucherPayload(ch, ceiling) };
+      // Short of capacity. Read the channel first: a top-up that landed late may already cover it.
+      const view = ch.channelRef ? await this.o.chain.followChannel(ch.channelRef, extra.scriptHash, ch.channelId) : undefined;
+      if (view && view.datum.stage.kind === "opened") {
+        const capacity = capacityOf(view, await this.o.chain.coinsPerUtxoByte());
+        if (capacity.toString() !== ch.balance || view.ref !== ch.channelRef) {
+          ch = { ...ch, balance: capacity.toString(), channelRef: view.ref };
+          await this.o.storage.set(ch);
+        }
+        if (ceiling <= capacity) return { x402Version, payload: voucherPayload(ch, ceiling) };
+        return { x402Version, payload: await this.topUp(req, extra, ch, view, amount) };
+      }
+      await this.o.storage.set({ ...ch, status: "closed" }); // gone from under us: open a new one
     }
     return { x402Version, payload: await this.openChannel(req, extra, amount) };
+  }
+
+  /**
+   * A deposit on the channel that already exists: `Main([Add])` on its current position, the
+   * same datum, and more of the currency; the voucher covers this request on the larger capacity.
+   */
+  private async topUp(req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, amount: bigint) {
+    const w = this.o.wallet;
+    const me = await w.address();
+    const add = [this.o.capacity ?? 0n, extra.minDeposit ? BigInt(extra.minDeposit) : 0n, 10n * amount].reduce((a, b) => (a > b ? a : b));
+    // Only UTxOs holding ADA and the channel's currency: coin selection would otherwise carry any
+    // other tokens the wallet holds into the change, at about 35 bytes each.
+    const available = (await this.available()).filter((u) => onlyCurrency(u.assets, view.datum.constants.currency));
+    const adaOnly = available.filter((u) => Assets.hasOnlyLovelace(u.assets));
+    let tx = w.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.add()]) });
+    tx = await this.withValidator(tx, extra.referenceScript);
+    tx = tx
+      .payToAddress({ address: view.address, assets: valueFor(view.datum.constants.currency, view.amount + add, view.lovelace), datum: view.utxo.datumOption as InlineDatum.InlineDatum })
+      .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
+    const sb = await retryQueries("top-up", () => tx.build({ changeAddress: me, availableUtxos: available, setCollateral: collateralTarget(adaOnly) }));
+    const signed = await signedHex(sb);
+    for (const i of Transaction.fromCBORHex(signed).body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
+    const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
+    return {
+      type: "deposit",
+      channelConfig: ch.channelConfig,
+      voucher: { channelId: ch.channelId, maxClaimableAmount: ceiling.toString(), signature: signIou(ch, ceiling), channelRef: view.ref },
+      deposit: { amount: add.toString(), transaction: toBase64(signed) },
+    };
+  }
+
+  private async withValidator(tx: ReturnType<SeedWallet["newTx"]>, referenceScript?: string) {
+    const ref = referenceScript ? await this.o.chain.getUnspent(referenceScript) : undefined;
+    return ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
   }
 
   /**
@@ -176,11 +236,12 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       token: req.asset,
       withdrawDelay: extra.withdrawDelay,
     };
-    const available = await this.available();
+    const cur = currencyOf(req.asset);
+    // As for a top-up, only UTxOs holding ADA and the currency, so no other token rides along.
+    const available = (await this.available()).filter((u) => onlyCurrency(u.assets, cur));
     // The tag can come from any input the opening spends. A token channel seeds from a UTxO that
     // holds the token, which is spent anyway; an ADA channel from the largest ADA-only UTxO. That
     // keeps openings from using up the ADA-only UTxOs that collateral comes from.
-    const cur = currencyOf(req.asset);
     const size = (u: UTxO.UTxO) => (cur.kind === "ada" ? (Assets.hasOnlyLovelace(u.assets) ? Assets.lovelaceOf(u.assets) : -1n) : amountIn(u.assets, cur));
     const seed = available.filter((u) => size(u) > 0n).sort((a, b) => (size(b) > size(a) ? 1 : size(b) < size(a) ? -1 : 0))[0];
     if (!seed) throw new Error(`no UTxO to open a ${req.asset} channel from`);
@@ -224,6 +285,9 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       openIndex,
       openInputs,
       openedAt: Date.now(),
+      network: req.network,
+      scriptHash: extra.scriptHash,
+      ...(extra.referenceScript ? { referenceScript: extra.referenceScript } : {}),
     };
     await this.o.storage.set(ch);
     return {
@@ -254,10 +318,13 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     if (charged > BigInt(req.amount)) throw new Error("the server charged more than the price");
     const next = BigInt(ch.chargedCumulativeAmount) + charged;
     if (state.chargedCumulativeAmount !== undefined && BigInt(state.chargedCumulativeAmount) !== next) return;
+    // A deposit on a channel already open is a top-up: its capacity and deposit grow by the amount.
+    const topUp = p.type === "deposit" && ch.status === "open" ? BigInt(p.deposit.amount) : 0n;
     await this.o.storage.set({
       ...ch,
       chargedCumulativeAmount: next.toString(),
       ...(p.type === "deposit" ? { status: "open" as const } : {}),
+      ...(topUp > 0n ? { balance: (BigInt(ch.balance) + topUp).toString(), deposit: (BigInt(ch.deposit) + topUp).toString() } : {}),
       ...(state.channelRef ? { channelRef: state.channelRef } : {}),
     });
   }
@@ -344,6 +411,62 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     return settle;
   }
 
+  // ---- the consumer's own exit (outside x402) -----------------------------------------
+
+  /**
+   * Closes a channel without the server: `Main([Close])`, value and `subbed` unchanged, with the
+   * earliest `elapse_at` the validator allows (the TTL slot's start plus the close period). The
+   * server may still settle its latest IOU until then; after it has, `end` takes the rest.
+   */
+  async close(channelId: string): Promise<{ transaction: string; elapseAt: bigint }> {
+    const { ch, view, network } = await this.openView(channelId);
+    if (view.datum.stage.kind !== "opened") throw new Error(`channel is ${view.datum.stage.kind}`);
+    const to = msOfSlot(network, slotOfMs(network, BigInt(Date.now())) + 300n);
+    const elapseAt = to + view.datum.constants.closePeriodMs;
+    let tx = this.o.wallet.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.close()]) });
+    tx = await this.withValidator(tx, ch.referenceScript);
+    tx = tx
+      .payToAddress({ address: view.address, assets: view.utxo.assets, datum: inlineDatum(view.datum.constants, { kind: "closed", subbed: view.datum.stage.subbed, elapseAt }) })
+      .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) })
+      .setValidity({ to });
+    const transaction = await this.submitOwn("close", tx);
+    await this.o.storage.set({ ...ch, status: "closing", elapseAt: elapseAt.toString() });
+    return { transaction, elapseAt };
+  }
+
+  /** After the server has settled a channel this client closed: `Main([End])`, everything left comes back. */
+  async end(channelId: string): Promise<string> {
+    const { ch, view } = await this.openView(channelId);
+    if (view.datum.stage.kind !== "settled") throw new Error(`channel is ${view.datum.stage.kind}, not settled`);
+    let tx = this.o.wallet.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.end()]) });
+    tx = await this.withValidator(tx, ch.referenceScript);
+    tx = tx.addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
+    const transaction = await this.submitOwn("end", tx);
+    await this.o.storage.set({ ...ch, status: "closed" });
+    return transaction;
+  }
+
+  /** The channel as it stands on chain, for this client's own exit. */
+  async openView(channelId: string) {
+    const ch = await this.o.storage.get(channelId);
+    if (!ch?.channelRef || !ch.scriptHash || !ch.network) throw new Error(`no record of channel ${channelId.slice(0, 16)}… to act on`);
+    const view = await this.o.chain.followChannel(ch.channelRef, ch.scriptHash, ch.channelId);
+    if (!view) throw new Error(`channel ${channelId.slice(0, 16)}… is gone`);
+    return { ch, view, network: ch.network };
+  }
+
+  /** Builds, signs and submits a transaction of this client's own, and waits for a block. */
+  private async submitOwn(what: string, tx: ReturnType<SeedWallet["newTx"]>): Promise<string> {
+    const adaOnly = (await this.available()).filter((u) => Assets.hasOnlyLovelace(u.assets));
+    const me = await this.o.wallet.address();
+    const sb = await retryQueries(what, () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
+    const hex = await signedHex(sb);
+    for (const i of Transaction.fromCBORHex(hex).body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
+    const txHash = await this.o.chain.submit(hex);
+    if (!(await this.o.chain.awaitTx(txHash, 300_000))) throw new Error(`${what}: ${txHash} not in a block after 5 minutes`);
+    return txHash;
+  }
+
   /**
    * Wallet UTxOs minus the ones this client's recent transactions spent. An entry goes once the
    * wallet no longer lists it (the spend is indexed) or after PENDING_MS (the spend never landed).
@@ -358,11 +481,20 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
 
 // ---- helpers -------------------------------------------------------------
 
+function voucherPayload(ch: ClientChannel, ceiling: bigint) {
+  return {
+    type: "voucher",
+    channelConfig: ch.channelConfig,
+    voucher: { channelId: ch.channelId, maxClaimableAmount: ceiling.toString(), signature: signIou(ch, ceiling), ...(ch.channelRef ? { channelRef: ch.channelRef } : {}) },
+  };
+}
+
 export function serverKey(req: PaymentRequirements, extra: BatchExtra): string {
   return [req.network, req.payTo, req.asset, extra.scriptHash, extra.receiverAuthorizer, extra.withdrawDelay].join("|");
 }
 
-function signIou(ch: ClientChannel, amount: bigint): string {
+/** The channel's IOU for `amount`, as hex. */
+export function signIou(ch: ClientChannel, amount: bigint): string {
   return edSign(null, iouBody(ch.channelId, amount), createPrivateKey(ch.iouPrivateKeyPem)).toString("hex");
 }
 

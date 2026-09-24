@@ -344,13 +344,127 @@ What the run changed in the code:
 - The SDK's asset unit is policy and name run together; its doc comment and x402 write them with
   a dot.
 
+## Step 6: top-ups, and the server settling on its own
+
+Two things steps 4–5 left out: a client adding funds to the channel it already has, and a server
+noticing by itself that a consumer has closed a channel, and settling it before `elapse_at`. Both
+ran on preprod in ADA and in sUSDM, with state in `out/x402-step6/` and `out/x402-step6-token/`.
+
+**Top-ups.** A channel opened with room for 10 requests at 1,000 units each. When the next
+voucher would pass that, the client reads the channel and builds `Main([Add])` on its current
+position: the same address and datum, and 10 more requests' worth of the currency. It sends that
+as a `deposit` whose voucher names the channel's position (`channelRef`) and pays for the
+request. The facilitator checks and broadcasts it as it does an opening, and the channel keeps
+its id. The server claims in between, so a top-up also lands on a channel that has had a
+redemption.
+
+| Currency | Step | Transaction | Result |
+|---|---|---|---|
+| tADA | request 1 | `ba849f6cb6f10022d4df25d5538448ecb3368fc80963d4c999f101aa409d4967` | opens; room for 10 requests |
+| | request 11 | `e81a80261595fcdb003943cc9124c76fcd2007b0973fa13fe3cfd66f937f617e` | top-up: room for 20, same channel id; answered in 24.4 s, 2 HTTP calls |
+| | claim | `e3852b8b5e25f96b59da7756455cfa0a27f7d2fcf9b2b0feb9f459ebc290679f` | redeems 0.015 tADA; the refund after it was refused (the capacity fix below) |
+| | request 21 | `217ce7623ab85f8ddeccbbd46ac7fff328626ee0dee7d290a0a280eb28039943` | top-up after the claim: room for 30; answered in 115.3 s (a slow block) |
+| | claim | `9194406a0378cae73f6c4660dda40b45f571d6c3ac51e2d03641a686779ab268` | redeems 0.015 tADA |
+| | refund | `a7246f6c47d88661db1ed8b2c5a71dac12d952e41da42fb613b2952d994499ff` | `Mutual`: 1.500075 tADA back |
+| sUSDM | request 1 | `b876ce673bef27e4ab3ab8db921fda3006c824c41338385a88bc50c93297a903` | opens; room for 10 requests, 2.133450 tADA reserve |
+| | claim | `2c077ce28f90a5ea560973644ff406b9af070daa3117832de9cf33aa0cf3c8c4` | after request 5: redeems 0.005 sUSDM |
+| | request 11 | `ae008a1c813d2ee6a6016a8829c3abe2f98e0ca5444dc676a2b7c3af36b10351` | top-up after the claim: room for 20; 30.4 s |
+| | claim | `62b8054efa2b2e5001f2b339a23c1aedcf6fba6280c402914133895a5dea2809` | redeems 0.010 sUSDM |
+| | refund | `648a92f56857705094cf0a5f5e2fc4ae6b9b2a398944252fdc4a087577cfb848` | 0.005 sUSDM and the reserve back |
+| | again | `c0c69b45…`, `bf085483…`, `97c052b8…`, `6bb0c55f…`, `773d4604…` | the same run with the fixes below: top-up in 34.9 s |
+
+Before each channel's first top-up went out, a second client on the same records built it
+without sending it, and the facilitator was asked about it (verify only). In all four rounds:
+
+| Top-up | Outcome |
+|---|---|
+| as the client built it | accepted |
+| the deposit declares one unit more than the transaction adds | refused by the facilitator, `deposit_transaction` |
+| the voucher one unit past the capacity the top-up makes (0.020001 / 0.030001) | refused by the facilitator, `cumulative_exceeds_balance` |
+| the datum records `subbed` one unit higher | refused by the validator (the build's evaluation) |
+
+The facilitator compares the whole datum as Plutus data either way; for this change the
+validator refused too.
+
+**The server settling on its own.** `ChannelManager.watch()` reads each channel the server holds
+vouchers for every 15 s here (30 s by default). When a consumer has closed one, the server stops
+accepting its vouchers (`withdrawRequestedAt`), and its next claim settles the channel with the
+latest voucher: `Settle` in place of `Sub`, in the same batched transaction format, leaving the
+channel `Settled` for its consumer to end. The consumer's close has a TTL 300 slots ahead and the
+earliest `elapse_at` the validator allows with it: the TTL slot's start + the 900 s close period.
+
+| Currency | Step | Transaction | Result |
+|---|---|---|---|
+| tADA | request 1 | `b5e0cd6598b47287c9963b494952b036ca1e2e47cc63c469bd7a966ee031cafe` | opens; 12 requests paid, nothing claimed |
+| | close | `905bebb6c43bc95d42f09408008826ccf57730601eb27139f553b4bda45cdec8` | the consumer alone, `Main([Close])`; `elapse_at` 11:54:04Z |
+| | settle | `d7ef18c8b8447c0a7df1e8a8ca193ce489cbea9de34ca61fbd28773a85a513eb` | the watcher saw the close 12 s after the client had it confirmed; takes 0.012 tADA; its block 62 s after the close's, 18.8 min before `elapse_at` |
+| | end | `c756a7f69814ad7295e502f5f15b50dbebd07043502bc58bac6ba9c1b1fb9d32` | the consumer, `Main([End])`: 1.740620 tADA back |
+| sUSDM | request 1 | `f82b9ac6d4beb9881afa65ec0cd3debc6e9b2112105de80ecc71051f9ced5c18` | opens; 12 requests paid |
+| | close | `71ea2837d8c6ce13637d45ff26a13e0ad0d0f7a8389d08bd62185396087e6853` | `elapse_at` 12:04:50Z |
+| | settle | `ed0c8468849254a4afa70ea90c24a962291e892a55782cbe134a7a81c8f69e4c` | seen after 8 s; takes 0.012 sUSDM; 30 s after the close, 18.3 min before `elapse_at` |
+| | end | `546dd1105edcf3434da9889b0c89b1a7fa9137b19df4882483284454a612ff6a` | 0.008 sUSDM and 2.133450 tADA back |
+
+Fees, in tADA, each read back from Blockfrost:
+
+| Transaction | tADA channel | sUSDM channel |
+|---|---:|---:|
+| open | 0.175005 (445 B) | 0.180945 (580 B) |
+| top-up | 0.272915 (1,294 B)¹ | 0.258089 (905 B) |
+| claim, one channel | 0.256727 (803 B) | 0.267137 (1,001 B) |
+| settle, one channel | 0.256809 (799 B) | 0.267219 (997 B) |
+| refund (`Mutual`) | 0.232545 (597 B) | 0.234569 (643 B) |
+| close | 0.250013 (747 B) | 0.255535 (834 B) |
+| end | 0.230954 (475 B) | 0.233253 (521 B) |
+
+¹ Carrying 14 unrelated tokens from a wallet UTxO into its change, about 480 B; fixed below, as
+the sUSDM run's second top-up shows (the first was 1,383 B).
+
+A settle costs what a claim does. The unilateral exit (close, settle, end) comes to 0.737776
+tADA against 0.489272 for claim and refund; the consumer pays the close and the end.
+
+**Reconciliation.** tADA run: consumer 75.474342 → 73.822899, provider 19.088929 → 18.360663; the
+two lost 2.379709 tADA, exactly the fees of its 10 transactions. sUSDM run: the wallets lost
+3.805853 tADA, exactly the fees of its 16 transactions (two of them wallet tidies, below); sUSDM
+consumer 999,996.748 → 999,996.706, provider 3.252 → 3.294, nothing left in channels, so none
+created or lost.
+
+What the run changed in the code:
+
+- **Capacity is cumulative.** The tADA run's first refund was refused: "voucher 15000 exceeds
+  capacity 5000". Capacity was computed from what the channel held, but IOUs are cumulative:
+  after 15,000 had been redeemed the channel held 5,000 more, so the limit was 20,000. Steps 4
+  and 5 never came near theirs (3 tADA or 3 sUSDM against at most 0.2 charged), so it did not
+  show. Capacity is now `subbed` plus what the channel can still pay out, for the facilitator,
+  the client and the top-up check alike, with a chain-free test; the rerun's top-up after the
+  claim, and both sUSDM top-ups, depend on it.
+- **A voucher above the server's recorded balance goes to the facilitator**, which reads the
+  channel, at most once per 30 s per channel. A top-up that confirms after its request gave up
+  (preprod took 115 s for one here) or an `Add` made outside x402 would otherwise be refused
+  until the server's view of the channel went stale, up to 5 minutes.
+- **Openings and top-ups spend only UTxOs holding ADA and the channel's currency.** The public
+  test wallet holds tokens strangers sent it, and coin selection had carried 14 of them into
+  each tADA top-up's change.
+- **A claim folds the provider's earlier token outputs into its own.** Each token claim paid the
+  redeemed tokens to `payTo` in an output of their own, which holds a min-UTxO of ADA (about 1.17
+  tADA). After step 5 and part of this run, the provider's largest ADA-only UTxO was 1.965 tADA,
+  under what collateral needs, and a claim could not be built, which also means a settle could
+  not. `npm run mint -- tidy provider` (`7ef33300…`) got the run going again; since then a claim
+  also spends up to 5 earlier token-only outputs and pays one (`bf085483…`: 2 folded, +72 B,
+  +0.004 tADA).
+- **The consumer still fragments the same way** and needed `npm run mint -- tidy consumer`
+  (`4e89d98d…`) before the rerun's refund: every token channel's refund or end returns the tokens
+  with the reserve as a UTxO of their own, and a token top-up's change folds ADA-only UTxOs into
+  tokens. Not fixed yet; the client needs the provider's treatment (tokens to itself in their own
+  output, earlier ones folded in).
+
 ## What this does not show yet
 
 - The real tUSDM. The stand-in has its shape and takes the same code paths; only the asset id
   differs.
-- Top-ups (`Add`), and the manager settling a channel on its own when a consumer closes it
-  unilaterally.
 - The facilitator holding the provider key for servers that run none (DESIGN.md §8).
+- A client that keeps its own wallet usable across many token channels (step 6, last point).
+- The watcher at scale: each pass reads every channel the server holds, two or three Blockfrost
+  queries each. With many channels a server would follow the chain rather than poll it.
 
 ## Notes for the binding spec
 
@@ -401,6 +515,17 @@ What the run changed in the code:
   deposited, that is at most 0.09 tADA. The facilitator requires at least the reserve at opening.
 - A token channel's refund always follows a claim: the provider's share would be a token output,
   which needs ADA of its own.
+- Capacity (x402 `balance`) is cumulative, as IOUs are: `subbed` plus what the channel can still
+  pay out. Computing it from the channel's holdings alone refuses vouchers once anything has been
+  redeemed and the rest is short of the running total.
+- A top-up is `Main([Add])` on the channel's current position with the datum unchanged; the
+  channel keeps its id. Answered in 24–35 s on preprod, once 115 s.
+- A server must watch its channels: nothing tells it a consumer has closed one. With a 15 s poll
+  the close was seen within 12 s and settled 30–62 s after it, over 18 minutes before `elapse_at`
+  with the shortest close period the binding allows.
+- Every script transaction needs an ADA-only UTxO for collateral, over about 2.2 tADA with the
+  margins used here. Token outputs each keep a min-UTxO of ADA, so a party that makes a new one per
+  transaction runs out; outputs of the same token should be folded together.
 
 ## Reproduce
 
@@ -422,6 +547,11 @@ npm run x402 -- all           # step 4: pay 200, claim, corrective, refund, batc
 npm run mint -- mint          # step 5: the sUSDM stand-in
 SUBBIT_CURRENCY=token SUBBIT_SCRIPT=ref npm run lifecycle -- all
 SUBBIT_CURRENCY=token npm run x402 -- all
+
+X402_OUT=x402-step6 npm run x402 -- topup        # step 6: claim, top-up, claim, refund
+X402_OUT=x402-step6 npm run x402 -- autosettle   # the consumer closes; the watcher settles; the consumer ends
+X402_OUT=x402-step6 npm run x402 -- report
+SUBBIT_CURRENCY=token X402_OUT=x402-step6-token npm run x402 -- topup   # and autosettle, report
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,
@@ -430,4 +560,5 @@ is in the gitignored `out/lifecycle.json`. Ref mode keeps its own, in `out/state
 `out/lifecycle-ref.json`; the deployed output is recorded in `out/refscript.json`. Step 4's
 phases also run one at a time (`pay [n]`, `claim`, `corrective`, `refund`, `batch`,
 `batch-refund`, `report`; `reset` clears its state), with state in `out/x402/`: the client's
-and server's channel stores, and `results.json`.
+and server's channel stores, and `results.json`. `X402_OUT` keeps a run's state elsewhere under
+`out/`, as step 6 did; `refund topup` refunds the top-up phase's channel on its own.

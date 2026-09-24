@@ -105,10 +105,11 @@ Every output must hold its min-UTxO in ADA, and a channel output carries a large
 - The **reserve** is the min-UTxO of the channel's largest continuing output, the `Closed` stage,
   holding its currency, at current parameters and with every integer at its widest encoding.
   Measured on preprod: 1.73 tADA for an ADA channel, 2.13 tADA for a token channel.
-- **ADA channel.** Capacity is the channel's lovelace minus the reserve. An IOU above capacity
-  cannot be redeemed without the consumer, because the continuing output would fall below its
-  minimum.
-- **Token channel.** Capacity is the channel's token amount. The validator counts only the
+- **Capacity** (x402 `balance`) is how far an IOU may go and still be redeemable without the
+  consumer. IOUs are cumulative, so capacity is `subbed` plus what the channel can still pay out.
+- **ADA channel.** It can pay out its lovelace minus the reserve. An IOU beyond capacity cannot be
+  redeemed without the consumer, because the continuing output would fall below its minimum.
+- **Token channel.** It can pay out all its tokens. The validator counts only the
   currency, so the ADA beside the tokens is kept up by min-UTxO alone, and a redemption MAY take
   it down to the continuing output's exact minimum (measured: 2.133450 → 2.042940 tADA). A
   client MUST therefore put in exactly the reserve and no more; the facilitator MUST require at
@@ -119,24 +120,26 @@ Every output must hold its min-UTxO in ADA, and a channel output carries a large
 
 ## Channel lifecycle
 
-1. **Open (deposit).** On the first request, or when capacity runs short, the client builds and
-   signs a transaction creating the channel output, and sends it with the IOU for this request.
-   The facilitator verifies it and, after the handler runs, broadcasts it and waits for the
-   confirmation policy. The response carries the new `channelRef`.
+1. **Open (deposit).** On the first request, the client builds and signs a transaction creating
+   the channel output, and sends it with the IOU for this request. The facilitator verifies it
+   and, after the handler runs, broadcasts it and waits for the confirmation policy. The response
+   carries the new `channelRef`.
 2. **Requests.** Each request carries a voucher for `chargedCumulativeAmount + amount`. The server
    checks it, serves, and counts the charge locally. Nothing is broadcast.
-3. **Redeem (claim).** The server builds and signs a `Sub` over one or more channels, taking what
+3. **Top up (deposit).** When a voucher would pass the capacity, the client builds and signs an
+   `Add` on the channel's current position and sends it as a `deposit` naming that position in
+   `voucher.channelRef`, with the IOU for this request. It is verified and broadcast as an
+   opening is; the channel keeps its id and moves to the top-up's output.
+4. **Redeem (claim).** The server builds and signs a `Sub` over one or more channels, taking what
    it charged from each, and sends it to the facilitator to broadcast.
-4. **Cooperative close (refund).** The client builds a `Mutual` transaction paying the server its
+5. **Cooperative close (refund).** The client builds a `Mutual` transaction paying the server its
    unredeemed share and itself the rest, signs it, and sends it with a zero-charge voucher; the
    server checks it and adds its signature; the facilitator broadcasts.
-5. **Unilateral exit** (outside x402). The consumer `Close`s; the server MUST `Settle` its latest
+6. **Unilateral exit** (outside x402). The consumer `Close`s; the server MUST `Settle` its latest
    IOU before `elapseAt`; the consumer then `End`s, or `Elapse`s after `elapseAt` if the server
    never settled. The validator gives `Settle` no deadline of its own: after `elapseAt` a late
-   settle and an elapse race, so `elapseAt` is the server's deadline in practice.
-
-Top-ups use a consumer-signed `Add` and the same `deposit` payload. *Not in the reference
-implementation yet.*
+   settle and an elapse race, so `elapseAt` is the server's deadline in practice. A server finds
+   out about a close by watching its channels (*Claim and settlement strategy*).
 
 ## 402 response: `PaymentRequirements`
 
@@ -209,6 +212,13 @@ datum as above at `Opened(0)`, holding exactly `deposit.amount` of the currency 
 channel, exactly the reserve in ADA. `voucher.maxClaimableAmount` is `amount` for a new channel.
 The client SHOULD size capacity at least `max(minDeposit, 10 × amount)`.
 
+A **top-up** is a `deposit` whose `voucher.channelRef` is set. Its `transaction` spends the channel
+at that position with `Main([Add])`, spends nothing else at the validator, and recreates the
+channel at the same address with the same datum and exactly `deposit.amount` more of the currency;
+a token channel keeps at least the reserve in ADA. `voucher.maxClaimableAmount` is
+`chargedCumulativeAmount + amount`, within the capacity after the top-up. The client SHOULD add at
+least `max(minDeposit, 10 × amount)`.
+
 ### `voucher`
 
 ```ts
@@ -266,7 +276,11 @@ the channel; reuse means opening a new one.
    voucher: `chargedCumulativeAmount`); otherwise the server answers the **corrective 402**. With
    no record, the base is `maxClaimableAmount − amount`. When the mirrored chain state is fresh
    (within `clamp(withdrawDelay / 3, 30 s, 5 min)`), the server MAY verify a voucher locally with
-   the facilitator's rules below and skip `/verify`.
+   the facilitator's rules below and skip `/verify`. A voucher above the recorded balance may
+   follow a top-up the server has not seen (one confirmed after its request gave up, or an `Add`
+   made outside x402); the server SHOULD then send it to `/verify`, which reads the channel, and
+   take the balance from the answer. The reference server does so at most once per 30 s per
+   channel and otherwise refuses locally.
 2. **After verify.** The server reserves the channel: one request per channel at a time; a second
    is refused `channel_busy`. A refund skips the handler.
 3. **Settle.** A voucher is committed locally (`charged += amount`, never above the voucher) with
@@ -286,7 +300,7 @@ and `voucherState { signedMaxClaimable, signature }`, with `error` =
 | Case | `transaction` | `amount` | `extra` |
 |---|---|---|---|
 | voucher | `""` | `""` | `chargedAmount`, `commitmentId`, `channelState` |
-| deposit | the opening transaction's id | the deposited currency amount | `chargedAmount`, `commitmentId`, `channelState` |
+| deposit | the opening or top-up transaction's id | the currency amount deposited or added | `chargedAmount`, `commitmentId`, `channelState` |
 | refund | the `Mutual` transaction's id | what the consumer nets, in the currency | `channelState` |
 
 `commitmentId` is `"<channelId>:<maxClaimableAmount>"`.
@@ -314,6 +328,28 @@ For every payload: `accepted.scheme`, `requirements.scheme` = `batch-settlement`
 
 and that the voucher is positive, at most the capacity, and signed by `payerAuthorizer`.
 
+**Top-up** (a deposit with `voucher.channelRef`). Following the channel from `voucher.channelRef`,
+the facilitator MUST find it at stage `Opened`, with the datum bound to the config as for a
+deposit, and check that the transaction:
+
+1. decodes, is for the requirement's network, and carries no certificates, withdrawals, minting
+   or governance actions;
+2. spends the channel at its current position, redeemed with `Main([Add])`, and redeems no other
+   input;
+3. creates exactly one output at `scriptHash`, at the channel's address, with no reference script
+   and an inline datum equal, as Plutus data, to the channel's (another encoder may write the same
+   datum with different bytes, and the validator compares values);
+4. holds ADA and the currency only, exactly `deposit.amount` more of the currency than the
+   channel, and for a token channel at least the reserve in ADA;
+5. is signed by `payer`, spends only existing, unspent inputs, each key-locked one carrying its
+   key's witness, and every witness is a valid signature over the transaction id;
+6. passes the evaluator;
+
+and that the voucher is above `subbed`, at most the capacity after the top-up, and signed by
+`payerAuthorizer`. A valid response describes the channel as it was before the top-up. On preprod
+the validator itself refused an `Add` whose datum recorded a different `subbed`; rule 3 does not
+rely on that.
+
 **Voucher.** Following the channel from `voucher.channelRef`, the facilitator MUST find it at
 stage `Opened`, with the datum bound to the config as for a deposit, and check `maxClaimableAmount`
 ≤ capacity, `maxClaimableAmount` > `subbed`, and the signature.
@@ -333,11 +369,11 @@ A valid response carries `extra` = `{ channelId, channelRef, balance, totalClaim
 |---|---|---|
 | `deposit` | client | re-verify, broadcast the exact bytes received, wait for the confirmation policy |
 | `refund` | server (client-originated) | add `providerWitness`, re-verify, broadcast, wait |
-| `claim` | server | check every channel input is redeemed through `Main`/`Defer` and not `Mutual`, and that `claims` lists them all; evaluate; broadcast; wait |
+| `claim` | server | check every channel input is redeemed through `Main`/`Defer` and not `Mutual`, and that `claims` lists them all; evaluate; broadcast; wait. Covers `Sub` and `Settle` alike |
 | `voucher` | — | refused: vouchers settle on the server |
 
 ```ts
-type ClaimPayload = { type: "claim"; transaction: string /* base64, provider-signed Sub */; claims: { channelId: string; totalClaimed: string }[] };
+type ClaimPayload = { type: "claim"; transaction: string /* base64, provider-signed Sub and/or Settle */; claims: { channelId: string; totalClaimed: string }[] };
 ```
 
 Claims use synthetic requirements (`amount: "0"`, `maxTimeoutSeconds: 0`, `extra: {}`).
@@ -356,7 +392,18 @@ the facilitator signs nothing.
 ## Claim and settlement strategy
 
 The server SHOULD redeem in batches, by interval or once unredeemed charges pass a threshold, and
-MUST settle a closed channel before its `elapseAt`. A claim over N channels cost, on preprod:
+MUST settle a closed channel before its `elapseAt`. Nothing tells the server that a consumer has
+closed: it MUST watch its channels, often enough that a settle lands well inside the close
+period. On seeing a close it SHOULD stop accepting the channel's vouchers (set
+`withdrawRequestedAt`) and settle with the latest voucher: `Settle` in place of `Sub`, in the same
+batched claim, leaving the channel `Settled` for the consumer to `End`. The reference server polls
+every 15–30 s and drops a channel's record only once the channel is settled, or after two
+consecutive reads find no channel, since one missing read may be a lagging index and the record
+holds the only copy of the latest voucher. On preprod, with a 15 s poll and the 900 s minimum
+close period, the close was seen within 12 s and the settle landed 30–62 s after it, over 18
+minutes before `elapseAt`. A settle costs what a `Sub` does.
+
+A claim over N channels cost, on preprod:
 
 | Channels | ADA channels (tADA) | Token channels (tADA) |
 |---:|---:|---:|
@@ -367,8 +414,11 @@ MUST settle a closed channel before its `elapseAt`. A claim over N channels cost
 Size binds first: about 45 ADA channels, or 36 token channels, per transaction (extrapolated from the measured claims, not measured).
 
 Redeemed tokens SHOULD go to `payTo` in an output of their own so the server's change stays
-ADA-only, which Cardano collateral requires. A server SHOULD keep the inputs of the claims it has
-built out of coin selection until its chain view drops them.
+ADA-only, which Cardano collateral requires, and SHOULD fold earlier such outputs into it: each
+holds a min-UTxO of ADA, and with one new output per claim the reference server ran out of
+ADA-only UTxOs large enough for collateral, so it could build neither a claim nor a settle. A server SHOULD keep the inputs of the claims it has built out of coin selection
+until its chain view drops them. Clients face the same with the token outputs their refunds and
+ends return.
 
 ## Client verification rules
 
@@ -379,6 +429,10 @@ previous count plus `chargedAmount`. It MAY take `channelRef` from `channelState
 **Corrective 402.** The client adopts the server's `chargedCumulativeAmount` only when
 `voucherState.signature` is its own IOU for `signedMaxClaimable`, the count is ≤
 `signedMaxClaimable`, and it is ≥ `totalClaimed`.
+
+**Top-ups.** After a successful top-up the client adds `deposit.amount` to its capacity and takes
+the new `channelRef`. Before building a top-up it reads the channel: if an earlier top-up has
+landed after all, it uses that capacity instead of adding more.
 
 **Pending openings.** A client whose deposit got no confirmation MUST NOT open another channel
 until it knows the first cannot land: it adopts the channel if the opening is on chain (counting
@@ -432,9 +486,8 @@ non-terminal `settlement_pending`.
 - **Channel identity.** A tag derived from a spent input, with a fresh IOU key per channel, keeps
   an IOU from being redeemable against any channel but its own.
 
-Not in the reference implementation yet: `Add` top-ups, settling automatically when a consumer
-closes, a response cache for exact repeats of a voucher, and delegating the provider key to the
-facilitator. Delegation would make the facilitator custodian of the redemptions it signs, since
+Not in the reference implementation yet: a response cache for exact repeats of a voucher, and
+delegating the provider key to the facilitator. Delegation would make the facilitator custodian of the redemptions it signs, since
 the validator does not restrict where a redemption pays out.
 
 ## Reference implementation
@@ -442,10 +495,12 @@ the validator does not restrict where a redemption pays out.
 This repository: `src/x402/` implements the client, resource-server and facilitator schemes for
 `@x402/core` 2.27.0 and the server's channel manager, on `@evolution-sdk/evolution` 0.5.13 and
 Blockfrost. `RESULTS.md` records every preprod transaction: steps 1–3 exercise the validator,
-step 4 the ADA binding end to end, step 5 a token binding.
+step 4 the ADA binding end to end, step 5 a token binding, step 6 top-ups and the automatic
+settle after a consumer's close.
 
 ## Version history
 
 | Version | Date | Changes |
 |---|---|---|
 | 0.1 | 2026-09-24 | First draft, from the reference implementation and preprod runs |
+| 0.2 | 2026-09-24 | Top-ups (`Add`) and their verification; the server watches its channels and settles a closed one; a voucher above the recorded balance is checked against the chain |

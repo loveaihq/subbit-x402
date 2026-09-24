@@ -9,8 +9,12 @@ import {
   ScriptHash,
   Transaction,
   TransactionBody,
+  Time,
   TransactionHash,
   TxOut,
+  mainnet,
+  preprod,
+  preview,
   type UTxO,
 } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH, inlineDatum, iouVerifier, parseDatum, type Constants, type Currency, type ParsedDatum, type Stage } from "../subbit.ts";
@@ -21,6 +25,13 @@ export function networkIdOf(network: string): number {
   if (id === undefined) throw new Error(`unsupported network ${network}`);
   return id;
 }
+
+const SLOTS = { "cardano:mainnet": mainnet.slotConfig, "cardano:preprod": preprod.slotConfig, "cardano:preview": preview.slotConfig } as const;
+
+/** Start of a slot in Unix ms: what a script sees for a validity bound set to that slot. */
+export const msOfSlot = (network: string, slot: bigint) => Time.slotToUnixTime(slot, SLOTS[network as CardanoNetwork]);
+/** The slot containing a Unix ms time; the SDK floors validity bounds the same way. */
+export const slotOfMs = (network: string, ms: bigint) => Time.unixTimeToSlot(ms, SLOTS[network as CardanoNetwork]);
 
 /** `lovelace` or `<policyId>.<assetNameHex>`, as Cardano `exact`. */
 export function currencyOf(asset: string): Currency {
@@ -119,13 +130,20 @@ export function channelReserve(address: Address.Address, constants: Constants, c
 }
 
 /**
- * x402 `balance`: how far IOUs may go and still be redeemable without the consumer. A token
- * channel's tokens are all redeemable (its ADA stays behind); an ADA channel keeps back its reserve.
+ * x402 `balance`: how far IOUs may go and still be redeemable without the consumer. IOUs are
+ * cumulative, so it counts what is already redeemed (`subbed`) plus what the channel can still
+ * pay out: all of a token channel's tokens (its ADA stays behind), an ADA channel's lovelace
+ * less its reserve.
  */
 export function capacityOf(ch: ChannelView, coinsPerUtxoByte: bigint): bigint {
-  if (ch.datum.constants.currency.kind !== "ada") return ch.amount;
-  const reserve = channelReserve(ch.address, ch.datum.constants, coinsPerUtxoByte);
-  return ch.lovelace > reserve ? ch.lovelace - reserve : 0n;
+  return subbedOf(ch.datum.stage) + redeemableOf(ch.address, ch.datum.constants, ch.amount, coinsPerUtxoByte);
+}
+
+/** What a channel holding `held` of its currency can still pay out. */
+export function redeemableOf(address: Address.Address, constants: Constants, held: bigint, coinsPerUtxoByte: bigint): bigint {
+  if (constants.currency.kind !== "ada") return held;
+  const reserve = channelReserve(address, constants, coinsPerUtxoByte);
+  return held > reserve ? held - reserve : 0n;
 }
 
 export function subbedOf(stage: Stage): bigint {

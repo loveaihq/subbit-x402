@@ -7,7 +7,7 @@ import { createPrivateKey, sign as edSign } from "node:crypto";
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import { Assets, TxOut } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH, channelAddress, iouBody, inlineDatum, newIouSigner, parseDatum, datumData } from "../src/subbit.ts";
-import { channelReserve, constantsOf, datumBindingError } from "../src/x402/cardano.ts";
+import { capacityOf, channelReserve, constantsOf, datumBindingError, type ChannelView } from "../src/x402/cardano.ts";
 import { BatchSettlementCardanoClient, FileClientStorage } from "../src/x402/client.ts";
 import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x402/server.ts";
 import { Err, PayloadError, configBindingError, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
@@ -95,6 +95,19 @@ test("a token channel's reserve covers its continuing outputs, token included", 
       assert.ok(reserve >= exact, `${stage.kind}, ${quantity}: reserve ${reserve} < ${exact}`);
     }
   }
+});
+
+test("capacity is cumulative, like IOUs: what is already redeemed counts toward it", () => {
+  const address = channelAddress(0);
+  const constants = constantsOf(config, TAG);
+  const reserve = channelReserve(address, constants, 4310n);
+  const view = (subbed: bigint, held: bigint) => ({ address, lovelace: held, amount: held, datum: { ownHash: SUBBIT_HASH, constants, stage: { kind: "opened", subbed } } }) as unknown as ChannelView;
+  // 20,000 of room: nothing redeemed yet, then 15,000 of it redeemed and 5,000 left in the channel.
+  assert.equal(capacityOf(view(0n, reserve + 20_000n), 4310n), 20_000n);
+  assert.equal(capacityOf(view(15_000n, reserve + 5_000n), 4310n), 20_000n);
+  const tokens = constantsOf({ ...config, token: "085c41bd155d0562653d61a847bc00b0dae291f323ed43b347419c19.0014df10735553444d" }, TAG);
+  const tview = { address, lovelace: 2_133_450n, amount: 5_000n, datum: { ownHash: SUBBIT_HASH, constants: tokens, stage: { kind: "opened", subbed: 15_000n } } } as unknown as ChannelView;
+  assert.equal(capacityOf(tview, 4310n), 20_000n);
 });
 
 test("the ADA reserve covers every continuing output the channel can have", () => {
@@ -186,6 +199,10 @@ test("server: vouchers past capacity, signed by another key, or on a closed chan
   const { server, storage, req } = await serverWithChannel(1500n);
   assert.equal((await paidRequest(server, req, voucher(1000n, newIouSigner()))).reason, Err.voucherSignature);
   assert.equal((await paidRequest(server, req, voucher(1000n))).stage, "settled");
+  // Past the recorded balance: the first such voucher goes to the facilitator, which reads the
+  // channel for a top-up the server has not seen; the next one within 30 s is refused here.
+  const h = server.schemeHooks;
+  assert.equal(await h.onBeforeVerify!({ paymentPayload: payloadFor(req, voucher(2000n)), requirements: req, declaredExtensions: {} } as never), undefined);
   assert.equal((await paidRequest(server, req, voucher(2000n))).reason, Err.cumulativeExceedsBalance);
   await storage.updateChannel(TAG, (c) => ({ ...c!, balance: "10000", withdrawRequestedAt: 1_790_000_000 }));
   assert.equal((await paidRequest(server, req, voucher(2000n))).reason, Err.channelClosed);

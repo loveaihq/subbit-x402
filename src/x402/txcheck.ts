@@ -16,8 +16,8 @@ import {
   VKey,
   type TransactionInput,
 } from "@evolution-sdk/evolution";
-import { parseDatum, tagFromInput } from "../subbit.ts";
-import { amountIn, channelReserve, datumBindingError, isChannelOutput, networkIdOf, onlyCurrency, txHashOf } from "./cardano.ts";
+import { Redeemer, Step, parseDatum, tagFromInput } from "../subbit.ts";
+import { amountIn, channelReserve, datumBindingError, isChannelOutput, networkIdOf, onlyCurrency, redeemableOf, subbedOf, txHashOf, type ChannelView } from "./cardano.ts";
 import type { Currency } from "../subbit.ts";
 import { Err, type ChannelConfig } from "./types.ts";
 
@@ -164,6 +164,73 @@ export function checkInputWitnesses(tx: Transaction.Transaction, cborHex: string
     const pay = a.paymentCredential;
     if (pay instanceof KeyHash.KeyHash && !have.has(KeyHash.toHex(pay))) fail(reason, "an input's key has not signed the transaction");
   }
+}
+
+// ---- deposit (top-up) --------------------------------------------------------------
+
+export interface TopUpCheck {
+  tx: Transaction.Transaction;
+  outputIndex: number;
+  /** Capacity after the top-up. */
+  capacity: bigint;
+  /** Inputs besides the channel, for the caller's unspent and witness checks. */
+  otherInputRefs: string[];
+}
+
+/**
+ * A top-up as the binding requires it: the transaction redeems the channel at its current
+ * position, alone, with `Main([Add])`; its one output at the validator keeps the channel's
+ * address and datum byte for byte, holds ADA and the currency only, and grows the currency by
+ * exactly `amount`; a token channel keeps at least its reserve in ADA; nothing else happens.
+ */
+export function checkTopUp(cborHex: string, network: string, ch: ChannelView, amount: bigint, coinsPerUtxoByte: bigint): TopUpCheck {
+  const R = Err.depositTransaction;
+  const tx = decodeTx(cborHex, R);
+  const netId = networkIdOf(network);
+  if (tx.body.networkId !== undefined && tx.body.networkId !== netId) fail(Err.network, "transaction network id");
+  if (tx.body.outputs.some((o) => o.address.networkId !== netId)) fail(Err.network, "an output is on another network");
+  checkNoExtras(tx, R);
+  const inputs = sortedInputRefs(tx);
+  const at = inputs.indexOf(ch.ref);
+  if (at < 0) fail(R, "the top-up does not spend the channel at its current position");
+  const redeemers = spendRedeemers(tx);
+  if (redeemers.size !== 1 || !redeemers.has(at)) fail(R, "the top-up redeems the channel and nothing else");
+  if (Data.toCBORHex(redeemers.get(at)!) !== Data.toCBORHex(Redeemer.main([Step.add()]))) fail(R, "the channel is spent with Main([Add])");
+
+  const scriptHash = ch.datum.ownHash;
+  const outs = tx.body.outputs.flatMap((o, i) => (isChannelOutput(o.address, scriptHash) ? [i] : []));
+  if (outs.length !== 1) fail(R, `expected one channel output, found ${outs.length}`);
+  const outputIndex = outs[0]!;
+  const o = tx.body.outputs[outputIndex]!;
+  if (Address.toBech32(o.address) !== Address.toBech32(ch.address)) fail(R, "the channel keeps its address");
+  if (o.scriptRef) fail(R, "channel output carries a reference script");
+  if (!(o.datumOption instanceof InlineDatum.InlineDatum)) fail(R, "channel datum is not inline");
+  // By value, as the validator compares it: another encoder may write the same datum differently.
+  let after;
+  try {
+    after = parseDatum((o.datumOption as InlineDatum.InlineDatum).data);
+  } catch (e) {
+    return fail(R, `channel datum: ${(e as Error).message}`);
+  }
+  const same = (x: unknown, y: unknown) => JSON.stringify(x, (_, v) => (typeof v === "bigint" ? v.toString() : v)) === JSON.stringify(y, (_, v) => (typeof v === "bigint" ? v.toString() : v));
+  if (!same(after, ch.datum)) fail(R, "a top-up leaves the datum as it was");
+  const c = ch.datum.constants.currency;
+  if (!onlyCurrency(o.assets, c)) fail(R, "channel output holds an asset besides ADA and its currency");
+  const grown = amountIn(o.assets, c) - ch.amount;
+  if (grown !== amount) fail(R, `the channel grows by ${grown}, the deposit says ${amount}`);
+  const reserve = channelReserve(o.address, ch.datum.constants, coinsPerUtxoByte);
+  if (c.kind !== "ada" && Assets.lovelaceOf(o.assets) < reserve) fail(R, `a token channel carries at least ${reserve} lovelace`);
+  if (!witnessKeyHashes(tx).has(ch.datum.constants.consumer)) fail(R, "the consumer has not signed");
+  // IOUs are cumulative: what is already redeemed counts toward the capacity.
+  const capacity = subbedOf(ch.datum.stage) + redeemableOf(o.address, ch.datum.constants, amountIn(o.assets, c), coinsPerUtxoByte);
+  return { tx, outputIndex, capacity, otherInputRefs: inputs.filter((r) => r !== ch.ref) };
+}
+
+/** Position of a transaction's single output at the validator. */
+export function channelOutputIndex(tx: Transaction.Transaction, scriptHash: string): number {
+  const outs = tx.body.outputs.flatMap((o, i) => (isChannelOutput(o.address, scriptHash) ? [i] : []));
+  if (outs.length !== 1) throw new TxCheckError(Err.depositTransaction, `expected one channel output, found ${outs.length}`);
+  return outs[0]!;
 }
 
 // ---- refund (Mutual) -------------------------------------------------------------
