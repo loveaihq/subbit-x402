@@ -129,6 +129,37 @@ export function channelReserve(address: Address.Address, constants: Constants, c
   return coinsPerUtxoByte * (160n + BigInt(TxOut.toCBORBytes(out).length));
 }
 
+/** How many of a wallet's token UTxOs one transaction folds into one. */
+export const FOLD = 5;
+
+/**
+ * The token side of a transaction that spends `need` of a token currency from a wallet and hands
+ * `back` of it to that wallet from a channel: which of the wallet's UTxOs holding ADA and this
+ * currency only it spends (largest first, enough for `need`, then more up to `fold` in all), and
+ * `rest`, what goes back to the wallet in one output of its own. Paying that explicitly, with the
+ * fee and all other ADA from ADA-only UTxOs, keeps the change ADA-only. Otherwise every such
+ * transaction folds an ADA-only UTxO, which collateral needs, into tokens, and every one that
+ * returns tokens leaves another min-UTxO of ADA behind with them.
+ */
+export function planTokens(utxos: UTxO.UTxO[], c: Currency, need: bigint, back: bigint, fold = FOLD): { inputs: UTxO.UTxO[]; rest: bigint } {
+  if (c.kind === "ada") throw new Error("planTokens is for token currencies");
+  const held = utxos
+    .filter((u) => !Assets.hasOnlyLovelace(u.assets) && onlyCurrency(u.assets, c) && amountIn(u.assets, c) > 0n)
+    .sort((a, b) => {
+      const [x, y] = [amountIn(a.assets, c), amountIn(b.assets, c)];
+      return x > y ? -1 : x < y ? 1 : 0;
+    });
+  const inputs: UTxO.UTxO[] = [];
+  let sum = 0n;
+  for (const u of held) {
+    if (sum >= need && inputs.length >= fold) break;
+    inputs.push(u);
+    sum += amountIn(u.assets, c);
+  }
+  if (sum < need) throw new Error(`the wallet holds ${sum} of the currency, ${need} needed`);
+  return { inputs, rest: sum - need + back };
+}
+
 /**
  * x402 `balance`: how far IOUs may go and still be redeemable without the consumer. IOUs are
  * cumulative, so it counts what is already redeemed (`subbed`) plus what the channel can still

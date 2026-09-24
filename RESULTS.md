@@ -451,18 +451,61 @@ What the run changed in the code:
   not. `npm run mint -- tidy provider` (`7ef33300…`) got the run going again; since then a claim
   also spends up to 5 earlier token-only outputs and pays one (`bf085483…`: 2 folded, +72 B,
   +0.004 tADA).
-- **The consumer still fragments the same way** and needed `npm run mint -- tidy consumer`
-  (`4e89d98d…`) before the rerun's refund: every token channel's refund or end returns the tokens
-  with the reserve as a UTxO of their own, and a token top-up's change folds ADA-only UTxOs into
-  tokens. Not fixed yet; the client needs the provider's treatment (tokens to itself in their own
-  output, earlier ones folded in).
+- **The consumer fragmented the same way** and needed `npm run mint -- tidy consumer`
+  (`4e89d98d…`) before the rerun's refund: every token channel's refund or end returned the tokens
+  with the reserve as a UTxO of their own, and a token top-up's change folded ADA-only UTxOs into
+  tokens. Step 7 gives the client the provider's treatment.
+
+## Step 7: the client folds its token UTxOs
+
+The client now builds its token transactions the way the manager builds claims. An opening or a
+top-up takes the tokens it needs from the wallet's UTxOs that hold ADA and the currency only,
+largest first, folds more of them in up to five in all, and pays what is left to the wallet in
+one output of its own; ADA and the fee come from ADA-only UTxOs, so the change stays ADA-only.
+An end folds up to five older token outputs into the one that takes the channel's tokens back
+(`planTokens` in `src/x402/cardano.ts`, with a chain-free test). The refund is left as it was:
+the server co-signs it, and the facilitator lets it spend the channel and nothing else, so it
+still returns one UTxO of tokens and reserve, which the consumer's next opening, top-up or end
+folds in.
+
+One more sUSDM run on preprod, from the wallets as step 6 left them (`out/x402-step7-token/`):
+
+| Step | Transaction | Inputs | Result |
+|---|---|---|---|
+| open | `36f88a1ea934b973f18b196ae488e5b8f10f712ff36f348010efb65527dc207d` | 5 sUSDM UTxOs | their ADA covered the reserve and the fee; no ADA-only UTxO spent; 789 B, 0.190141 tADA |
+| claim | `c2e89e949ea792d0ed9ac989a22d521979f4f85c82ff2bb2e74d352ecc1ec869` | channel, the provider's last token output, 1 ADA-only | 0.005 sUSDM |
+| top-up | `832b1f9924c4582df336f510648ea4851e333797c2edb1ecbc51d00b53cced3b` | channel, 5 sUSDM UTxOs | 1,078 B, 0.267995 tADA; answered in 25.4 s |
+| claim | `b9bf06fffb513605a3667745f3f7e4242e764ff54af628d094605a1fb8e270bc` | as above | 0.010 sUSDM |
+| refund | `2cdb331f9cd08a2c1907689f0955a0d29c76687460aa49f2337030653c07bd15` | the channel alone | 0.005 sUSDM and the reserve back, in one UTxO |
+| open | `c6178dc2dc7dabd79a4fbf0571baba69cd663abdbd9c6e4cc98d6d737e8c3ef4` | 2 sUSDM UTxOs, 1 ADA-only | 717 B, 0.186973 tADA |
+| close | `fd0c8c68af3253dd93fab0956975617d620a36d9aa833f2feccae7cfb39c64af` | channel | the consumer alone |
+| settle | `764ac1a9392f8dba5bada7107940065fc753cae40c9cbf4a4ee7cce82c86dcd6` | channel, the provider's token output, 1 ADA-only | by the watcher, 49 s after the close, 18.9 min before `elapse_at` |
+| end | `cfb16cc3f7db87b72b099b4db38df189d3cf7907264b06822751d9a25a47680b` | channel, 1 sUSDM UTxO | 0.008 sUSDM and 2.133450 tADA back; 624 B, 0.238378 tADA |
+
+Every opening, top-up and end paid its tokens to the wallet in one output and its change in
+ADA alone. The wallets, before and after:
+
+| | ADA-only UTxOs | largest | holding sUSDM | holding other tokens |
+|---|---:|---:|---:|---:|
+| consumer, before | 8 | 15.000000 | 9 | 1 |
+| consumer, after | 11 | 15.000000 | 1 | 1 |
+| provider, before | 4 | 5.627207 | 1 | 1 |
+| provider, after | 4 | 4.819184 | 1 | 1 |
+
+The folds moved the ADA that sat beside the tokens back into ADA-only UTxOs. They cost about
+0.01 tADA a transaction at five folded (an opening 0.190141 against 0.180945 in step 6, a top-up
+0.267995 against 0.258089), 0.005 at one (the end, 0.238378 against 0.233253). The provider's
+largest ADA-only UTxO shrinks by the claims' fees, which it earns back only in sUSDM.
+
+**Reconciliation.** ADA: consumer 71.553225 → 70.179634, provider 16.824484 → 16.016461; the
+two lost 2.181614 tADA, exactly the fees of the 9 transactions. sUSDM: consumer 999,996.706 →
+999,996.679, provider 3.294 → 3.321, nothing left in channels, so none created or lost.
 
 ## What this does not show yet
 
 - The real tUSDM. The stand-in has its shape and takes the same code paths; only the asset id
   differs.
 - The facilitator holding the provider key for servers that run none (DESIGN.md §8).
-- A client that keeps its own wallet usable across many token channels (step 6, last point).
 - The watcher at scale: each pass reads every channel the server holds, two or three Blockfrost
   queries each. With many channels a server would follow the chain rather than poll it.
 
@@ -552,6 +595,10 @@ X402_OUT=x402-step6 npm run x402 -- topup        # step 6: claim, top-up, claim,
 X402_OUT=x402-step6 npm run x402 -- autosettle   # the consumer closes; the watcher settles; the consumer ends
 X402_OUT=x402-step6 npm run x402 -- report
 SUBBIT_CURRENCY=token X402_OUT=x402-step6-token npm run x402 -- topup   # and autosettle, report
+
+export SUBBIT_CURRENCY=token X402_OUT=x402-step7-token   # step 7: the same, with the client folding
+npm run x402 -- wallets before && npm run x402 -- topup && npm run x402 -- autosettle
+npm run x402 -- wallets after && npm run x402 -- report
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

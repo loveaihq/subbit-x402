@@ -16,16 +16,15 @@ import type {
 } from "@x402/core/types";
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
 import { Address, Assets, Client, InlineDatum, KeyHash, ScriptHash, Transaction, TransactionHash, TransactionInput, TransactionWitnessSet, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
-import { Redeemer, Step, channelAddress, iouBody, inlineDatum, newIouSigner, subbitScript, tagFromInput } from "../subbit.ts";
+import { Redeemer, Step, channelAddress, iouBody, inlineDatum, newIouSigner, subbitScript, tagFromInput, type Currency } from "../subbit.ts";
 import {
-  amountIn,
   capacityOf,
   channelReserve,
   constantsOf,
   currencyOf,
   msOfSlot,
   networkIdOf,
-  onlyCurrency,
+  planTokens,
   refOf,
   slotOfMs,
   txHashOf,
@@ -172,16 +171,18 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const w = this.o.wallet;
     const me = await w.address();
     const add = [this.o.capacity ?? 0n, extra.minDeposit ? BigInt(extra.minDeposit) : 0n, 10n * amount].reduce((a, b) => (a > b ? a : b));
-    // Only UTxOs holding ADA and the channel's currency: coin selection would otherwise carry any
-    // other tokens the wallet holds into the change, at about 35 bytes each.
-    const available = (await this.available()).filter((u) => onlyCurrency(u.assets, view.datum.constants.currency));
-    const adaOnly = available.filter((u) => Assets.hasOnlyLovelace(u.assets));
+    const all = await this.available();
+    // ADA-only UTxOs pay the ADA and the fee, so no other token rides along into the change; a
+    // token channel's tokens come from the UTxOs `planTokens` picks, folding older ones in.
+    const adaOnly = all.filter((u) => Assets.hasOnlyLovelace(u.assets));
+    const c = view.datum.constants.currency;
     let tx = w.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.add()]) });
     tx = await this.withValidator(tx, extra.referenceScript);
+    if (c.kind !== "ada") tx = withTokens(tx, me, c, planTokens(all, c, add, 0n));
     tx = tx
-      .payToAddress({ address: view.address, assets: valueFor(view.datum.constants.currency, view.amount + add, view.lovelace), datum: view.utxo.datumOption as InlineDatum.InlineDatum })
+      .payToAddress({ address: view.address, assets: valueFor(c, view.amount + add, view.lovelace), datum: view.utxo.datumOption as InlineDatum.InlineDatum })
       .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
-    const sb = await retryQueries("top-up", () => tx.build({ changeAddress: me, availableUtxos: available, setCollateral: collateralTarget(adaOnly) }));
+    const sb = await retryQueries("top-up", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
     const signed = await signedHex(sb);
     for (const i of Transaction.fromCBORHex(signed).body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
     const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
@@ -237,13 +238,15 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       withdrawDelay: extra.withdrawDelay,
     };
     const cur = currencyOf(req.asset);
-    // As for a top-up, only UTxOs holding ADA and the currency, so no other token rides along.
-    const available = (await this.available()).filter((u) => onlyCurrency(u.assets, cur));
-    // The tag can come from any input the opening spends. A token channel seeds from a UTxO that
-    // holds the token, which is spent anyway; an ADA channel from the largest ADA-only UTxO. That
-    // keeps openings from using up the ADA-only UTxOs that collateral comes from.
-    const size = (u: UTxO.UTxO) => (cur.kind === "ada" ? (Assets.hasOnlyLovelace(u.assets) ? Assets.lovelaceOf(u.assets) : -1n) : amountIn(u.assets, cur));
-    const seed = available.filter((u) => size(u) > 0n).sort((a, b) => (size(b) > size(a) ? 1 : size(b) < size(a) ? -1 : 0))[0];
+    const floor = [this.o.capacity ?? 0n, extra.minDeposit ? BigInt(extra.minDeposit) : 0n, 10n * amount].reduce((a, b) => (a > b ? a : b));
+    const all = await this.available();
+    // As for a top-up: ADA from ADA-only UTxOs, a token channel's tokens from `planTokens`.
+    const adaOnly = all.filter((u) => Assets.hasOnlyLovelace(u.assets));
+    const plan = cur.kind === "ada" ? undefined : planTokens(all, cur, floor, 0n);
+    // The tag can come from any input the opening spends. A token channel seeds from the largest
+    // UTxO holding its token, which it spends anyway; an ADA channel from the largest ADA-only
+    // UTxO. That keeps openings from using up the ADA-only UTxOs that collateral comes from.
+    const seed = plan ? plan.inputs[0] : [...adaOnly].sort((a, b) => (Assets.lovelaceOf(b.assets) > Assets.lovelaceOf(a.assets) ? 1 : -1))[0];
     if (!seed) throw new Error(`no UTxO to open a ${req.asset} channel from`);
     // The tag must be unique per IOU key; Subbit's ADR: hash an input this transaction spends.
     const tag = tagFromInput(new TransactionInput.TransactionInput({ transactionId: seed.transactionId, index: seed.index }));
@@ -251,7 +254,6 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const address = channelAddress(networkIdOf(req.network));
     if (ScriptHash.toHex(address.paymentCredential as ScriptHash.ScriptHash) !== extra.scriptHash) throw new Error("server asks for a validator this client does not have");
     const cpb = (await w.getProtocolParameters()).coinsPerUtxoByte;
-    const floor = [this.o.capacity ?? 0n, extra.minDeposit ? BigInt(extra.minDeposit) : 0n, 10n * amount].reduce((a, b) => (a > b ? a : b));
     const reserve = channelReserve(address, constants, cpb);
     // An ADA channel holds its capacity plus the reserve; a token channel holds its capacity in
     // tokens and exactly the reserve in ADA, since the validator does not count that ADA.
@@ -259,13 +261,12 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const deposit = isAda ? floor + reserve : floor;
     if (this.o.maxDeposit !== undefined && deposit > this.o.maxDeposit) throw new Error(`a channel needs ${deposit} units, above maxDeposit ${this.o.maxDeposit}`);
 
-    const sb = await retryQueries("open", () =>
-      w
-        .newTx()
-        .collectFrom({ inputs: [seed] })
-        .payToAddress({ address, assets: valueFor(constants.currency, deposit, reserve), datum: inlineDatum(constants, { kind: "opened", subbed: 0n }) })
-        .build({ changeAddress: me, availableUtxos: available }),
-    );
+    const tx = (plan ? withTokens(w.newTx(), me, cur, plan) : w.newTx().collectFrom({ inputs: [seed] })).payToAddress({
+      address,
+      assets: valueFor(constants.currency, deposit, reserve),
+      datum: inlineDatum(constants, { kind: "opened", subbed: 0n }),
+    });
+    const sb = await retryQueries("open", () => tx.build({ changeAddress: me, availableUtxos: adaOnly }));
     const signed = await signedHex(sb);
     const built = Transaction.fromCBORHex(signed);
     const openInputs = built.body.inputs.map((i) => `${TransactionHash.toHex(i.transactionId)}#${i.index}`);
@@ -441,6 +442,9 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     let tx = this.o.wallet.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.end()]) });
     tx = await this.withValidator(tx, ch.referenceScript);
     tx = tx.addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
+    // The tokens coming back go out in one output with the wallet's older ones, not as a new UTxO of their own.
+    const c = view.datum.constants.currency;
+    if (c.kind !== "ada") tx = withTokens(tx, await this.o.wallet.address(), c, planTokens(await this.available(), c, 0n, view.amount));
     const transaction = await this.submitOwn("end", tx);
     await this.o.storage.set({ ...ch, status: "closed" });
     return transaction;
@@ -480,6 +484,14 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
 }
 
 // ---- helpers -------------------------------------------------------------
+
+/** `planTokens`' side of a transaction: its inputs, and one output at `me` of what goes back. */
+function withTokens<T extends ReturnType<SeedWallet["newTx"]>>(tx: T, me: Address.Address, c: Currency, plan: { inputs: UTxO.UTxO[]; rest: bigint }): T {
+  if (c.kind === "ada") return tx;
+  let out = plan.inputs.length ? tx.collectFrom({ inputs: plan.inputs }) : tx;
+  if (plan.rest > 0n) out = out.payToAddress({ address: me, assets: Assets.fromHexStrings(c.policy, c.name, plan.rest, 0n), autoMinUtxo: true });
+  return out as T;
+}
 
 function voucherPayload(ch: ClientChannel, ceiling: bigint) {
   return {

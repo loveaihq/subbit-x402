@@ -11,6 +11,7 @@
 //   batch-refund  close the 10 batch channels with Mutual
 //   topup       a channel with room for 10 requests serves 15: a claim after the 5th, a top-up (Add) at the 11th
 //   autosettle  the consumer closes a channel alone; the server's watcher settles it; the consumer ends it
+//   wallets [label]  how each wallet's UTxOs are split, recorded under the label
 //   report      every transaction's fee, and the wallets reconciled
 //
 // Usage: npm run x402 -- <phase|all>   (`all` is step 4's sequence; topup and autosettle run on their own)
@@ -35,7 +36,7 @@ import { ChannelManager, type ClaimResult } from "../../src/x402/manager.ts";
 import { BatchSettlementCardanoServer, FileChannelStorage, walletProviderSigner } from "../../src/x402/server.ts";
 import { Err, parseExtra, toBase64, type DepositPayload } from "../../src/x402/types.ts";
 import { REF_STATE, BF_BASE, ada, bf, consumer, expectEq, iso, keyHashHex, load, log, must, provider, run, save, scriptsFailed } from "../chain.ts";
-import { TOKEN, amountOf, token, unitName } from "../currency.ts";
+import { TOKEN, amountOf, onlyCurrency, token, unitName } from "../currency.ts";
 
 const NETWORK = "cardano:preprod" as const;
 const PRICE = 1_000n;
@@ -69,6 +70,15 @@ interface Results {
   checks?: Array<{ phase: string; what: string; outcome: string }>;
   /** Wallet housekeeping during the run (a `mint -- tidy`), so the report counts its fee. */
   other?: Array<{ what: string; transaction: string }>;
+  shapes?: Array<{ at: string; consumer: Shape; provider: Shape }>;
+}
+
+/** A wallet's UTxOs: the ADA-only ones (collateral comes from the largest), those holding the currency, those holding other tokens. */
+interface Shape {
+  adaOnly: number;
+  largestAdaOnly: bigint;
+  withCurrency: number;
+  withOther: number;
 }
 
 /** Loads the results, applies `f`, saves: phases that call other phases never write over each other. */
@@ -485,6 +495,24 @@ async function phaseAutoSettle(s: Stack) {
   log(`autosettle: the consumer ended ${channelId.slice(0, 16)}… in ${end}: ${ada(view.amount)} ${unitName}${TOKEN ? ` and ${ada(view.lovelace)} tADA` : ""} back`);
 }
 
+async function phaseWallets(label: string) {
+  const one = async (w: typeof consumer): Promise<Shape> => {
+    const us = await w.getWalletUtxos();
+    const ada_ = us.filter((u) => Assets.hasOnlyLovelace(u.assets));
+    const mine = us.filter((u) => !Assets.hasOnlyLovelace(u.assets) && TOKEN && onlyCurrency(u.assets));
+    return {
+      adaOnly: ada_.length,
+      largestAdaOnly: ada_.reduce((m, u) => (Assets.lovelaceOf(u.assets) > m ? Assets.lovelaceOf(u.assets) : m), 0n),
+      withCurrency: mine.length,
+      withOther: us.length - ada_.length - mine.length,
+    };
+  };
+  const shape = { consumer: await one(consumer), provider: await one(provider) };
+  record((r) => (r.shapes ??= []).push({ at: label, ...shape }));
+  const fmt = (x: Shape) => `${x.adaOnly} ADA-only (largest ${ada(x.largestAdaOnly)}), ${x.withCurrency} holding ${unitName}, ${x.withOther} holding other tokens`;
+  log(`wallets, ${label}: consumer ${fmt(shape.consumer)}; provider ${fmt(shape.provider)}`);
+}
+
 /** The route's payment requirements, as its 402 states them. */
 async function requirements(): Promise<PaymentRequirements> {
   const res = await fetch(URL_DATA);
@@ -619,6 +647,7 @@ async function main() {
     if (phase === "refund" || phase === "all") await phaseRefund(s, phase === "refund" ? (process.argv[3] ?? "client") : "client");
     if (phase === "batch" || phase === "all") await phaseBatch(s);
     if (phase === "batch-refund" || phase === "all") await phaseBatchRefund(s);
+    if (phase === "wallets") await phaseWallets(process.argv[3] ?? new Date().toISOString());
     if (phase === "topup") await phaseTopUp(s);
     if (phase === "autosettle") await phaseAutoSettle(s);
     if (phase === "report" || phase === "all") await phaseReport();

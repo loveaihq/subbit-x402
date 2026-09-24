@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPrivateKey, sign as edSign } from "node:crypto";
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
-import { Assets, TxOut } from "@evolution-sdk/evolution";
+import { Assets, TxOut, type UTxO } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH, channelAddress, iouBody, inlineDatum, newIouSigner, parseDatum, datumData } from "../src/subbit.ts";
-import { capacityOf, channelReserve, constantsOf, datumBindingError, type ChannelView } from "../src/x402/cardano.ts";
+import { capacityOf, channelReserve, constantsOf, datumBindingError, planTokens, type ChannelView } from "../src/x402/cardano.ts";
 import { BatchSettlementCardanoClient, FileClientStorage } from "../src/x402/client.ts";
 import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x402/server.ts";
 import { Err, PayloadError, configBindingError, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
@@ -108,6 +108,31 @@ test("capacity is cumulative, like IOUs: what is already redeemed counts toward 
   const tokens = constantsOf({ ...config, token: "085c41bd155d0562653d61a847bc00b0dae291f323ed43b347419c19.0014df10735553444d" }, TAG);
   const tview = { address, lovelace: 2_133_450n, amount: 5_000n, datum: { ownHash: SUBBIT_HASH, constants: tokens, stage: { kind: "opened", subbed: 15_000n } } } as unknown as ChannelView;
   assert.equal(capacityOf(tview, 4310n), 20_000n);
+});
+
+test("token inputs: enough for what is needed, largest first, then folded up to five; the rest goes back in one output", () => {
+  const policy = "085c41bd155d0562653d61a847bc00b0dae291f323ed43b347419c19";
+  const name = "0014df10735553444d";
+  const cur = { kind: "asset", policy, name } as const;
+  const u = (tokens: bigint, lovelace = 1_900_000n) => ({ assets: Assets.fromHexStrings(policy, name, tokens, lovelace) }) as unknown as UTxO.UTxO;
+  const adaOnly = { assets: Assets.fromLovelace(15_000_000n) } as unknown as UTxO.UTxO;
+  const junk = { assets: Assets.merge(Assets.fromHexStrings(policy, name, 900n, 2_000_000n), Assets.fromHexStrings("ab".repeat(28), "01", 1n, 0n)) } as unknown as UTxO.UTxO;
+  const wallet = [u(5n), adaOnly, u(1_000_000n), junk, u(30n), u(7n), u(2n), u(1n), u(3n)];
+  const held = (x: UTxO.UTxO[]) => x.map((v) => Assets.getByUnit(v.assets, policy + name));
+
+  // An opening needing 10,000: the big one covers it, four more are folded in; the rest goes back.
+  const open = planTokens(wallet, cur, 10_000n, 0n);
+  assert.deepEqual(held(open.inputs), [1_000_000n, 30n, 7n, 5n, 3n]);
+  assert.equal(open.rest, 1_000_045n - 10_000n);
+  // Never ADA-only UTxOs (they pay ADA and collateral) nor ones holding another token.
+  assert.ok(!open.inputs.includes(adaOnly) && !open.inputs.includes(junk));
+  // An end hands back 8,000 and spends nothing: up to five older outputs fold into its one.
+  const end = planTokens(wallet, cur, 0n, 8_000n);
+  assert.equal(end.inputs.length, 5);
+  assert.equal(end.rest, 1_000_045n + 8_000n);
+  // Needing more than the five largest hold takes as many as it needs.
+  assert.equal(planTokens([u(1n), u(1n), u(1n), u(1n), u(1n), u(1n), u(1n)], cur, 6n, 0n).inputs.length, 6);
+  assert.throws(() => planTokens(wallet, cur, 2_000_000n, 0n), /1000048 of the currency, 2000000 needed/);
 });
 
 test("the ADA reserve covers every continuing output the channel can have", () => {

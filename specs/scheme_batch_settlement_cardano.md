@@ -417,8 +417,12 @@ Redeemed tokens SHOULD go to `payTo` in an output of their own so the server's c
 ADA-only, which Cardano collateral requires, and SHOULD fold earlier such outputs into it: each
 holds a min-UTxO of ADA, and with one new output per claim the reference server ran out of
 ADA-only UTxOs large enough for collateral, so it could build neither a claim nor a settle. A server SHOULD keep the inputs of the claims it has built out of coin selection
-until its chain view drops them. Clients face the same with the token outputs their refunds and
-ends return.
+until its chain view drops them. A client SHOULD do the same in the transactions it builds alone:
+an opening or top-up takes its tokens from UTxOs holding ADA and the currency only, folds older
+ones in, and pays the rest to itself in one output, with ADA and the fee from ADA-only UTxOs; an
+end folds older token outputs into the one taking the channel's tokens back. A refund cannot fold
+(it spends the channel alone), so it returns one UTxO of tokens and reserve for the client's next
+transaction to fold.
 
 ## Client verification rules
 
@@ -496,11 +500,11 @@ This repository: `src/x402/` implements the client, resource-server and facilita
 `@x402/core` 2.27.0 and the server's channel manager, on `@evolution-sdk/evolution` 0.5.13 and
 Blockfrost. `RESULTS.md` records every preprod transaction: steps 1–3 exercise the validator,
 step 4 the ADA binding end to end, step 5 a token binding, step 6 top-ups and the automatic
-settle after a consumer's close.
+settle after a consumer's close, step 7 a client that folds its token UTxOs.
 
 ## Version history
 
 | Version | Date | Changes |
 |---|---|---|
 | 0.1 | 2026-09-24 | First draft, from the reference implementation and preprod runs |
-| 0.2 | 2026-09-24 | Top-ups (`Add`) and their verification; the server watches its channels and settles a closed one; a voucher above the recorded balance is checked against the chain |
+| 0.2 | 2026-09-24 | Top-ups (`Add`) and their verification; the server watches its channels and settles a closed one; a voucher above the recorded balance is checked against the chain; token outputs are folded, by the server and the client |

@@ -9,7 +9,7 @@ import type { FacilitatorClient } from "@x402/core/server";
 import type { PaymentRequirements } from "@x402/core/types";
 import { Address, Assets, KeyHash, Transaction, TransactionHash } from "@evolution-sdk/evolution";
 import { Redeemer, Step, inlineDatum, subbitScript, type Stage } from "../subbit.ts";
-import { refOf, valueFor, type ChannelView } from "./cardano.ts";
+import { FOLD, refOf, valueFor, type ChannelView } from "./cardano.ts";
 import { retryQueries, type Chain } from "./chain.ts";
 import { collateralTarget, signedHex, type SeedWallet } from "./client.ts";
 import type { ChannelStorage, ServerChannel } from "./server.ts";
@@ -27,9 +27,6 @@ export interface ManagerOptions {
   scriptHash: string;
   referenceScript?: string;
 }
-
-/** How many of the provider's earlier token outputs one claim folds into its own. */
-const FOLD = 5;
 
 export interface ClaimResult {
   transaction: string;
