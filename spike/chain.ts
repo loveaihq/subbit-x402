@@ -1,6 +1,7 @@
-// Chain plumbing shared by the spike's steps: the two preprod wallets, submitting and
-// waiting, reading results back from Blockfrost, slot arithmetic, build-only validator
-// checks, and the checks a provider makes before serving a channel it did not open.
+// Chain plumbing shared by the spike's steps: the preprod wallets, where transactions get
+// the validator from, submitting and waiting, reading results back from Blockfrost, slot
+// arithmetic, build-only validator checks, and the checks a provider makes before serving
+// a channel it did not open.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import {
   Address,
@@ -15,7 +16,7 @@ import {
   preprod,
   type UTxO,
 } from "@evolution-sdk/evolution";
-import { SUBBIT_HASH, channelAddress, parseDatum, type Constants } from "../src/subbit.ts";
+import { SUBBIT_HASH, channelAddress, parseDatum, subbitScript, type Constants } from "../src/subbit.ts";
 
 export const NETWORK_ID = 0;
 export const BF_BASE = "https://cardano-preprod.blockfrost.io/api/v0";
@@ -29,6 +30,60 @@ export const consumer = wallet(0);
 export const provider = wallet(1);
 export type Wallet = typeof consumer;
 export const chan = channelAddress(NETWORK_ID);
+
+// ---- where a transaction gets the validator from --------------------------
+
+/**
+ * `SUBBIT_SCRIPT=ref` has every transaction that spends a channel read the validator from the
+ * reference-script output `npm run refscript -- deploy` made. The default, `inline`, attaches
+ * its 3,046 bytes to each such transaction, as steps 1 and 2 did.
+ */
+export const SCRIPT_MODE = scriptMode();
+/**
+ * Account 2 holds the reference-script output and never builds a transaction. The SDK's coin
+ * selection skips only the reference inputs of the transaction being built, so in a spending
+ * wallet the output could go out as plain ADA in the next ordinary transaction.
+ */
+export const refHolder = wallet(2);
+export const REF_STATE = new URL("../out/refscript.json", import.meta.url);
+
+/** A step's state file. Each mode keeps its own, so a run in one never resumes the other's. */
+export const stateFile = (step: string, mode = SCRIPT_MODE) => new URL(`../out/${step}${mode === "ref" ? "-ref" : ""}.json`, import.meta.url);
+
+type TxBuilder = ReturnType<Wallet["newTx"]>;
+let refUtxo: Promise<UTxO.UTxO> | undefined;
+
+/** Gives a transaction that spends a channel its validator: attached, or by reference, per SUBBIT_SCRIPT. */
+export async function withSubbit(tx: TxBuilder): Promise<TxBuilder> {
+  if (SCRIPT_MODE === "inline") return tx.attachScript({ script: subbitScript });
+  refUtxo ??= refScriptUtxo();
+  return tx.readFrom({ referenceInputs: [await refUtxo] });
+}
+
+/** The deployed reference-script output, read from the chain and checked to carry exactly the Subbit validator. */
+export async function refScriptUtxo(): Promise<UTxO.UTxO> {
+  const ref = load<{ out?: { txHash: string; index: number } }>(REF_STATE).out;
+  if (!ref) throw new Error("no reference script yet: run `npm run refscript -- deploy` first");
+  const at = `${ref.txHash}#${ref.index}`;
+  for (let attempt = 0; ; attempt++) {
+    const [u] = await refHolder.getUtxosByOutRef([outRef(ref.txHash, ref.index)]).catch(() => []);
+    if (u?.scriptRef) {
+      const hash = ScriptHash.toHex(ScriptHash.fromScript(u.scriptRef));
+      if (hash !== SUBBIT_HASH) throw new Error(`${at} carries script ${hash}, not the Subbit validator`);
+      return u;
+    }
+    // Right after the deploy the indexer may not have the output yet, and the SDK drops a
+    // reference script it cannot fetch instead of failing, so both are retried.
+    if (attempt >= 10) throw new Error(u ? `${at} carries no reference script` : `${at} is spent or unknown`);
+    await new Promise((res) => setTimeout(res, 3_000));
+  }
+}
+
+function scriptMode(): "inline" | "ref" {
+  const m = process.env.SUBBIT_SCRIPT ?? "inline";
+  if (m !== "inline" && m !== "ref") throw new Error(`SUBBIT_SCRIPT must be inline or ref, not ${m}`);
+  return m;
+}
 
 // ---- the provider's own checks on a channel it did not open -------------
 
@@ -122,7 +177,26 @@ export async function submit(what: string, submitBuilder: { submit(): Promise<Tr
   log(`${what}: submitted ${hex}, waiting for a block…`);
   const ok = await client.awaitTx(hash, 5_000, 240_000);
   if (!ok) throw new Error(`${what}: ${hex} not confirmed in 4 minutes`);
+  await untilIndexed(hex, client);
   return hex;
+}
+
+/**
+ * Blockfrost's address index trails a confirmed transaction by ~20 s, and until it catches up
+ * the wallet still lists the inputs just spent. The SDK evaluates against the UTxOs it selected
+ * (`/utils/txs/evaluate/utxos`), so a build that picks one of them passes evaluation and fails
+ * only at submission. Wait until none of them is listed.
+ */
+async function untilIndexed(txHash: string, client: Wallet) {
+  const spent = new Set(
+    ((await bf(`/txs/${txHash}/utxos`)) as BfUtxos).inputs.filter((i) => !i.collateral && !i.reference).map((i) => `${i.tx_hash}#${i.output_index}`),
+  );
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const listed = (await client.getWalletUtxos()).map((u) => `${TransactionHash.toHex(u.transactionId)}#${u.index}`);
+    if (!listed.some((k) => spent.has(k))) return;
+    await new Promise((res) => setTimeout(res, 3_000));
+  }
+  throw new Error(`${txHash}: a minute after confirmation the wallet still lists inputs it spent`);
 }
 
 export interface BfOutput {
@@ -130,6 +204,7 @@ export interface BfOutput {
   amount: Array<{ unit: string; quantity: string }>;
   output_index: number;
   inline_datum?: string | null;
+  reference_script_hash?: string | null;
 }
 
 export interface BfUtxos {
@@ -211,7 +286,14 @@ export function log(s: string) {
 
 export function run(main: () => Promise<void>) {
   main().catch((e) => {
-    console.error(e instanceof Error ? (e.stack ?? e.message) : e);
+    const hide = (s: string) => s.replaceAll(BF_KEY, "<project id>");
+    console.error(hide(e instanceof Error ? (e.stack ?? e.message) : String(e)));
+    // The SDK wraps the node's or the evaluator's own answer several causes deep.
+    for (let c = causeOf(e), depth = 0; c != null && depth < 10; c = causeOf(c), depth++) {
+      console.error(hide(`  caused by: ${c instanceof Error ? c.message : JSON.stringify(c, big)}`));
+    }
     process.exit(1);
   });
 }
+
+const causeOf = (v: unknown) => (v !== null && typeof v === "object" ? (v as { cause?: unknown }).cause : undefined);

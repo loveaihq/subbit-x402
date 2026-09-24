@@ -20,7 +20,7 @@
 //
 // Usage: npm run lifecycle -- <phase|all|report>
 //        `all` runs b-open and b-close first, so B's close period runs down while A runs.
-// Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID
+// Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID, SUBBIT_SCRIPT=inline|ref (default inline)
 import { createPrivateKey, sign as edSign, type KeyObject } from "node:crypto";
 import { Address, Assets, Data, InlineDatum, KeyHash, type UTxO } from "@evolution-sdk/evolution";
 import {
@@ -32,7 +32,6 @@ import {
   inlineDatum,
   newIouSigner,
   parseDatum,
-  subbitScript,
   tagFromInput,
   type Constants,
   type Stage,
@@ -60,10 +59,13 @@ import {
   refused,
   run,
   save as saveFile,
+  SCRIPT_MODE,
   slotAtOrAfter,
   slotOf,
+  stateFile,
   submit,
   waitForSlot,
+  withSubbit,
   type BfUtxos,
 } from "./chain.ts";
 
@@ -73,7 +75,7 @@ const A = { deposit: 10_000_000n, closePeriodMs: 3_600_000n };
 const B = { deposit: 5_000_000n, closePeriodMs: 600_000n };
 /** How long a close stays submittable. elapse_at lands this far out plus the close period. */
 const CLOSE_TTL_SLOTS = 300n;
-const STATE = new URL("../out/lifecycle.json", import.meta.url);
+const STATE = stateFile("lifecycle");
 
 interface Iou {
   amount: bigint;
@@ -102,6 +104,7 @@ const save = (s: State) => saveFile(STATE, s);
 
 async function main() {
   const phase = process.argv[2] ?? "all";
+  log(`validator: ${SCRIPT_MODE === "ref" ? "read from the reference-script output" : "attached inline"}`);
   const phases: Record<string, () => Promise<void>> = {
     "a-open": aOpen,
     "a-sub": aSub,
@@ -413,10 +416,8 @@ interface SubTx {
 
 async function subTx(ch: Channel, utxo: UTxO.UTxO, o: SubTx) {
   const me = await provider.address();
-  return provider
-    .newTx()
+  return (await withSubbit(provider.newTx()))
     .collectFrom({ inputs: [utxo], redeemer: Redeemer.main([Step.sub(o.owed, o.sig)]) })
-    .attachScript({ script: subbitScript })
     .payToAddress({ address: chan, assets: Assets.fromLovelace(o.keep), datum: inlineDatum(ch.constants, { kind: "opened", subbed: o.subbedOut }) })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(me)) })
     .build({ changeAddress: me });
@@ -433,10 +434,8 @@ interface CloseTx {
 async function closeTx(ch: Channel, utxo: UTxO.UTxO, o: CloseTx) {
   const w = walletOf(o.by);
   const me = await w.address();
-  let tx = w
-    .newTx()
+  let tx = (await withSubbit(w.newTx()))
     .collectFrom({ inputs: [utxo], redeemer: Redeemer.main([Step.close()]) })
-    .attachScript({ script: subbitScript })
     .payToAddress({
       address: chan,
       assets: Assets.fromLovelace(o.keep),
@@ -458,10 +457,8 @@ interface SettleTx {
 async function settleTx(ch: Channel, utxo: UTxO.UTxO, o: SettleTx) {
   const w = walletOf(o.by);
   const me = await w.address();
-  return w
-    .newTx()
+  return (await withSubbit(w.newTx()))
     .collectFrom({ inputs: [utxo], redeemer: Redeemer.main([Step.settle(o.owed, o.sig)]) })
-    .attachScript({ script: subbitScript })
     .payToAddress({ address: chan, assets: Assets.fromLovelace(o.keep), datum: inlineDatum(ch.constants, o.stageOut) })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(me)) })
     .build({ changeAddress: me });
@@ -471,10 +468,8 @@ async function settleTx(ch: Channel, utxo: UTxO.UTxO, o: SettleTx) {
 async function endTx(utxo: UTxO.UTxO, by: Who) {
   const w = walletOf(by);
   const me = await w.address();
-  return w
-    .newTx()
+  return (await withSubbit(w.newTx()))
     .collectFrom({ inputs: [utxo], redeemer: Redeemer.main([Step.end()]) })
-    .attachScript({ script: subbitScript })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(me)) })
     .build({ changeAddress: me });
 }
@@ -482,10 +477,8 @@ async function endTx(utxo: UTxO.UTxO, by: Who) {
 async function elapseTx(utxo: UTxO.UTxO, by: Who, from: bigint) {
   const w = walletOf(by);
   const me = await w.address();
-  return w
-    .newTx()
+  return (await withSubbit(w.newTx()))
     .collectFrom({ inputs: [utxo], redeemer: Redeemer.main([Step.elapse()]) })
-    .attachScript({ script: subbitScript })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(me)) })
     .setValidity({ from })
     .build({ changeAddress: me });

@@ -7,7 +7,7 @@
 //
 // Every result is read back from Blockfrost, not taken from the builder's word.
 // Usage: npm run spike -- <balance|open|ious|sub|mutual|all|negative>
-// Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID
+// Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID, SUBBIT_SCRIPT=inline|ref (default inline)
 import { createPrivateKey, sign as edSign } from "node:crypto";
 import { Address, Assets, Data, KeyHash } from "@evolution-sdk/evolution";
 import {
@@ -19,7 +19,6 @@ import {
   inlineDatum,
   newIouSigner,
   parseDatum,
-  subbitScript,
   tagFromInput,
   type Constants,
 } from "../src/subbit.ts";
@@ -41,8 +40,11 @@ import {
   provider,
   run,
   save as saveFile,
+  SCRIPT_MODE,
   scriptsFailed,
+  stateFile,
   submit,
+  withSubbit,
   type BfOutput,
 } from "./chain.ts";
 
@@ -51,7 +53,7 @@ const PRICE = 1_000n; // 0.001 ADA per request: under Cardano's ~0.98 ADA per-ou
 const REQUESTS = 5_000;
 const PROVIDER_FLOAT = 10_000_000n; // provider needs its own ADA for fees and collateral
 const CLOSE_PERIOD_MS = 3_600_000n;
-const STATE = new URL("../out/state.json", import.meta.url);
+const STATE = stateFile("state");
 const load = () => loadFile<State>(STATE);
 const save = (s: State) => saveFile(STATE, s);
 
@@ -67,6 +69,7 @@ interface State {
 
 async function main() {
   const phase = process.argv[2] ?? "all";
+  log(`validator: ${SCRIPT_MODE === "ref" ? "read from the reference-script output" : "attached inline"}`);
   const phases: Record<string, () => Promise<void>> = { balance, open, ious, sub, mutual, negative };
   if (phase === "all") {
     for (const p of ["balance", "open", "ious", "sub", "mutual"]) await phases[p]!();
@@ -192,10 +195,8 @@ async function sub() {
     const take = owed - c.stage.subbed;
     if (held - take < 2_000_000n) throw new Error("IOU would drain the channel below its min-UTxO reserve");
 
-    const signBuilder = await provider
-      .newTx()
+    const signBuilder = await (await withSubbit(provider.newTx()))
       .collectFrom({ inputs: [channel], redeemer: Redeemer.main([Step.sub(owed, sig)]) })
-      .attachScript({ script: subbitScript })
       .payToAddress({
         address: chan,
         assets: Assets.fromLovelace(held - take),
@@ -235,10 +236,8 @@ async function mutual() {
   if (!channel) throw new Error("channel UTxO not found");
   const held = Assets.lovelaceOf(channel.assets);
 
-  const signBuilder = await consumer
-    .newTx()
+  const signBuilder = await (await withSubbit(consumer.newTx()))
     .collectFrom({ inputs: [channel], redeemer: Redeemer.mutual() })
-    .attachScript({ script: subbitScript })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(consumerAddr)) })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(providerAddr)) })
     .build({ changeAddress: consumerAddr });
@@ -305,10 +304,8 @@ async function negative() {
   const attempt = async (label: string, owed: bigint, sig: string, take: bigint, expect: "accept" | "reject") => {
     let verdict: string;
     try {
-      await provider
-        .newTx()
+      await (await withSubbit(provider.newTx()))
         .collectFrom({ inputs: [channel], redeemer: Redeemer.main([Step.sub(owed, sig)]) })
-        .attachScript({ script: subbitScript })
         .payToAddress({ address: chan, assets: Assets.fromLovelace(held - take), datum: inlineDatum(constants, { kind: "opened", subbed: take }) })
         .addSigner({ keyHash: providerKH })
         .build({ changeAddress: providerAddr });
@@ -329,10 +326,8 @@ async function negative() {
   await attempt("control: take exactly the 1 ADA signed for", ONE, iou, ONE, "accept");
 
   // Give the tADA back.
-  const sb = await consumer
-    .newTx()
+  const sb = await (await withSubbit(consumer.newTx()))
     .collectFrom({ inputs: [channel], redeemer: Redeemer.mutual() })
-    .attachScript({ script: subbitScript })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(consumerAddr)) })
     .addSigner({ keyHash: providerKH })
     .build({ changeAddress: consumerAddr });

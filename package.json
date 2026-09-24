@@ -9,6 +9,7 @@
   "scripts": {
     "spike": "tsx spike/run.ts",
     "lifecycle": "tsx spike/lifecycle.ts",
+    "refscript": "tsx spike/refscript.ts",
     "test": "node --test --import tsx test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
