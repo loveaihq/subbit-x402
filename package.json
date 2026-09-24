@@ -1,0 +1,26 @@
+{
+  "name": "subbit-x402",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Spike: x402 batch-settlement on Cardano, using Subbit.xyz channels",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "Vincent <loveaihqhq@gmail.com>",
+  "scripts": {
+    "spike": "tsx spike/run.ts",
+    "test": "node --test --import tsx test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@evolution-sdk/evolution": "0.5.13",
+    "@noble/hashes": "2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}
