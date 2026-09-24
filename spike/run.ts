@@ -6,28 +6,14 @@
 //   mutual  both sign to close; the consumer gets the rest back
 //
 // Every result is read back from Blockfrost, not taken from the builder's word.
-// Usage: npm run spike -- <balance|open|ious|sub|mutual|all>
+// Usage: npm run spike -- <balance|open|ious|sub|mutual|all|negative>
 // Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createPrivateKey, sign as edSign } from "node:crypto";
-import {
-  Address,
-  Assets,
-  Client,
-  Data,
-  InlineDatum,
-  KeyHash,
-  ScriptHash,
-  TransactionHash,
-  TransactionInput,
-  preprod,
-  type UTxO,
-} from "@evolution-sdk/evolution";
+import { Address, Assets, Data, KeyHash } from "@evolution-sdk/evolution";
 import {
   Redeemer,
   SUBBIT_HASH,
   Step,
-  channelAddress,
   iouBody,
   iouVerifier,
   inlineDatum,
@@ -37,24 +23,37 @@ import {
   tagFromInput,
   type Constants,
 } from "../src/subbit.ts";
+import {
+  ada,
+  bf,
+  big,
+  chan,
+  checkChannel,
+  consumer,
+  expectEq,
+  inputOf,
+  keyHashHex,
+  load as loadFile,
+  log,
+  lovelaceOfBf,
+  netFor,
+  outRef,
+  provider,
+  run,
+  save as saveFile,
+  scriptsFailed,
+  submit,
+  type BfOutput,
+} from "./chain.ts";
 
 const DEPOSIT = 20_000_000n; // 20 tADA into the channel
 const PRICE = 1_000n; // 0.001 ADA per request: under Cardano's ~0.98 ADA per-output floor
 const REQUESTS = 5_000;
 const PROVIDER_FLOAT = 10_000_000n; // provider needs its own ADA for fees and collateral
 const CLOSE_PERIOD_MS = 3_600_000n;
-const NETWORK_ID = 0;
-const BF_BASE = "https://cardano-preprod.blockfrost.io/api/v0";
 const STATE = new URL("../out/state.json", import.meta.url);
-
-const MNEMONIC = must("WALLET_MNEMONIC");
-const BF_KEY = must("BLOCKFROST_PROJECT_ID");
-
-const wallet = (accountIndex: number) =>
-  Client.make(preprod).withBlockfrost({ baseUrl: BF_BASE, projectId: BF_KEY }).withSeed({ mnemonic: MNEMONIC, accountIndex });
-const consumer = wallet(0);
-const provider = wallet(1);
-const chan = channelAddress(NETWORK_ID);
+const load = () => loadFile<State>(STATE);
+const save = (s: State) => saveFile(STATE, s);
 
 interface State {
   constants?: Constants;
@@ -187,7 +186,7 @@ async function sub() {
     if (!channel) throw new Error("channel UTxO not found");
 
     // Opening ran no validator, so everything the provider relies on is checked here.
-    const c = checkChannel(channel, keyHashHex(providerAddr), st.constants);
+    const c = checkChannel(channel, keyHashHex(providerAddr), st.constants, CLOSE_PERIOD_MS);
     const held = Assets.lovelaceOf(channel.assets);
     if (c.stage.kind !== "opened") throw new Error("channel is not open");
     const take = owed - c.stage.subbed;
@@ -315,9 +314,8 @@ async function negative() {
         .build({ changeAddress: providerAddr });
       verdict = "accept";
     } catch (e) {
-      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-      // Only a script failure counts as a rejection; anything else (network, rate limit) is a broken test.
-      if (!/evaluat|script|validator|ExUnits|redeemer/i.test(msg)) throw e;
+      // Only the evaluator reporting a script failure counts as a rejection; anything else (network, rate limit) is a broken test.
+      if (!scriptsFailed(e)) throw e;
       verdict = "reject";
     }
     if (verdict !== expect) throw new Error(`${label}: expected ${expect}, validator said ${verdict}`);
@@ -344,114 +342,4 @@ async function negative() {
   log(`negative: 4 dishonest subs refused by the validator, the honest one built; channel closed in ${closed}`);
 }
 
-// ---- the provider's own checks on a channel it did not open -------------
-
-function checkChannel(utxo: UTxO.UTxO, providerKeyHash: string, expected: Constants) {
-  const pay = utxo.address.paymentCredential;
-  if (!(pay instanceof ScriptHash.ScriptHash) || ScriptHash.toHex(pay) !== SUBBIT_HASH) throw new Error("not at the Subbit script");
-  if (utxo.scriptRef) throw new Error("channel carries a reference script");
-  if (!Assets.hasOnlyLovelace(utxo.assets)) throw new Error("channel holds tokens besides ADA");
-  if (!(utxo.datumOption instanceof InlineDatum.InlineDatum)) throw new Error("channel datum is not inline");
-  const d = parseDatum(utxo.datumOption.data);
-  if (d.ownHash !== SUBBIT_HASH) throw new Error("datum names another script");
-  if (d.constants.provider !== providerKeyHash) throw new Error("channel is for another provider");
-  if (d.constants.currency.kind !== "ada") throw new Error("channel currency is not ADA");
-  if (d.constants.closePeriodMs < CLOSE_PERIOD_MS) throw new Error("close period too short to settle in");
-  if (Buffer.from(d.constants.iouKey, "hex").length !== 32) throw new Error("IOU key is not 32 bytes");
-  if (Buffer.from(d.constants.tag, "hex").length > 64) throw new Error("tag too long");
-  if (d.constants.iouKey !== expected.iouKey || d.constants.tag !== expected.tag) throw new Error("channel is not the one the IOUs were signed for");
-  return d;
-}
-
-// ---- plumbing -------------------------------------------------------------
-
-async function submit(what: string, submitBuilder: { submit(): Promise<TransactionHash.TransactionHash> }, client: typeof consumer) {
-  const hash = await submitBuilder.submit();
-  const hex = TransactionHash.toHex(hash);
-  log(`${what}: submitted ${hex}, waiting for a block…`);
-  const ok = await client.awaitTx(hash, 5_000, 240_000);
-  if (!ok) throw new Error(`${what}: ${hex} not confirmed in 4 minutes`);
-  return hex;
-}
-
-interface BfOutput {
-  address: string;
-  amount: Array<{ unit: string; quantity: string }>;
-  output_index: number;
-  inline_datum?: string | null;
-}
-
-async function bf(path: string) {
-  for (let attempt = 0; ; attempt++) {
-    const r = await fetch(BF_BASE + path, { headers: { project_id: BF_KEY } });
-    if (r.ok) return r.json();
-    if (r.status !== 404 || attempt >= 10) throw new Error(`Blockfrost ${path}: ${r.status}`);
-    await new Promise((res) => setTimeout(res, 3_000)); // indexer lag right after confirmation
-  }
-}
-
-function lovelaceOfBf(o: { amount: Array<{ unit: string; quantity: string }> }): bigint {
-  return BigInt(o.amount.find((a) => a.unit === "lovelace")?.quantity ?? "0");
-}
-
-function netFor(utxos: { inputs: Array<{ address: string; amount: BfOutput["amount"] }>; outputs: BfOutput[] }, address: string): bigint {
-  const sum = (xs: Array<{ address: string; amount: BfOutput["amount"] }>) =>
-    xs.filter((x) => x.address === address).reduce((s, x) => s + lovelaceOfBf(x), 0n);
-  // A valid transaction spends neither its collateral nor its reference inputs, and does not
-  // create its collateral-return output — Blockfrost lists all three anyway, flagged.
-  type Flags = { collateral?: boolean; reference?: boolean };
-  const spent = utxos.inputs.filter((i) => !(i as Flags).collateral && !(i as Flags).reference);
-  const created = utxos.outputs.filter((o) => !(o as Flags).collateral);
-  return sum(created) - sum(spent);
-}
-
-function inputOf(u: UTxO.UTxO) {
-  return new TransactionInput.TransactionInput({ transactionId: u.transactionId, index: u.index });
-}
-
-function outRef(txHash: string, index: number) {
-  return new TransactionInput.TransactionInput({ transactionId: TransactionHash.fromHex(txHash), index: BigInt(index) });
-}
-
-function keyHashHex(a: Address.Address): string {
-  if (!(a.paymentCredential instanceof KeyHash.KeyHash)) throw new Error("expected a key address");
-  return KeyHash.toHex(a.paymentCredential);
-}
-
-function expectEq(what: string, actual: unknown, expected: unknown) {
-  if (actual !== expected) throw new Error(`${what}: expected ${String(expected)}, got ${String(actual)}`);
-  log(`  ok  ${what}`);
-}
-
-const big = (_: string, v: unknown) => (typeof v === "bigint" ? `${v}n` : v);
-
-function load(): State {
-  if (!existsSync(STATE)) return {};
-  return JSON.parse(readFileSync(STATE, "utf8"), (_, v) => (typeof v === "string" && /^-?\d+n$/.test(v) ? BigInt(v.slice(0, -1)) : v));
-}
-
-function save(s: State) {
-  mkdirSync(new URL(".", STATE), { recursive: true });
-  writeFileSync(STATE, JSON.stringify(s, big, 2));
-}
-
-function ada(lovelace: bigint): string {
-  const neg = lovelace < 0n;
-  const v = neg ? -lovelace : lovelace;
-  return `${neg ? "-" : ""}${v / 1_000_000n}.${(v % 1_000_000n).toString().padStart(6, "0")}`;
-}
-
-function must(k: string): string {
-  const v = process.env[k];
-  if (!v) throw new Error(`${k} is not set`);
-  return v;
-}
-
-function log(s: string) {
-  console.log(`[${new Date().toISOString().slice(11, 19)}] ${s}`);
-}
-
-main().catch((e) => {
-  console.error(e instanceof Error ? (e.stack ?? e.message) : e);
-  process.exit(1);
-});
+run(main);
