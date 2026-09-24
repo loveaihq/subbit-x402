@@ -5,7 +5,8 @@ on preprod (`RESULTS.md`, step 4), which added three rules below: a refund whose
 is under min-UTxO is preceded by a claim (§5), an unconfirmed settle is `settlement_pending` with
 the transaction id (§6), and a client abandons an opening only when an input of it was spent
 elsewhere (§6). Milestone 2, token channels, ran the same way with a USDM stand-in (`RESULTS.md`,
-step 5) and added the rules on a token channel's ADA (§4, §5). It follows x402 `main` @ `80c2fa49`
+step 5) and added the rules on a token channel's ADA (§4, §5). The binding as a specification
+draft, in x402's format: `specs/scheme_batch_settlement_cardano.md`. It follows x402 `main` @ `80c2fa49`
 (generic spec, EVM binding, SVM draft) and `@x402/core` / `@x402/evm` 2.27.0, and reuses the
 Cardano conventions of `@x402/cardano` 2.27.0 (`exact`). Subbit is kompact-io/subbit-xyz @
 66648db, as vendored; every Subbit fact below is from its Aiken source at that commit or from
