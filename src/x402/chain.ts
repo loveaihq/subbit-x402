@@ -149,6 +149,24 @@ export class SubmitError extends Error {
   }
 }
 
+/**
+ * Runs an SDK call again when Blockfrost fails a query (a burst limit or a 5xx; preprod runs
+ * showed both), up to `attempts` times. A script failure or anything else is thrown at once:
+ * retrying those would hide a real refusal.
+ */
+export async function retryQueries<T>(what: string, fn: () => Promise<T>, attempts = 4): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const text = String((e as Error)?.message ?? e);
+      const query = /Blockfrost (getProtocolParameters|getUtxos|getUtxosByOutRef|getDelegation|getDatum)[A-Za-z]* failed|Failed to fetch protocol parameters/.test(text);
+      if (!query || /ScriptFailures|Script evaluation failed/.test(text) || i >= attempts) throw e;
+      await new Promise((res) => setTimeout(res, 5_000 * i));
+    }
+  }
+}
+
 export function splitRef(ref: string): [string, number] {
   const m = /^([0-9a-f]{64})#(\d+)$/.exec(ref);
   if (!m) throw new Error(`not an out-ref: ${ref}`);

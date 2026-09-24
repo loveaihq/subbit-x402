@@ -62,12 +62,27 @@ export interface ChannelView {
   address: Address.Address;
   datum: ParsedDatum;
   lovelace: bigint;
+  /** How much of its currency it holds: its lovelace for an ADA channel, its tokens otherwise. */
+  amount: bigint;
 }
+
+/** The SDK's name for a currency's unit: policy and asset name run together. */
+export const sdkUnitOf = (c: Currency) => (c.kind === "ada" ? "lovelace" : c.policy + c.name);
+
+/** How much of `c` a value holds. */
+export const amountIn = (assets: Assets.Assets, c: Currency) => (c.kind === "ada" ? Assets.lovelaceOf(assets) : Assets.getByUnit(assets, sdkUnitOf(c)));
+
+/** A channel value: `amount` of the currency, and for a token channel `lovelace` of ADA beside it. */
+export const valueFor = (c: Currency, amount: bigint, lovelace: bigint) =>
+  c.kind === "ada" ? Assets.fromLovelace(amount) : Assets.fromHexStrings(c.policy, c.name, amount, lovelace);
+
+/** Whether a value holds ADA and at most the currency, as every channel output must. */
+export const onlyCurrency = (assets: Assets.Assets, c: Currency) => Assets.getUnits(assets).every((u) => u === "lovelace" || u === sdkUnitOf(c));
 
 /**
  * Reads a UTxO as a channel of `scriptHash`, or says why it is not one: wrong script, a
- * reference script riding on it, a datum that is not exactly Subbit's, or (milestone 1) any
- * asset besides ADA.
+ * reference script riding on it, a datum that is not exactly Subbit's, or an asset besides ADA
+ * and the channel's currency.
  */
 export function readChannel(u: UTxO.UTxO, scriptHash: string): ChannelView | { error: string } {
   const pay = u.address.paymentCredential;
@@ -81,27 +96,34 @@ export function readChannel(u: UTxO.UTxO, scriptHash: string): ChannelView | { e
     return { error: `channel datum: ${(e as Error).message}` };
   }
   if (datum.ownHash !== scriptHash) return { error: "datum names another script" };
-  if (datum.constants.currency.kind !== "ada" || !Assets.hasOnlyLovelace(u.assets)) return { error: "only ADA channels are supported" };
-  return { utxo: u, ref: refOf(u), address: u.address, datum, lovelace: Assets.lovelaceOf(u.assets) };
+  const c = datum.constants.currency;
+  if (!onlyCurrency(u.assets, c)) return { error: "channel holds an asset besides ADA and its currency" };
+  return { utxo: u, ref: refOf(u), address: u.address, datum, lovelace: Assets.lovelaceOf(u.assets), amount: amountIn(u.assets, c) };
 }
 
 /**
- * What an ADA channel must keep back: the min-UTxO of its largest continuing output, the
- * `Closed` datum, sized with every integer at its widest CBOR form so the figure never falls
- * short when `subbed`, `elapse_at` or the value grow.
+ * The ADA a channel must keep: the min-UTxO of its largest continuing output, the `Closed`
+ * datum, holding its currency, and sized with every integer at its widest CBOR form so the
+ * figure never falls short when `subbed`, `elapse_at` or the value grow. An ADA channel keeps it
+ * back from what IOUs may reach; a token channel carries exactly this much ADA beside its tokens.
  */
 export function channelReserve(address: Address.Address, constants: Constants, coinsPerUtxoByte: bigint): bigint {
   const wide = 2n ** 63n;
+  const c = constants.currency;
   const out = new TxOut.TransactionOutput({
     address,
-    assets: Assets.fromLovelace(wide),
+    assets: c.kind === "ada" ? Assets.fromLovelace(wide) : Assets.fromHexStrings(c.policy, c.name, wide, wide),
     datumOption: inlineDatum(constants, { kind: "closed", subbed: wide, elapseAt: wide }),
   });
   return coinsPerUtxoByte * (160n + BigInt(TxOut.toCBORBytes(out).length));
 }
 
-/** x402 `balance`: how far IOUs may go and still be redeemable without the consumer. */
+/**
+ * x402 `balance`: how far IOUs may go and still be redeemable without the consumer. A token
+ * channel's tokens are all redeemable (its ADA stays behind); an ADA channel keeps back its reserve.
+ */
 export function capacityOf(ch: ChannelView, coinsPerUtxoByte: bigint): bigint {
+  if (ch.datum.constants.currency.kind !== "ada") return ch.amount;
   const reserve = channelReserve(ch.address, ch.datum.constants, coinsPerUtxoByte);
   return ch.lovelace > reserve ? ch.lovelace - reserve : 0n;
 }

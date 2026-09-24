@@ -12,7 +12,8 @@
 //   report      every transaction's fee, and the wallets reconciled
 //
 // Usage: npm run x402 -- <phase|all>
-// Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID
+// Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID; SUBBIT_CURRENCY=token prices the
+//        route in the sUSDM stand-in (`npm run mint -- mint`) instead of lovelace, state in out/x402-token/
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { rmSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -28,18 +29,28 @@ import { BatchSettlementCardanoFacilitator } from "../../src/x402/facilitator.ts
 import { ChannelManager, type ClaimResult } from "../../src/x402/manager.ts";
 import { BatchSettlementCardanoServer, FileChannelStorage, walletProviderSigner } from "../../src/x402/server.ts";
 import { REF_STATE, BF_BASE, ada, bf, consumer, keyHashHex, load, log, must, provider, run, save } from "../chain.ts";
+import { TOKEN, amountOf, token, unitName } from "../currency.ts";
 
 const NETWORK = "cardano:preprod" as const;
 const PRICE = 1_000n;
 const FAC_PORT = 7413;
 const RES_PORT = 7411;
 const URL_DATA = `http://127.0.0.1:${RES_PORT}/data`;
-const OUT = new URL("../../out/x402/", import.meta.url);
+const OUT = new URL(TOKEN ? "../../out/x402-token/" : "../../out/x402/", import.meta.url);
+const ASSET = TOKEN ? token!.unit : "lovelace";
 const dir = (p: string) => fileURLToPath(new URL(p, OUT));
 const RESULTS = new URL("results.json", OUT);
 
+interface Wallets {
+  consumer: bigint;
+  provider: bigint;
+  /** The currency's units, when it is a token. */
+  consumerTokens: bigint;
+  providerTokens: bigint;
+}
+
 interface Results {
-  before?: { consumer: bigint; provider: bigint };
+  before?: Wallets;
   pay?: { n: number; firstMs: number; restMs: number[]; httpPerRequest: number; deposit: string; channelId: string };
   claims?: Array<{ phase: string; n: number; transaction: string }>;
   corrective?: Array<{ direction: string; httpCalls: number; ok: boolean }>;
@@ -85,12 +96,13 @@ async function stack() {
     storage,
     signAsProvider: walletProviderSigner(provider),
     chain,
+    ...(TOKEN ? { assetDecimals: { [ASSET]: token!.decimals } } : {}),
   });
   const resource = new x402ResourceServer(facilitatorClient).register(NETWORK, scheme);
   const routes: RoutesConfig = {
     "GET /data": {
-      accepts: { scheme: "batch-settlement", network: NETWORK, payTo, price: { asset: "lovelace", amount: PRICE.toString() }, maxTimeoutSeconds: 300, extra: {} },
-      description: "one datum for 0.001 tADA",
+      accepts: { scheme: "batch-settlement", network: NETWORK, payTo, price: { asset: ASSET, amount: PRICE.toString() }, maxTimeoutSeconds: 300, extra: {} },
+      description: `one datum for 0.001 ${unitName}`,
     },
   };
   const http = new x402HTTPResourceServer(resource, routes);
@@ -194,7 +206,7 @@ async function phaseClaim(s: Stack, label = "claim", opts: { channelIds?: string
   for (const c of results) {
     const fee = BigInt((await bf(`/txs/${c.transaction}`)).fees);
     const taken = c.channels.reduce((x, y) => x + y.taken, 0n);
-    log(`${label}: ${c.transaction} redeems ${c.channels.length} channel(s), ${ada(taken)} tADA, fee ${ada(fee)}`);
+    log(`${label}: ${c.transaction} redeems ${c.channels.length} channel(s), ${ada(taken)} ${unitName}, fee ${ada(fee)} tADA`);
     (r.claims ??= []).push({ phase: label, n: c.channels.length, transaction: c.transaction });
   }
   if (results.length === 0) log(`${label}: nothing to claim`);
@@ -228,7 +240,7 @@ async function phaseRefund(s: Stack, storageDir = "client") {
   for (const ch of (await p.storage.list()).filter((c) => c.status === "open")) {
     await phaseClaim(s, "claim before refund", { channelIds: [ch.channelId] });
     const settle = await p.scheme.refund(URL_DATA, fetch, ch.channelId);
-    log(`refund: ${ch.channelId.slice(0, 16)}… closed by ${settle.transaction}, ${ada(BigInt(settle.amount || "0"))} tADA back to the consumer`);
+    log(`refund: ${ch.channelId.slice(0, 16)}… closed by ${settle.transaction}, ${ada(BigInt(settle.amount || "0"))} ${unitName} back to the consumer`);
     const r = load<Results>(RESULTS); // after the claim, which saved its own entry
     (r.refunds ??= []).push({ channelId: ch.channelId, transaction: settle.transaction });
     save(RESULTS, r);
@@ -281,16 +293,24 @@ async function phaseReport() {
   }
   const now = await settledWallets();
   const open = await openChannelValue();
-  log(`consumer ${ada(r.before!.consumer)} → ${ada(now.consumer)}; provider ${ada(r.before!.provider)} → ${ada(now.provider)}; still in open channels ${ada(open)}`);
-  const lost = r.before!.consumer + r.before!.provider - now.consumer - now.provider - open;
-  log(`${lost === fees ? "  ok " : "  MISMATCH"} the two wallets lost ${ada(lost)}, the ${txs.length} transactions' fees total ${ada(fees)}`);
+  const b = r.before!;
+  log(`consumer ${ada(b.consumer)} → ${ada(now.consumer)}; provider ${ada(b.provider)} → ${ada(now.provider)} tADA; still in open channels ${ada(open.lovelace)} tADA`);
+  const lost = b.consumer + b.provider - now.consumer - now.provider - open.lovelace;
+  log(`${lost === fees ? "  ok " : "  MISMATCH"} the two wallets lost ${ada(lost)} tADA, the ${txs.length} transactions' fees total ${ada(fees)}`);
+  if (TOKEN) {
+    log(`consumer ${ada(b.consumerTokens)} → ${ada(now.consumerTokens)}; provider ${ada(b.providerTokens)} → ${ada(now.providerTokens)} ${unitName}; still in open channels ${ada(open.amount)}`);
+    const moved = now.consumerTokens + now.providerTokens + open.amount - b.consumerTokens - b.providerTokens;
+    log(`${moved === 0n ? "  ok " : "  MISMATCH"} ${unitName} across the wallets and channels: ${moved === 0n ? "none created or lost" : `off by ${moved}`}`);
+  }
 }
 
 // ---- helpers ------------------------------------------------------------------
 
-async function walletsAda() {
-  const sum = async (w: typeof consumer) => (await w.getWalletUtxos()).reduce((a, u) => a + Assets.lovelaceOf(u.assets), 0n);
-  return { consumer: await sum(consumer), provider: await sum(provider) };
+async function walletsAda(): Promise<Wallets> {
+  const [c, p] = [await consumer.getWalletUtxos(), await provider.getWalletUtxos()];
+  const ada_ = (us: typeof c) => us.reduce((a, u) => a + Assets.lovelaceOf(u.assets), 0n);
+  const tok = (us: typeof c) => (TOKEN ? us.reduce((a, u) => a + amountOf(u.assets), 0n) : 0n);
+  return { consumer: ada_(c), provider: ada_(p), consumerTokens: tok(c), providerTokens: tok(p) };
 }
 
 async function settledWallets() {
@@ -298,23 +318,27 @@ async function settledWallets() {
   for (let i = 0; i < 6; i++) {
     await new Promise((res) => setTimeout(res, 30_000));
     const now = await walletsAda();
-    if (now.consumer === last.consumer && now.provider === last.provider) return now;
+    if (JSON.stringify(now, (_, v) => (typeof v === "bigint" ? v.toString() : v)) === JSON.stringify(last, (_, v) => (typeof v === "bigint" ? v.toString() : v))) return now;
     last = now;
   }
   throw new Error("balances did not settle");
 }
 
-async function openChannelValue(): Promise<bigint> {
-  let total = 0n;
+async function openChannelValue(): Promise<{ lovelace: bigint; amount: bigint }> {
+  let lovelace = 0n;
+  let amount = 0n;
   for (const d of ["client", ...Array.from({ length: 10 }, (_, i) => `batch/${i}`)]) {
     if (!existsSync(dir(d))) continue;
     for (const c of await new FileClientStorage(dir(d)).list()) {
       if (c.status !== "open" || !c.channelRef) continue;
       const v = await chain.followChannel(c.channelRef, SUBBIT_HASH, c.channelId);
-      if (v) total += v.lovelace;
+      if (v) {
+        lovelace += v.lovelace;
+        amount += TOKEN ? v.amount : 0n;
+      }
     }
   }
-  return total;
+  return { lovelace, amount };
 }
 
 const q = (sorted: number[], at: number) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(at * (sorted.length - 1)))]!.toFixed(1) : "-");

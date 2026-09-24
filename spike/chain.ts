@@ -92,12 +92,14 @@ export function checkChannel(utxo: UTxO.UTxO, providerKeyHash: string, expected:
   const pay = utxo.address.paymentCredential;
   if (!(pay instanceof ScriptHash.ScriptHash) || ScriptHash.toHex(pay) !== SUBBIT_HASH) throw new Error("not at the Subbit script");
   if (utxo.scriptRef) throw new Error("channel carries a reference script");
-  if (!Assets.hasOnlyLovelace(utxo.assets)) throw new Error("channel holds tokens besides ADA");
+  const cur = expected.currency;
+  const allowed = new Set(["lovelace", ...(cur.kind === "asset" ? [cur.policy + cur.name] : [])]);
+  if (!Assets.getUnits(utxo.assets).every((u) => allowed.has(u))) throw new Error("channel holds tokens besides its currency");
   if (!(utxo.datumOption instanceof InlineDatum.InlineDatum)) throw new Error("channel datum is not inline");
   const d = parseDatum(utxo.datumOption.data);
   if (d.ownHash !== SUBBIT_HASH) throw new Error("datum names another script");
   if (d.constants.provider !== providerKeyHash) throw new Error("channel is for another provider");
-  if (d.constants.currency.kind !== "ada") throw new Error("channel currency is not ADA");
+  if (JSON.stringify(d.constants.currency) !== JSON.stringify(cur)) throw new Error("channel currency is not the one expected");
   if (d.constants.closePeriodMs < minClosePeriodMs) throw new Error("close period too short to settle in");
   if (Buffer.from(d.constants.iouKey, "hex").length !== 32) throw new Error("IOU key is not 32 bytes");
   if (Buffer.from(d.constants.tag, "hex").length > 64) throw new Error("tag too long");

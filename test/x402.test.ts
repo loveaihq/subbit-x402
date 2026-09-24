@@ -82,6 +82,21 @@ test("a channel config binds to the requirements and to the datum, field by fiel
   assert.equal(datumBindingError(d, { ...config, withdrawDelay: 3600 }, TAG, SUBBIT_HASH), Err.withdrawDelayMismatch);
 });
 
+test("a token channel's reserve covers its continuing outputs, token included", () => {
+  const address = channelAddress(0);
+  const policy = "085c41bd155d0562653d61a847bc00b0dae291f323ed43b347419c19";
+  const name = "0014df10735553444d";
+  const constants = constantsOf({ ...config, token: `${policy}.${name}` }, TAG);
+  const reserve = channelReserve(address, constants, 4310n);
+  for (const stage of [{ kind: "opened", subbed: 0n }, { kind: "closed", subbed: 2n ** 40n, elapseAt: 1_790_000_000_000n }, { kind: "settled" }] as const) {
+    for (const quantity of [1n, 5_000_000n, 2n ** 50n]) {
+      const out = new TxOut.TransactionOutput({ address, assets: Assets.fromHexStrings(policy, name, quantity, reserve), datumOption: inlineDatum(constants, stage) });
+      const exact = 4310n * (160n + BigInt(TxOut.toCBORBytes(out).length));
+      assert.ok(reserve >= exact, `${stage.kind}, ${quantity}: reserve ${reserve} < ${exact}`);
+    }
+  }
+});
+
 test("the ADA reserve covers every continuing output the channel can have", () => {
   const address = channelAddress(0);
   const constants = constantsOf(config, TAG);

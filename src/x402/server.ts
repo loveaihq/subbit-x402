@@ -23,7 +23,7 @@ import type {
   VerifyResponse,
 } from "@x402/core/types";
 import { Transaction, TransactionHash, TransactionWitnessSet, type Address } from "@evolution-sdk/evolution";
-import { verifyVoucherSignature } from "./cardano.ts";
+import { currencyOf, verifyVoucherSignature } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
 import { checkMutual, decodeTx } from "./txcheck.ts";
 import {
@@ -150,6 +150,8 @@ export interface ServerConfig {
   signAsProvider: ProviderSigner;
   /** Resolves a refund's collateral inputs before the provider signs. */
   chain: Chain;
+  /** Decimals of the token assets the server prices in, for `$`-free settlement overrides. */
+  assetDecimals?: Record<string, number>;
 }
 
 interface RequestContext {
@@ -200,14 +202,14 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
 
   async parsePrice(price: Price, network: Network): Promise<AssetAmount> {
     if (typeof price === "object" && price !== null && "amount" in price) {
-      if (price.asset !== LOVELACE) throw new Error(`milestone 1 prices in lovelace only, not ${price.asset}`);
+      currencyOf(price.asset); // lovelace or policy.name, else throws
       return { amount: price.amount, asset: price.asset, extra: price.extra ?? {} };
     }
-    throw new Error(`give ${network} prices as { asset: "lovelace", amount }; ADA has no USD money parser`);
+    throw new Error(`give ${network} prices as { asset, amount } in atomic units; this binding has no money parser`);
   }
 
   getAssetDecimals(asset: string): number | undefined {
-    return asset === LOVELACE ? 6 : undefined;
+    return asset === LOVELACE ? 6 : this.config.assetDecimals?.[asset];
   }
 
   async enhancePaymentRequirements(req: PaymentRequirements, _kind: SupportedKind, _ext: string[]): Promise<PaymentRequirements> {
@@ -385,7 +387,7 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
       collateral.push(u.address);
     }
     const owed = BigInt(ch.chargedCumulativeAmount) - BigInt(ch.totalClaimed);
-    checkMutual(hex, ctx.requirements.network, this.config.scriptHash, ch.channelRef, ch.channelConfig.payer, this.config.receiverAuthorizer, this.config.payTo, owed, collateral);
+    checkMutual(hex, ctx.requirements.network, this.config.scriptHash, ch.channelRef, ch.channelConfig.payer, this.config.receiverAuthorizer, this.config.payTo, currencyOf(ch.channelConfig.token), owed, collateral);
     this.merge(ctx.paymentPayload, { channelSnapshot: ch });
     return { providerWitness: await this.config.signAsProvider(hex) };
   };

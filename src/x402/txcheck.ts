@@ -17,7 +17,8 @@ import {
   type TransactionInput,
 } from "@evolution-sdk/evolution";
 import { parseDatum, tagFromInput } from "../subbit.ts";
-import { channelReserve, datumBindingError, isChannelOutput, networkIdOf, txHashOf } from "./cardano.ts";
+import { amountIn, channelReserve, datumBindingError, isChannelOutput, networkIdOf, onlyCurrency, txHashOf } from "./cardano.ts";
+import type { Currency } from "../subbit.ts";
 import { Err, type ChannelConfig } from "./types.ts";
 
 const SPKI_ED25519 = Buffer.from("302a300506032b6570032100", "hex");
@@ -100,9 +101,10 @@ export interface DepositCheck {
 
 /**
  * A channel-opening transaction as the binding requires it: exactly one output at the channel
- * script, with the Subbit datum this config and tag describe at stage `Opened(0)`, holding
- * exactly `amount` lovelace and nothing else, no reference script on it, and a tag derived
- * from one of the transaction's own inputs (Subbit ADR tag.md).
+ * script, with the Subbit datum this config and tag describe at stage `Opened(0)`, no reference
+ * script on it, a tag derived from one of the transaction's own inputs (Subbit ADR tag.md), and
+ * a value of exactly `amount` of the currency and nothing else, except that a token channel
+ * carries at least its reserve in ADA, so every continuing output it will have clears min-UTxO.
  */
 export function checkDeposit(
   cborHex: string,
@@ -135,12 +137,14 @@ export function checkDeposit(
   const bind = datumBindingError(d, config, channelId, scriptHash);
   if (bind) fail(bind, "channel datum does not match the channel config");
   if (d.stage.kind !== "opened" || d.stage.subbed !== 0n) fail(R, "a new channel must open at Opened(0)");
-  if (!Assets.hasOnlyLovelace(o.assets)) fail(R, "channel output holds tokens besides ADA");
-  if (Assets.lovelaceOf(o.assets) !== amount) fail(R, `channel output holds ${Assets.lovelaceOf(o.assets)}, deposit says ${amount}`);
+  const c = d.constants.currency;
+  if (!onlyCurrency(o.assets, c)) fail(R, "channel output holds an asset besides ADA and its currency");
+  if (amountIn(o.assets, c) !== amount) fail(R, `channel output holds ${amountIn(o.assets, c)}, deposit says ${amount}`);
   if (!tx.body.inputs.some((i) => tagFromInput(i) === channelId)) fail(Err.channelIdMismatch, "channelId is not derived from an input this transaction spends");
 
   const reserve = channelReserve(o.address, d.constants, coinsPerUtxoByte);
-  const capacity = amount > reserve ? amount - reserve : 0n;
+  if (c.kind !== "ada" && Assets.lovelaceOf(o.assets) < reserve) fail(R, `a token channel carries at least ${reserve} lovelace`);
+  const capacity = c.kind !== "ada" ? amount : amount > reserve ? amount - reserve : 0n;
   return { tx, outputIndex, capacity, inputRefs: tx.body.inputs.map(refOfInput) };
 }
 
@@ -184,6 +188,8 @@ export function checkMutual(
   consumer: string,
   provider: string,
   payTo: string,
+  /** The channel's currency: the provider's share is paid in it. */
+  currency: Currency,
   minPayout: bigint,
   /** Resolved addresses of the collateral inputs; none may be locked by the provider's key. */
   collateralAddresses: Address.Address[],
@@ -215,8 +221,8 @@ export function checkMutual(
   let providerPayout = 0n;
   for (const o of tx.body.outputs) {
     if (Address.toBech32(o.address) === Address.toBech32(payToAddr)) {
-      if (!Assets.hasOnlyLovelace(o.assets)) fail(R, "the provider's payout must be ADA only");
-      providerPayout += Assets.lovelaceOf(o.assets);
+      if (!onlyCurrency(o.assets, currency)) fail(R, "the provider's payout holds an asset besides ADA and the currency");
+      providerPayout += amountIn(o.assets, currency);
     }
     if (isChannelOutput(o.address, scriptHash)) fail(R, "a refund leaves nothing at the channel script");
   }

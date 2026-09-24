@@ -17,8 +17,8 @@ import type {
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
 import { Address, Assets, Client, KeyHash, ScriptHash, Transaction, TransactionHash, TransactionInput, TransactionWitnessSet, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
 import { Redeemer, channelAddress, iouBody, inlineDatum, newIouSigner, subbitScript, tagFromInput } from "../subbit.ts";
-import { channelReserve, constantsOf, networkIdOf, refOf, txHashOf, verifyVoucherSignature } from "./cardano.ts";
-import type { Chain } from "./chain.ts";
+import { amountIn, channelReserve, constantsOf, currencyOf, networkIdOf, refOf, txHashOf, valueFor, verifyVoucherSignature } from "./cardano.ts";
+import { retryQueries, type Chain } from "./chain.ts";
 import {
   Err,
   LOVELACE,
@@ -119,7 +119,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   }
 
   async createPaymentPayload(x402Version: number, req: PaymentRequirements): Promise<PaymentPayloadResult> {
-    if (req.asset !== LOVELACE) throw new Error(`milestone 1 pays in lovelace only, not ${req.asset}`);
+    currencyOf(req.asset); // lovelace or policy.name, else throws
     const extra = parseExtra(req);
     const amount = BigInt(req.amount);
     let ch = await this.o.storage.current(serverKey(req, extra));
@@ -177,8 +177,13 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       withdrawDelay: extra.withdrawDelay,
     };
     const available = await this.available();
-    const seed = available.filter((u) => Assets.hasOnlyLovelace(u.assets)).sort((a, b) => (Assets.lovelaceOf(b.assets) > Assets.lovelaceOf(a.assets) ? 1 : -1))[0];
-    if (!seed) throw new Error("no ADA-only UTxO to open a channel from");
+    // The tag can come from any input the opening spends. A token channel seeds from a UTxO that
+    // holds the token, which is spent anyway; an ADA channel from the largest ADA-only UTxO. That
+    // keeps openings from using up the ADA-only UTxOs that collateral comes from.
+    const cur = currencyOf(req.asset);
+    const size = (u: UTxO.UTxO) => (cur.kind === "ada" ? (Assets.hasOnlyLovelace(u.assets) ? Assets.lovelaceOf(u.assets) : -1n) : amountIn(u.assets, cur));
+    const seed = available.filter((u) => size(u) > 0n).sort((a, b) => (size(b) > size(a) ? 1 : size(b) < size(a) ? -1 : 0))[0];
+    if (!seed) throw new Error(`no UTxO to open a ${req.asset} channel from`);
     // The tag must be unique per IOU key; Subbit's ADR: hash an input this transaction spends.
     const tag = tagFromInput(new TransactionInput.TransactionInput({ transactionId: seed.transactionId, index: seed.index }));
     const constants = constantsOf(config, tag);
@@ -186,14 +191,20 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     if (ScriptHash.toHex(address.paymentCredential as ScriptHash.ScriptHash) !== extra.scriptHash) throw new Error("server asks for a validator this client does not have");
     const cpb = (await w.getProtocolParameters()).coinsPerUtxoByte;
     const floor = [this.o.capacity ?? 0n, extra.minDeposit ? BigInt(extra.minDeposit) : 0n, 10n * amount].reduce((a, b) => (a > b ? a : b));
-    const deposit = floor + channelReserve(address, constants, cpb);
-    if (this.o.maxDeposit !== undefined && deposit > this.o.maxDeposit) throw new Error(`a channel needs ${deposit} lovelace, above maxDeposit ${this.o.maxDeposit}`);
+    const reserve = channelReserve(address, constants, cpb);
+    // An ADA channel holds its capacity plus the reserve; a token channel holds its capacity in
+    // tokens and exactly the reserve in ADA, since the validator does not count that ADA.
+    const isAda = constants.currency.kind === "ada";
+    const deposit = isAda ? floor + reserve : floor;
+    if (this.o.maxDeposit !== undefined && deposit > this.o.maxDeposit) throw new Error(`a channel needs ${deposit} units, above maxDeposit ${this.o.maxDeposit}`);
 
-    const sb = await w
-      .newTx()
-      .collectFrom({ inputs: [seed] })
-      .payToAddress({ address, assets: Assets.fromLovelace(deposit), datum: inlineDatum(constants, { kind: "opened", subbed: 0n }) })
-      .build({ changeAddress: me, availableUtxos: available });
+    const sb = await retryQueries("open", () =>
+      w
+        .newTx()
+        .collectFrom({ inputs: [seed] })
+        .payToAddress({ address, assets: valueFor(constants.currency, deposit, reserve), datum: inlineDatum(constants, { kind: "opened", subbed: 0n }) })
+        .build({ changeAddress: me, availableUtxos: available }),
+    );
     const signed = await signedHex(sb);
     const built = Transaction.fromCBORHex(signed);
     const openInputs = built.body.inputs.map((i) => `${TransactionHash.toHex(i.transactionId)}#${i.index}`);
@@ -293,7 +304,11 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const w = this.o.wallet;
     const me = await w.address();
     const payTo = Address.fromBech32(req.payTo);
+    const cur = view.datum.constants.currency;
     if (owed > 0n) {
+      // A token share would need ADA of its own; an ADA share must clear min-UTxO. Either way,
+      // what cannot be its own output is claimed by the server first.
+      if (cur.kind !== "ada") throw new Error(`owed ${owed} tokens; the server must claim them before a refund`);
       const min = minAdaOutput(payTo, (await w.getProtocolParameters()).coinsPerUtxoByte);
       if (owed < min) throw new Error(`owed ${owed} is below the ${min} lovelace an output needs; the server must claim it first`);
     }
@@ -308,7 +323,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
     if (owed > 0n) tx = tx.payToAddress({ address: payTo, assets: Assets.fromLovelace(owed) });
     const adaOnly = (await this.available()).filter((u) => Assets.hasOnlyLovelace(u.assets));
-    const sb = await tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) });
+    const sb = await retryQueries("refund", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
     const signed = await signedHex(sb);
 
     const payload: RefundPayload = {

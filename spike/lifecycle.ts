@@ -22,7 +22,7 @@
 //        `all` runs b-open and b-close first, so B's close period runs down while A runs.
 // Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID, SUBBIT_SCRIPT=inline|ref (default inline)
 import { createPrivateKey, sign as edSign, type KeyObject } from "node:crypto";
-import { Address, Assets, Data, InlineDatum, KeyHash, type UTxO } from "@evolution-sdk/evolution";
+import { Address, Assets, Data, InlineDatum, KeyHash, TxOut, type UTxO } from "@evolution-sdk/evolution";
 import {
   Redeemer,
   SUBBIT_HASH,
@@ -68,6 +68,8 @@ import {
   withSubbit,
   type BfUtxos,
 } from "./chain.ts";
+import { channelReserve } from "../src/x402/cardano.ts";
+import { TOKEN, amountOf, amountOfBf, currency, token, unitName, valueOf } from "./currency.ts";
 
 const PRICE = 1_000n; // 0.001 ADA per request, as in step 1
 const ONE = 1_000_000n;
@@ -75,7 +77,7 @@ const A = { deposit: 10_000_000n, closePeriodMs: 3_600_000n };
 const B = { deposit: 5_000_000n, closePeriodMs: 600_000n };
 /** How long a close stays submittable. elapse_at lands this far out plus the close period. */
 const CLOSE_TTL_SLOTS = 300n;
-const STATE = stateFile("lifecycle");
+const STATE = stateFile(TOKEN ? "lifecycle-token" : "lifecycle");
 
 interface Iou {
   amount: bigint;
@@ -145,7 +147,7 @@ async function aSub() {
   const d = checkChannel(utxo, keyHashHex(providerAddr), a.constants, A.closePeriodMs);
   if (d.stage.kind !== "opened") throw new Error("channel is not open");
   const { amount: owed, sig } = a.latest!;
-  const held = Assets.lovelaceOf(utxo.assets);
+  const held = amountOf(utxo.assets);
   const take = owed - d.stage.subbed;
   const honest: SubTx = { owed, sig, keep: held - take, subbedOut: owed };
   const build = (change: Partial<SubTx>) => subTx(a, utxo, { ...honest, ...change });
@@ -158,16 +160,24 @@ async function aSub() {
   );
   await refused("an IOU signed by a key the channel does not name", () => build({ sig: signAs(newIouSigner().privateKey, a.constants.tag, owed) }));
   await refused("an IOU signed for another channel's tag", () => build({ sig: signAs(createPrivateKey(a.iouPrivateKeyPem), "ab".repeat(32), owed) }));
-  const sb = await accepted(`the provider subs exactly what the IOU covers, ${ada(take)} tADA`, () => build({}));
+  if (TOKEN) {
+    // A continuing output may hold ADA and the currency, nothing else.
+    await refused("the continuing output also carries a token besides the currency", () => build({ extra: token!.extraUnit }));
+    // The validator counts only the currency; the ADA riding along is held up by min-UTxO alone.
+    const cpb = (await provider.getProtocolParameters()).coinsPerUtxoByte;
+    const floor = minAdaFor(valueOf(held - take, 0n), inlineDatum(a.constants, { kind: "opened", subbed: owed }), cpb);
+    await accepted(`(built, not submitted) the sub also takes the channel's ADA down to its min-UTxO, ${ada(Assets.lovelaceOf(utxo.assets))} -> ${ada(floor)} tADA`, () => build({ lovelace: floor }));
+  }
+  const sb = await accepted(`the provider subs exactly what the IOU covers, ${ada(take)} ${unitName}`, () => build({}));
   const txHash = await submit("a-sub", await sb.sign(), provider);
 
   const r = await readBack(a, txHash);
   expectEq("taken = owed − subbed before", r.valueIn - r.out!.value, take);
   expectEq("stage after sub", show(r.out!.stage), show({ kind: "opened", subbed: owed }));
-  expectEq("provider net = taken − fee", netFor(r.utxos, Address.toBech32(providerAddr)), take - r.fee);
+  expectNet("provider net = taken − fee", r.utxos, Address.toBech32(providerAddr), take, r.fee, 0n);
   record(a, "a-sub", txHash, r);
   save(st);
-  log(`a-sub: provider redeemed ${ada(take)} tADA mid-life; the channel stays open with subbed = ${ada(owed)}`);
+  log(`a-sub: provider redeemed ${ada(take)} ${unitName} mid-life; the channel stays open with subbed = ${ada(owed)}`);
 }
 
 async function aClose() {
@@ -192,7 +202,7 @@ async function aSettle() {
   if (d.stage.kind !== "closed") throw new Error("channel is not closed");
   const elapseAt = d.stage.elapseAt;
   if (nowMs() >= elapseAt) log(`a-settle: past elapse_at ${iso(elapseAt)}; from here a settle races the consumer's elapse`);
-  const held = Assets.lovelaceOf(utxo.assets);
+  const held = amountOf(utxo.assets);
   const { amount: owed, sig } = a.latest!;
   const take = owed - d.stage.subbed;
   const honest: SettleTx = { by: "provider", owed, sig, keep: held - take, stageOut: { kind: "settled" } };
@@ -204,16 +214,16 @@ async function aSettle() {
   // …and the provider cannot take more than the consumer signed for.
   await refused("the provider settles 1 lovelace more than owed − subbed", () => build({ keep: held - take - 1n }));
   await refused("the provider settles but leaves the channel closed, free to settle again", () => build({ stageOut: d.stage }));
-  const sb = await accepted(`the provider settles exactly owed − subbed = ${ada(take)} tADA`, () => build({}));
+  const sb = await accepted(`the provider settles exactly owed − subbed = ${ada(take)} ${unitName}`, () => build({}));
   const txHash = await submit("a-settle", await sb.sign(), provider);
 
   const r = await readBack(a, txHash);
   expectEq("taken = owed − subbed", r.valueIn - r.out!.value, take);
   expectEq("stage after settle", show(r.out!.stage), show({ kind: "settled" }));
-  expectEq("provider net = taken − fee", netFor(r.utxos, Address.toBech32(providerAddr)), take - r.fee);
+  expectNet("provider net = taken − fee", r.utxos, Address.toBech32(providerAddr), take, r.fee, 0n);
   record(a, "a-settle", txHash, r);
   save(st);
-  log(`a-settle: the provider got its ${ada(take)} tADA after the consumer's unilateral close, ${(elapseAt - r.blockTimeMs) / 60_000n} min before elapse_at`);
+  log(`a-settle: the provider got its ${ada(take)} ${unitName} after the consumer's unilateral close, ${(elapseAt - r.blockTimeMs) / 60_000n} min before elapse_at`);
 }
 
 async function aEnd() {
@@ -224,7 +234,7 @@ async function aEnd() {
   const consumerAddr = await consumer.address();
   const utxo = await channelUtxo(a);
   if (datumOf(utxo).stage.kind !== "settled") throw new Error("channel is not settled");
-  const held = Assets.lovelaceOf(utxo.assets);
+  const held = amountOf(utxo.assets);
   const { amount: owed, sig } = a.latest!;
 
   await refused("the provider settles a second time", () => settleTx(a, utxo, { by: "provider", owed, sig, keep: held - ONE, stageOut: { kind: "settled" } }));
@@ -234,10 +244,10 @@ async function aEnd() {
 
   const r = await readBack(a, txHash);
   expectEq("no channel output remains", r.out, undefined);
-  expectEq("consumer net = remaining − fee", netFor(r.utxos, Address.toBech32(consumerAddr)), held - r.fee);
+  expectNet("consumer net = remaining − fee", r.utxos, Address.toBech32(consumerAddr), held, r.fee, r.lovelaceIn);
   record(a, "a-end", txHash, r);
   save(st);
-  log(`a-end: the consumer took back the remaining ${ada(held)} tADA`);
+  log(`a-end: the consumer took back the remaining ${ada(held)} ${unitName}`);
 }
 
 // ---- B: the provider disappears ------------------------------------------
@@ -273,7 +283,7 @@ async function bElapse() {
   await waitForSlot(first, "b-elapse");
 
   const utxo = await channelUtxo(b); // untouched while the provider was away
-  const held = Assets.lovelaceOf(utxo.assets);
+  const held = amountOf(utxo.assets);
   const { amount: owed, sig } = b.latest!;
   await refused("the consumer elapses one slot before elapse_at", () => elapseTx(utxo, "consumer", msOf(first - 1n)));
   await refused("the provider elapses the channel and takes the funds", () => elapseTx(utxo, "provider", msOf(first)));
@@ -287,10 +297,10 @@ async function bElapse() {
   const r = await readBack(b, txHash);
   expectEq("lower bound the script saw = elapse_at", r.from, d.stage.elapseAt);
   expectEq("no channel output remains", r.out, undefined);
-  expectEq("consumer net = everything − fee", netFor(r.utxos, Address.toBech32(consumerAddr)), held - r.fee);
+  expectNet("consumer net = everything − fee", r.utxos, Address.toBech32(consumerAddr), held, r.fee, r.lovelaceIn);
   record(b, "b-elapse", txHash, r);
   save(st);
-  log(`b-elapse: the consumer recovered all ${ada(held)} tADA without the provider, whose unredeemed ${ada(owed)} tADA IOU is now void`);
+  log(`b-elapse: the consumer recovered all ${ada(held)} ${unitName} without the provider, whose unredeemed ${ada(owed)} ${unitName} IOU is now void`);
 }
 
 async function report() {
@@ -319,23 +329,26 @@ async function openChannel(what: string, deposit: bigint, closePeriodMs: bigint)
   const signer = newIouSigner();
   const constants: Constants = {
     tag: tagFromInput(inputOf(seed)),
-    currency: { kind: "ada" },
+    currency,
     iouKey: signer.publicKey,
     consumer: keyHashHex(consumerAddr),
     provider: keyHashHex(providerAddr),
     closePeriodMs,
   };
+  // A token channel carries the ADA its largest continuing output needs, and no more (see a-sub).
+  const reserve = TOKEN ? channelReserve(chan, constants, (await consumer.getProtocolParameters()).coinsPerUtxoByte) : 0n;
   const sb = await consumer
     .newTx()
     .collectFrom({ inputs: [seed] })
-    .payToAddress({ address: chan, assets: Assets.fromLovelace(deposit), datum: inlineDatum(constants, { kind: "opened", subbed: 0n }) })
+    .payToAddress({ address: chan, assets: valueOf(deposit, reserve), datum: inlineDatum(constants, { kind: "opened", subbed: 0n }) })
     .build({ changeAddress: consumerAddr });
   const txHash = await submit(what, await sb.sign(), consumer);
 
   const outs = ((await bf(`/txs/${txHash}/utxos`)) as BfUtxos).outputs.filter((o) => o.address === Address.toBech32(chan));
   if (outs.length !== 1) throw new Error(`expected one channel output, found ${outs.length}`);
   const o = outs[0]!;
-  expectEq("channel value", lovelaceOfBf(o), deposit);
+  expectEq("channel value", amountOfBf(o), deposit);
+  if (TOKEN) expectEq("channel ADA = the reserve", lovelaceOfBf(o), reserve);
   expectEq("channel datum", show(parseDatum(Data.fromCBORHex(o.inline_datum!))), show({ ownHash: SUBBIT_HASH, constants, stage: { kind: "opened", subbed: 0n } }));
   const ch: Channel = {
     constants,
@@ -346,7 +359,7 @@ async function openChannel(what: string, deposit: bigint, closePeriodMs: bigint)
   // The provider's own check, before it serves a single request against the channel.
   checkChannel(await channelUtxo(ch), keyHashHex(providerAddr), constants, closePeriodMs);
   log(`  ok  the provider's checks on the channel pass`);
-  log(`${what}: channel ${txHash}#${o.output_index} holds ${ada(deposit)} tADA, close period ${closePeriodMs / 60_000n} min`);
+  log(`${what}: channel ${txHash}#${o.output_index} holds ${ada(deposit)} ${unitName}${TOKEN ? ` and ${ada(reserve)} tADA` : ""}, close period ${closePeriodMs / 60_000n} min`);
   return ch;
 }
 
@@ -364,7 +377,7 @@ function payUpTo(ch: Channel, count: number) {
     latest = { amount, sig, count: i };
   }
   ch.latest = latest;
-  if (count > from) log(`  requests ${from + 1}–${count} paid by IOU; the provider holds one for ${ada(latest.amount)} tADA`);
+  if (count > from) log(`  requests ${from + 1}–${count} paid by IOU; the provider holds one for ${ada(latest.amount)} ${unitName}`);
 }
 
 /** The consumer closes alone. With `probe`, first the closes the validator must refuse. */
@@ -373,7 +386,7 @@ async function close(ch: Channel, what: string, probe: boolean) {
   const utxo = await channelUtxo(ch);
   const d = datumOf(utxo);
   if (d.stage.kind !== "opened") throw new Error("channel is not open");
-  const held = Assets.lovelaceOf(utxo.assets);
+  const held = amountOf(utxo.assets);
   const period = ch.constants.closePeriodMs;
   // The script sees the start of the TTL slot as the upper bound and wants
   // elapse_at ≥ upper bound + close period. The consumer takes the earliest it allows.
@@ -384,7 +397,7 @@ async function close(ch: Channel, what: string, probe: boolean) {
   if (probe) {
     await refused("elapse_at 1 ms short of upper bound + close period", () => build({ elapseAt: to + period - 1n }));
     await refused("no upper bound on the validity range", () => build({ to: undefined }));
-    await refused("the close takes 1 tADA out of the channel", () => build({ keep: held - ONE }));
+    await refused(`the close takes 1 ${unitName} out of the channel`, () => build({ keep: held - ONE }));
     await refused(`the close records subbed = ${ada(ch.latest!.amount)}, all that is owed, voiding the provider's claim`, () =>
       build({ subbed: ch.latest!.amount }),
     );
@@ -412,13 +425,17 @@ interface SubTx {
   sig: string;
   keep: bigint;
   subbedOut: bigint;
+  /** ADA left in a token channel's continuing output; by default all it had. */
+  lovelace?: bigint;
+  /** One unit of another token, added to the continuing output. */
+  extra?: string;
 }
 
 async function subTx(ch: Channel, utxo: UTxO.UTxO, o: SubTx) {
   const me = await provider.address();
   return (await withSubbit(provider.newTx()))
     .collectFrom({ inputs: [utxo], redeemer: Redeemer.main([Step.sub(o.owed, o.sig)]) })
-    .payToAddress({ address: chan, assets: Assets.fromLovelace(o.keep), datum: inlineDatum(ch.constants, { kind: "opened", subbed: o.subbedOut }) })
+    .payToAddress({ address: chan, assets: withExtra(valueOf(o.keep, o.lovelace ?? Assets.lovelaceOf(utxo.assets)), o.extra), datum: inlineDatum(ch.constants, { kind: "opened", subbed: o.subbedOut }) })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(me)) })
     .build({ changeAddress: me });
 }
@@ -438,7 +455,7 @@ async function closeTx(ch: Channel, utxo: UTxO.UTxO, o: CloseTx) {
     .collectFrom({ inputs: [utxo], redeemer: Redeemer.main([Step.close()]) })
     .payToAddress({
       address: chan,
-      assets: Assets.fromLovelace(o.keep),
+      assets: valueOf(o.keep, Assets.lovelaceOf(utxo.assets)),
       datum: inlineDatum(ch.constants, { kind: "closed", subbed: o.subbed, elapseAt: o.elapseAt }),
     })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(me)) });
@@ -459,7 +476,7 @@ async function settleTx(ch: Channel, utxo: UTxO.UTxO, o: SettleTx) {
   const me = await w.address();
   return (await withSubbit(w.newTx()))
     .collectFrom({ inputs: [utxo], redeemer: Redeemer.main([Step.settle(o.owed, o.sig)]) })
-    .payToAddress({ address: chan, assets: Assets.fromLovelace(o.keep), datum: inlineDatum(ch.constants, o.stageOut) })
+    .payToAddress({ address: chan, assets: valueOf(o.keep, Assets.lovelaceOf(utxo.assets)), datum: inlineDatum(ch.constants, o.stageOut) })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(me)) })
     .build({ changeAddress: me });
 }
@@ -494,6 +511,8 @@ interface Readback {
   to?: bigint;
   blockTimeMs: bigint;
   valueIn: bigint;
+  /** The channel input's ADA: all of it for an ADA channel, what rode along for a token one. */
+  lovelaceIn: bigint;
   out?: { index: number; value: bigint; stage: Stage };
 }
 
@@ -510,7 +529,7 @@ async function readBack(ch: Channel, txHash: string): Promise<Readback> {
   if (outs[0]) {
     const d = parseDatum(Data.fromCBORHex(outs[0].inline_datum!));
     if (show(d.constants) !== show(ch.constants)) throw new Error("the continuing output changed the channel's constants");
-    out = { index: outs[0].output_index, value: lovelaceOfBf(outs[0]), stage: d.stage };
+    out = { index: outs[0].output_index, value: amountOfBf(outs[0]), stage: d.stage };
   }
   return {
     utxos,
@@ -518,7 +537,8 @@ async function readBack(ch: Channel, txHash: string): Promise<Readback> {
     from: tx.invalid_before == null ? undefined : msOf(BigInt(tx.invalid_before)),
     to: tx.invalid_hereafter == null ? undefined : msOf(BigInt(tx.invalid_hereafter)),
     blockTimeMs: BigInt(tx.block_time) * 1_000n,
-    valueIn: lovelaceOfBf(ins[0]!),
+    valueIn: amountOfBf(ins[0]!),
+    lovelaceIn: lovelaceOfBf(ins[0]!),
     out,
   };
 }
@@ -549,5 +569,40 @@ function need<T>(v: T | undefined, phase: string): T {
 }
 
 const show = (v: unknown) => JSON.stringify(v, big);
+
+/**
+ * A party's net change from a transaction. For an ADA channel, `amount` less the fee. For a token
+ * channel, `amount` in tokens, and in ADA whatever `lovelace` it got back less the fee.
+ */
+function expectNet(what: string, utxos: BfUtxos, address: string, amount: bigint, fee: bigint, lovelace: bigint) {
+  if (!TOKEN) return expectEq(what, netFor(utxos, address), amount - fee);
+  expectEq(`${what}, in ${unitName}`, netAmountFor(utxos, address), amount);
+  expectEq(`${what}, in tADA`, netFor(utxos, address), lovelace - fee);
+}
+
+function netAmountFor(utxos: BfUtxos, address: string): bigint {
+  type Flags = { collateral?: boolean; reference?: boolean };
+  const spent = utxos.inputs.filter((i) => i.address === address && !(i as Flags).collateral && !(i as Flags).reference);
+  const created = utxos.outputs.filter((o) => o.address === address && !(o as Flags).collateral);
+  return created.reduce((s, o) => s + amountOfBf(o), 0n) - spent.reduce((s, i) => s + amountOfBf(i), 0n);
+}
+
+function withExtra(value: Assets.Assets, unit?: string): Assets.Assets {
+  if (!unit) return value;
+  const [policy, name] = unit.split(".") as [string, string];
+  return Assets.addByHex(value, policy, name, 1n);
+}
+
+/** The exact min-UTxO of a channel output holding `value` and `datum`: the fixed point in its own ADA. */
+function minAdaFor(value: Assets.Assets, datum: InlineDatum.InlineDatum, coinsPerUtxoByte: bigint): bigint {
+  let lovelace = 1_000_000n;
+  for (let i = 0; i < 5; i++) {
+    const out = new TxOut.TransactionOutput({ address: chan, assets: Assets.withLovelace(value, lovelace), datumOption: datum });
+    const need = coinsPerUtxoByte * (160n + BigInt(TxOut.toCBORBytes(out).length));
+    if (need === lovelace) break;
+    lovelace = need;
+  }
+  return lovelace;
+}
 
 run(main);

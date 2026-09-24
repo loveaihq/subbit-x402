@@ -168,7 +168,7 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     const owed = BigInt(p.voucher.maxClaimableAmount) - subbed;
     const hex = p.providerWitness ? Transaction.addVKeyWitnessesHex(fromBase64(p.transaction), p.providerWitness) : fromBase64(p.transaction);
     const collateral = await this.resolveCollateral(hex);
-    checkMutual(hex, req.network, extra.scriptHash, ch.ref, p.channelConfig.payer, p.channelConfig.receiverAuthorizer, req.payTo, owed, collateral);
+    checkMutual(hex, req.network, extra.scriptHash, ch.ref, p.channelConfig.payer, p.channelConfig.receiverAuthorizer, req.payTo, ch.datum.constants.currency, owed, collateral);
     return v;
   }
 
@@ -226,13 +226,16 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     if (!confirmed) return { success: false, errorReason: SETTLEMENT_PENDING, transaction: txHash, network: req.network, payer };
     const subbed = ch.datum.stage.kind === "opened" ? ch.datum.stage.subbed : 0n;
     const fee = decodeTx(hex, Err.refundTransaction).body.fee;
+    const owed = BigInt(p.voucher.maxClaimableAmount) - subbed;
+    // What the consumer nets in the currency: the channel less the provider's share, and for an
+    // ADA channel less the fee paid out of it too (a token channel's fee comes from its ADA).
+    const back = ch.amount - owed - (ch.datum.constants.currency.kind === "ada" ? fee : 0n);
     return {
       success: true,
       transaction: txHash,
       network: req.network,
       payer,
-      // What the consumer nets: the channel, less the provider's share and the fee it paid from it.
-      amount: (ch.lovelace - (BigInt(p.voucher.maxClaimableAmount) - subbed) - fee).toString(),
+      amount: back.toString(),
       extra: { channelState: { channelId: p.voucher.channelId, channelRef: "", balance: "0", totalClaimed: p.voucher.maxClaimableAmount, withdrawRequestedAt: 0 } },
     };
   }

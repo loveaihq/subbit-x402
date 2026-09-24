@@ -4,7 +4,8 @@ Status: approved 2026-09-24; milestone 1 (§10) is implemented in `src/x402/` an
 on preprod (`RESULTS.md`, step 4), which added three rules below: a refund whose provider share
 is under min-UTxO is preceded by a claim (§5), an unconfirmed settle is `settlement_pending` with
 the transaction id (§6), and a client abandons an opening only when an input of it was spent
-elsewhere (§6). It follows x402 `main` @ `80c2fa49`
+elsewhere (§6). Milestone 2, token channels, ran the same way with a USDM stand-in (`RESULTS.md`,
+step 5) and added the rules on a token channel's ADA (§4, §5). It follows x402 `main` @ `80c2fa49`
 (generic spec, EVM binding, SVM draft) and `@x402/core` / `@x402/evm` 2.27.0, and reuses the
 Cardano conventions of `@x402/cardano` 2.27.0 (`exact`). Subbit is kompact-io/subbit-xyz @
 66648db, as vendored; every Subbit fact below is from its Aiken source at that commit or from
@@ -50,8 +51,9 @@ Two Subbit properties shape the design:
 - `network`: `cardano:mainnet | cardano:preprod | cardano:preview`, with `@x402/cardano`'s CIP-34
   aliases normalised on input. The spike runs on `cardano:preprod`.
 - `asset`: `lovelace`, or `<policyId>.<assetNameHex>` as in Cardano `exact`. It maps one-to-one
-  onto the datum's `currency`. The first milestone uses `lovelace`; `@x402/cardano` already names
-  a preprod USDM (`e675b46e…​.0014df10745553444d`) for the later token milestone.
+  onto the datum's `currency`. Milestone 1 ran on `lovelace`, milestone 2 on a token: a stand-in
+  shaped like USDM (`sUSDM`, CIP-67 label 333, 6 decimals), since the real preprod tUSDM that
+  `@x402/cardano` names (`e675b46e…​.0014df10745553444d`) is not in these wallets.
 - `amount`: the per-request maximum, in the asset's atomic units.
 - `payTo`: the provider's bech32 address. Redemptions pay out to it.
 
@@ -88,11 +90,18 @@ type ChannelConfig = {
   channels by scanning the script address for its `payer` key hash.
 - **`channelRef`**: the channel's current `txHash#index`. It changes with every `Sub` or `Add`;
   the server tracks it, and payloads may carry it as a hint.
-- **Capacity** (x402 `balance`): for a token channel, the currency amount; for an ADA channel,
-  the lovelace minus a reserve, because every continuing output must keep its own min-UTxO. The
-  reserve is the min-UTxO of the channel's largest continuing output (the `Closed` datum) at
-  current parameters: just under 2 tADA, to be computed exactly from the output's size. An IOU
-  above capacity cannot be redeemed unilaterally, so the server never accepts one.
+- **Reserve**: the min-UTxO of the channel's largest continuing output (the `Closed` datum,
+  holding its currency), at current parameters and with every integer at its widest encoding:
+  1.73 tADA for an ADA channel, 2.13 tADA for a token one (the datum names the token too).
+- **Capacity** (x402 `balance`): for an ADA channel, the lovelace minus the reserve, because every
+  continuing output must keep its own min-UTxO; an IOU above it cannot be redeemed unilaterally,
+  so the server never accepts one. For a token channel, all its tokens: its ADA is the reserve.
+- **A token channel's ADA.** The validator counts only the currency: a continuing output must
+  hold ADA and the currency and nothing else, but how much ADA is left to the ledger's min-UTxO.
+  A redemption can therefore take the channel's ADA down to that output's exact min-UTxO. So the
+  client puts in exactly the reserve and no more, the facilitator requires at least the reserve
+  (less could leave a later, larger output short), and what a provider can move is the reserve
+  less the exact minimum: 0.09 tADA on preprod.
 
 ## 5. Payloads
 
@@ -116,7 +125,8 @@ type RefundPayload  = { type: "refund";  channelConfig: ChannelConfig; voucher: 
   the channel, and signs it as consumer. The server checks the provider's payout and adds its
   signature; the facilitator broadcasts. Full refund only: the channel is consumed, and reuse
   means opening a new one (as SVM). The provider's share is an output of its own and must clear
-  min-UTxO; when it would not, the server claims it first and the refund then owes nothing.
+  min-UTxO; when it would not, the server claims it first and the refund then owes nothing. For
+  a token channel the share is always claimed first, since a token output needs ADA of its own.
 
 Server → facilitator `/settle`, with synthetic requirements (`amount: "0"`, as EVM):
 

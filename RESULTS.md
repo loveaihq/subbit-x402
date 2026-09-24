@@ -245,10 +245,109 @@ What the run changed in the code:
   whether or not it has been spent. The facilitator's unspent check and its walk from a channel's
   old position to its current one read Blockfrost's `consumed_by_tx` instead.
 
+## Step 5: token channels, with a USDM stand-in
+
+The preprod USDM that `@x402/cardano` names is real (Moneta's tUSDM, 15.1 M in supply), but these
+wallets hold none and getting some means an outside faucet. So the consumer minted a stand-in of
+the same shape (`spike/mint.ts`): `sUSDM`, asset name `0014df10` + "sUSDM" (CIP-67 label 333), 6
+decimals, 1,000,000 of them, under a native policy that needs the consumer's key and closed at
+slot 134561842, an hour later, so the supply is fixed. The same transaction gave the provider 10
+units of a second name under that policy, `sXTRA`, for a check below.
+
+| Step | Transaction | Result |
+|---|---|---|
+| mint | `f5f98d482f30ffa76a19b0157e9faeec91087a0a42a052cffaaf807c6f83f295` | policy `085c41bd155d0562653d61a847bc00b0dae291f323ed43b347419c19`; 1,000,000 sUSDM to the consumer, 10 sXTRA to the provider |
+
+`SUBBIT_CURRENCY=token` runs step 2's lifecycle and step 4's x402 run in sUSDM
+(`spike/currency.ts`); amounts are in 10⁻⁶ sUSDM, so step 2's figures carry over unchanged.
+
+**What the validator checks on a token channel** (`assets.ak`): on a channel input only the
+currency's quantity counts; a continuing output must hold ADA and at most the currency, nothing
+else; and only the currency's amount enters any step's arithmetic. The ADA a token channel holds
+is kept up by the ledger's min-UTxO alone.
+
+**Step 2's lifecycle in sUSDM**, with the validator read from step 3's reference script:
+
+| Step | Transaction | Result |
+|---|---|---|
+| A open | `2987c04a180c820487be1d8c1d3ce945c513097eb372a53331d4d6ac06b83973` | 10 sUSDM and 2.133450 tADA, exactly the reserve |
+| A sub | `f076726a96e428cf86f1eb6726b31a7a7737235a1d4335825c107e1c6a6355a8` | the provider redeems 1 sUSDM; the channel's ADA stays |
+| A close | `f327b77a966ef9f813854c6c9e1938fc4542ac6091ce595c6879a08dc01d0105` | the consumer closes alone |
+| A settle | `d89547a7dcc6b8d21c33bfb2d10406c143955c8a791d94a0caf62bddde187610` | the provider takes 3 − 1 = 2 sUSDM, 63 min before `elapse_at` |
+| A end | `14607b393fb4b4820bc5263f5504d2b604501eb9aa93dea2cac2559b78f3adb0` | the consumer takes back 7 sUSDM and the 2.133450 tADA |
+| B open | `0c94c72c44e2bc812a320e150c6024c79d501efe4954d0ff7193b5df00be8c1f` | 5 sUSDM and 2.133450 tADA |
+| B close | `68245d148d7024960dcbe70b84784aae10e5ddccd8c10d08938685249fbfb0f6` | 500 IOUs never redeemed; the consumer closes |
+| B elapse | `27e7bdab457ca1c9a3c829e27596002c76de264e8e9a3c11ceec50021557e745` | from `elapse_at`, all 5 sUSDM and the ADA back, no provider signature |
+
+Every party's net change was read back in both sUSDM and ADA. The build-only checks came out as
+in step 2 (all 17 refusals refused, the late settle accepted), and two more ran for tokens:
+
+| Channel | Transaction | Validator |
+|---|---|---|
+| open | the continuing output also carries 1 sXTRA | refused |
+| | the provider's sub also takes the channel's ADA down to that output's exact min-UTxO, 2.133450 → 2.042940 tADA | **accepted** (built, not submitted) |
+
+The 8 transactions cost 2.006198 tADA in fees, against 1.869612 for their ADA twins in step 3:
+the token makes each channel output larger.
+
+**x402 in sUSDM.** Step 4's run again, the route priced at 1,000 units, 0.001 sUSDM:
+
+| Phase | Transaction | Result |
+|---|---|---|
+| request 1 | `47f7170704019e9b74a5081326e9c36658c213a8e4cc2919a921253e938967c7` | the deposit opens a channel with 3 sUSDM and 2.133450 tADA; answered after 42.9 s |
+| requests 2–200 | none | median 6.3 ms, p90 8.3 ms, max 37.0 ms; 2 HTTP calls each |
+| claim | `4abaa2ec2912534ff56f449c3a46eb0d6a9205814e675e2f97a9e69ff2e7debf` | redeems 0.200000 sUSDM; fee 0.264632 tADA |
+| corrective 402 | none | one request behind, then one ahead: 3 HTTP calls each, back in step |
+| refund | `142ad42e713510823f30995e561a02345456cbdcabde6f982a36a8c52a215ebc`, `7070e997b1136c68031b3f34a25567273a0511aadb1d431a22b4991762dab30b` | a claim of the last 0.002 sUSDM, then `Mutual`: 2.798 sUSDM and the reserve back |
+
+| Channels | Transaction | Bytes | Memory | Steps | Fee (tADA) | Per channel |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | `82ee0cb069144e8b6727d9345c8b3b3bb4831bf2ae3fb1ba60f57ab2d8d4c3e3` | 1,003 | 211,749 | 134,346,282 | 0.267227 | 0.267227 |
+| 5 | `4132c0e4b1fb2652dc6d7ddf6d0505ddee58589789e12b318ff46184e390035d` | 2,759 | 1,039,560 | 682,807,406 | 0.431805 | 0.086361 |
+| 5 | `1bd2a7c4be389b1eefdbd33e151466d703fc2eb46068d85e25d7c101b08122b5` | 2,759 | 1,039,560 | 682,807,406 | 0.431805 | 0.086361 |
+| 9 | `ced326604ee4ebdb7d13f0cda2837e92edc6377656c724f205095e94e70caa20` | 4,515 | 1,820,728 | 1,205,026,270 | 0.591801 | 0.065756 |
+| 10 | `44ce4a0f94cd3152e717ea467d54841a55ba23701c9a1112a3d16aec4630e814` | 4,954 | 2,021,838 | 1,338,875,191 | 0.632372 | 0.063237 |
+
+A token channel adds 439 bytes to a claim, against 350 for ADA, and about 0.0406 tADA
+(0.2267 + 0.0406 × N from the single and the ten-channel claims), so size binds at about 36
+channels per transaction (extrapolated). Fees are paid in ADA and charges come in the token: at
+ADA = $0.238 (2026-09-24) and 0.001 sUSDM a request, a claim over one channel pays for itself
+after 64 requests, over ten after 16 per channel.
+
+The ten batch channels were refunded with `Mutual` (`29cc8b4e…`, `44d05ef0…`, `ce9ea2f7…`,
+`32acc779…`, `b0cbb39b…`, `d5057704…`, `bbb3b07e…`, `24d75395…`, `97399749…`, `bfcb0b5a…`; 645
+bytes and 0.234657 tADA each), 0.095 sUSDM and the reserve back from each. **Reconciliation, in
+both currencies:** sUSDM: consumer 999,997.000000 → 999,996.748000, provider 3.000000 → 3.252000,
+nothing left in channels, so none created or lost. ADA: consumer 80.206828 → 75.474342, provider
+22.152256 → 19.088929; the two lost 7.795813 tADA, exactly the 7.616672 of fees of the run's 29
+transactions plus the 0.179141 of a UTxO tidy the provider made midway (`3c5df065…`, below).
+
+What the run changed in the code:
+
+- **The reserve includes the token.** The first token opening was refused by the ledger: the ADA
+  put in, 1,909,330 lovelace, had been sized for an output without the token, which needs
+  2,025,700. `channelReserve` now sizes the output with the currency at its widest quantity.
+- **ADA-only UTxOs for collateral.** The SDK takes collateral only from at most three inputs,
+  ADA-only first. Channel openings seeded from the largest ADA-only UTxO had folded the consumer's
+  ADA into one token-laden UTxO, and claims did the same to the provider, whose change then held
+  the redeemed tokens. Now a token channel seeds from a UTxO holding the token, and a claim pays
+  the redeemed tokens to `payTo` in an output of their own, so its change stays ADA-only. Before
+  that, `npm run mint -- tidy` gave each wallet three ADA-only UTxOs (`888cbe9c…` for the
+  consumer, `3c5df065…` for the provider).
+- **The manager holds back what it just spent.** A claim built seconds after another selected the
+  provider input the first had spent: Blockfrost's address index still listed it, and the
+  evaluator refused the transaction (`CannotCreateEvaluationContext`, an input missing from the
+  UTxO set). The manager now keeps its claims' inputs out of coin selection, as the client does.
+- **Retries on Blockfrost queries.** Builds failed twice fetching protocol parameters (the
+  endpoint answered 200 a minute later; 3,896 calls that day, far below the quota). Builds now
+  retry failed provider queries, and only those: a script failure is never retried.
+- The SDK's asset unit is policy and name run together; its doc comment and x402 write them with
+  a dot.
+
 ## What this does not show yet
 
-- A native-asset channel (USDM), where min-UTxO ADA rides alongside the currency.
-  `@x402/cardano` already names a preprod USDM (`e675b46e…​.0014df10745553444d`).
+- The real tUSDM. The stand-in has its shape and takes the same code paths; only the asset id
+  differs.
 - Top-ups (`Add`), and the manager settling a channel on its own when a consumer closes it
   unilaterally.
 - The facilitator holding the provider key for servers that run none (DESIGN.md §8).
@@ -294,8 +393,14 @@ What the run changed in the code:
   opening up unless one of its inputs went to another transaction.
 - A refund pays the provider its unredeemed share in an output of its own, so that share must
   clear min-UTxO; below it, the server claims first.
-- Claims batch: one transaction redeems up to about 45 channels (size-bound at preprod's
-  parameters), at 0.221768 + 0.034959 × N tADA.
+- Claims batch: one transaction redeems up to about 45 ADA channels or 36 token channels
+  (size-bound at preprod's parameters), at 0.221768 + 0.034959 × N tADA for ADA and about
+  0.2267 + 0.0406 × N for tokens.
+- A token channel carries exactly its reserve in ADA. The validator counts only the currency, so
+  a redemption can take that ADA down to the output's exact min-UTxO; with the reserve as
+  deposited, that is at most 0.09 tADA. The facilitator requires at least the reserve at opening.
+- A token channel's refund always follows a claim: the provider's share would be a token output,
+  which needs ADA of its own.
 
 ## Reproduce
 
@@ -313,6 +418,10 @@ SUBBIT_SCRIPT=ref npm run lifecycle -- all
 npm run refscript -- report   # both modes side by side, and the reconciliation
 
 npm run x402 -- all           # step 4: pay 200, claim, corrective, refund, batch, batch-refund, report
+
+npm run mint -- mint          # step 5: the sUSDM stand-in
+SUBBIT_CURRENCY=token SUBBIT_SCRIPT=ref npm run lifecycle -- all
+SUBBIT_CURRENCY=token npm run x402 -- all
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

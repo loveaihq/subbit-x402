@@ -11,6 +11,7 @@
     "lifecycle": "tsx spike/lifecycle.ts",
     "refscript": "tsx spike/refscript.ts",
     "x402": "tsx spike/x402/e2e.ts",
+    "mint": "tsx spike/mint.ts",
     "test": "node --test --import tsx test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
