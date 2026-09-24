@@ -179,10 +179,79 @@ against the UTxOs it selected (`/utils/txs/evaluate/utxos`), so only the node co
 The same close built two minutes later went through, and `submit()` now waits until the wallet
 no longer lists any input a confirmed transaction spent.
 
+## Step 4: x402 `batch-settlement` end to end
+
+Milestone 1 of `DESIGN.md`: the binding in `src/x402/` (client, resource-server and facilitator
+schemes for `@x402/core` 2.27.0, and the server's channel manager), driven by
+`spike/x402/e2e.ts`. The facilitator (127.0.0.1:7413, no key, no funds) and the resource server
+(127.0.0.1:7411, `GET /data` priced 1,000 lovelace, close period 900 s) run in one process and talk
+real HTTP; the client is `@x402/fetch`'s `wrapFetchWithPayment` around the binding's client
+scheme. Channels read the validator from step 3's reference script. Consumer = account 0,
+provider (`payTo`) = account 1.
+
+| Phase | Transaction | Result |
+|---|---|---|
+| request 1 | `0614b7d062db1ffd1385333d08c55ca48326c4f56ebe374999ce263c2dc70981` | the deposit opens a channel with 3 tADA of capacity; answered after 35.5 s, a block included |
+| requests 2–200 | none | median 14.8 ms, p90 30.1 ms, max 49.8 ms; no chain; 2 HTTP calls each (402, then paid); server and client both count 200,000 lovelace |
+| claim | `de70bb06fca7c4f59720b81b7a4b847a456f8f7645f5ac626048076b3788da1d` | one `Sub` redeems 0.200000 tADA for the 200 requests to `payTo`; fee 0.256907 |
+| corrective 402 | none | the client's count set one request behind, then one ahead: each time 3 HTTP calls and the counts back in step |
+| refund | `d6c97926b18923bff9ec1e32f8637028c0e9f2a3ebb858255e13cc73a14538e1`, `b053c1d16da3f37e0f8c116e2ed03b6e90aa8a42a89414873641d2596d9184be` | a claim of the last 0.002 tADA, then the consumer's `Mutual`, co-signed by the server: 4.300979 tADA back |
+
+**Batching.** Ten more channels, one paid request after another, then claims of 10, 5 and 1
+channels per transaction, one `Main` over the first channel and `Defer` on the rest:
+
+| Channels | Transaction | Bytes | Memory | Steps | Fee | Per channel |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | `32092dc3ac28fcccfc12b5dbc55c7ad941afc0b4287ab2073e29fd52a74b2347` | 803 | 191,022 | 127,363,413 | 0.256727 | 0.256727 |
+| 5 | `9ce9a419839ad87c7d35c7672d68e033de9c3a877f9e04330be022945b9c6078` | 2,203 | 912,059 | 635,384,521 | 0.396566 | 0.079313 |
+| 5 | `2030137c27fef7087352babc81b1e7ff7bca640a938b11bc2f9e9f444cdad520` | 2,203 | 912,059 | 635,384,521 | 0.396566 | 0.079313 |
+| 9 | `b6d1183cc87dd1af69776610568d11ec8c8f3e9104ed3563f318d59741a567a3` | 3,603 | 1,633,294 | 1,143,182,869 | 0.536399 | 0.059600 |
+| 10 | `4fa168b6dcdcbaf61bda06d57ebda03dab389f52b1d1bb68bb20ecf913c680dc` | 3,953 | 1,813,578 | 1,270,160,301 | 0.571358 | 0.057136 |
+
+Every channel added costs the same: 350 bytes, 180,284 memory units, 126,977,432 steps, and
+0.034959 tADA, so a claim over N channels costs 0.221768 + 0.034959 × N tADA. Of preprod's limits
+per transaction (16,384 bytes, 17.5 M memory, 10 G steps), size binds first, at 45 channels
+(extrapolated, not measured), about 0.040 tADA per channel. At 1,000 lovelace a request, a claim
+over one channel pays for itself after 257 requests, over ten after 58 per channel.
+
+Afterwards all eleven batch channels were refunded with `Mutual` (`3375a341…`, `2f42e704…`,
+`debe4ac6…`, `cd6f3f07…`, `25355586…`, `dca3f90f…`, `66f80442…`, `88a5805a…`, `bbda9ac5…`,
+`330a8229…`, `431b3d9f…`; 597 bytes and 0.232545 tADA each). **Reconciliation:** 31
+transactions (12 deposits, 7 claims, 12 refunds), 7.559126 tADA in fees; consumer 88.369112 →
+83.239416 tADA, provider 23.953134 → 21.523704, nothing left in channels, and the two wallets lost
+exactly the fees. The provider is down because these runs redeemed 0.242 tADA of charges against
+2.7 tADA of claim fees: at x402 prices a claim has to wait for volume.
+
+What the run changed in the code:
+
+- **A deposit that confirms late.** The eleventh deposit (`7e72cefe…`) landed at 06:20:22,
+  2.5 minutes after it was submitted and 33 s after the facilitator stopped waiting; a lookup
+  at 06:20:43 still got 404, as Blockfrost's transaction index trailed the tip. The facilitator
+  had reported the settle as failed, and the client, after five minutes, gave the channel up
+  and opened another; the first became an orphan holding 1.832620 tADA, recovered later by a
+  cooperative refund (`25355586…`). Now the facilitator answers `settlement_pending` with the
+  transaction id whenever confirmation is unknown, polling Blockfrost itself (the SDK's
+  `awaitTx` throws when its timeout runs out, which a caller cannot tell from a failed query),
+  and the client gives an opening up only when one of its inputs has been spent by another
+  transaction, the one case in which it can never land.
+- **Collateral.** The SDK takes the largest ADA-only UTxO as collateral against a fixed 5 ADA
+  target and stops: with a 5.75 tADA UTxO the return came to 0.752942 tADA, below the 0.969750
+  minimum, and the build failed without trying another input (its message blames tokens). Script
+  transactions now set the target from the largest ADA-only UTxO.
+- **A refund's payout floor.** The provider's share in a `Mutual` is an output of its own, which
+  must clear min-UTxO (about 1 ADA); a share of 0.002 tADA cannot. The server claims it first,
+  where `Sub` pays it into the provider's change, and the refund then owes nothing.
+- **Reading spent outputs.** Through Blockfrost, the SDK's `getUtxosByOutRef` returns an output
+  whether or not it has been spent. The facilitator's unspent check and its walk from a channel's
+  old position to its current one read Blockfrost's `consumed_by_tx` instead.
+
 ## What this does not show yet
 
 - A native-asset channel (USDM), where min-UTxO ADA rides alongside the currency.
-- Anything x402: no `PaymentRequirements`, no facilitator, no HTTP.
+  `@x402/cardano` already names a preprod USDM (`e675b46e…​.0014df10745553444d`).
+- Top-ups (`Add`), and the manager settling a channel on its own when a consumer closes it
+  unilaterally.
+- The facilitator holding the provider key for servers that run none (DESIGN.md §8).
 
 ## Notes for the binding spec
 
@@ -217,6 +286,16 @@ no longer lists any input a confirmed transaction spent.
   output. Whoever builds most channel transactions, the provider or a facilitator acting for
   many, should keep one. It needs an address no wallet spends from: the SDK's coin selection
   skips only the reference inputs of the transaction being built.
+- A paid request after the first touches no chain: 15 ms median on one machine, two HTTP round
+  trips with `@x402/fetch` (the request, its 402, the paid request). Only the first request of a
+  channel waits for its deposit to reach a block, 25–36 s on preprod.
+- A deposit can confirm minutes after it is submitted. A facilitator that cannot confirm must say
+  `settlement_pending` and give the transaction id, never failure, and a client must not give an
+  opening up unless one of its inputs went to another transaction.
+- A refund pays the provider its unredeemed share in an output of its own, so that share must
+  clear min-UTxO; below it, the server claims first.
+- Claims batch: one transaction redeems up to about 45 channels (size-bound at preprod's
+  parameters), at 0.221768 + 0.034959 × N tADA.
 
 ## Reproduce
 
@@ -232,9 +311,14 @@ npm run refscript -- check
 SUBBIT_SCRIPT=ref npm run spike -- all
 SUBBIT_SCRIPT=ref npm run lifecycle -- all
 npm run refscript -- report   # both modes side by side, and the reconciliation
+
+npm run x402 -- all           # step 4: pay 200, claim, corrective, refund, batch, batch-refund, report
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,
 `a-close`, `a-settle`, `a-end`, `b-elapse`, `report`). State, including the throwaway IOU keys,
 is in the gitignored `out/lifecycle.json`. Ref mode keeps its own, in `out/state-ref.json` and
-`out/lifecycle-ref.json`; the deployed output is recorded in `out/refscript.json`.
+`out/lifecycle-ref.json`; the deployed output is recorded in `out/refscript.json`. Step 4's
+phases also run one at a time (`pay [n]`, `claim`, `corrective`, `refund`, `batch`,
+`batch-refund`, `report`; `reset` clears its state), with state in `out/x402/`: the client's
+and server's channel stores, and `results.json`.
