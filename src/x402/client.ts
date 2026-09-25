@@ -197,6 +197,8 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   private readonly spent: Map<string, number>;
   /** The wallet's IOU root, asked for once. */
   private root?: Promise<Uint8Array>;
+  /** This client's own top-ups, until the chain shows them: where each spent its channel from, and when. */
+  private readonly topUps = new Map<string, { from: string; tx: string; at: number }>();
 
   constructor(private readonly o: ClientOptions) {
     this.spent = o.spentInputs ?? new Map<string, number>();
@@ -221,7 +223,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
       if (ceiling <= BigInt(ch.balance)) return { x402Version, payload: await this.voucher(ch, ceiling, req) };
       // Short of capacity. Read the channel first: a top-up that landed late may already cover it.
-      const view = ch.channelRef ? await this.o.chain.followChannel(ch.channelRef, extra.scriptHash, ch.channelId) : undefined;
+      const view = await this.pastOwnTopUp(ch.channelId, ch.channelRef ? await this.o.chain.followChannel(ch.channelRef, extra.scriptHash, ch.channelId) : undefined, extra.scriptHash);
       if (view && view.datum.stage.kind === "opened") {
         const capacity = capacityOf(view, await this.o.chain.coinsPerUtxoByte());
         if (capacity.toString() !== ch.balance || view.ref !== ch.channelRef) {
@@ -281,12 +283,33 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
     await this.o.authorize?.({ kind: "topUp", channel: ch, amount: ceiling, deposit: add, transaction: signed, view, requirements: req });
     for (const i of Transaction.fromCBORHex(signed).body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
+    this.topUps.set(ch.channelId, { from: view.ref, tx: txHashOf(signed), at: Date.now() });
     return {
       type: "deposit",
       channelConfig: ch.channelConfig,
       voucher: { channelId: ch.channelId, maxClaimableAmount: ceiling.toString(), signature: await this.signVoucher(ch, ceiling), channelRef: view.ref },
       deposit: { amount: add.toString(), transaction: toBase64(signed) },
     };
+  }
+
+  /**
+   * Right after a top-up of this client's own lands, the chain's index can still show the channel
+   * where that top-up spent it: Blockfrost trails a block by some seconds (16 s once, on preprod,
+   * for a request retried after its response was lost). A top-up built on that view spends an
+   * output that is gone. So while the view is where our last top-up started, read again for up to
+   * 30 s; if it still has not moved, the top-up is not on chain yet, and the request is refused as
+   * one to retry rather than raced with a second top-up.
+   */
+  private async pastOwnTopUp(channelId: string, view: ChannelView | undefined, scriptHash: string): Promise<ChannelView | undefined> {
+    const t = this.topUps.get(channelId);
+    if (!t || Date.now() - t.at > PENDING_MS) return view;
+    for (let i = 0; view?.ref === t.from; i++) {
+      if (i === 10) throw new Error(`channel ${channelId.slice(0, 16)}…: its top-up ${t.tx} is not on chain yet; retry shortly`);
+      await new Promise((r) => setTimeout(r, 3_000));
+      view = await this.o.chain.followChannel(t.from, scriptHash, channelId);
+    }
+    this.topUps.delete(channelId);
+    return view;
   }
 
   private async withValidator(tx: ReturnType<SeedWallet["newTx"]>, referenceScript?: string) {
@@ -565,14 +588,17 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   /**
    * After `elapse_at`, when the server has not settled: `Main([Elapse])` takes everything back
    * without it. The lower validity bound is the first slot starting at or after `elapse_at`; a
-   * node refuses the transaction until the chain has reached that slot, so this waits for it.
+   * node refuses the transaction until the chain has reached that slot, so this waits for it —
+   * or, with `wait: false`, refuses with "not yet", for a caller holding a lock while it runs.
+   * Either way the decision rests on the same read of the channel as the transaction does.
    */
-  async elapse(channelId: string): Promise<string> {
+  async elapse(channelId: string, opts: { wait?: boolean } = {}): Promise<string> {
     const { ch, view, network } = await this.openView(channelId);
     const stage = view.datum.stage;
     if (stage.kind !== "closed") throw new Error(`channel is ${stage.kind}, not closed`);
     const from = slotAtOrAfter(network, stage.elapseAt);
     for (let tip = await this.o.chain.tipSlot(); tip < from; tip = await this.o.chain.tipSlot()) {
+      if (opts.wait === false) throw new Error(`not yet: the channel's elapse_at is ${new Date(Number(stage.elapseAt)).toISOString()}`);
       await new Promise((r) => setTimeout(r, Math.min(60_000, Number(from - tip) * 1_000 + 5_000)));
     }
     let tx = this.o.wallet.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.elapse()]) });

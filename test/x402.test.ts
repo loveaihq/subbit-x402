@@ -603,3 +603,56 @@ test("client: a deposit is what capacity asks, never under the floor, cut to wha
   assert.throws(() => depositWithin(50_000n, 10_000n, 9_999n), /at least 10000/);
   assert.throws(() => depositWithin(50_000n, 10_000n, -5n), /room for \(0\)/);
 });
+
+test("client: right after its own top-up, it waits for the chain's index instead of topping up again", async () => {
+  const wallet = testWallet();
+  const key = derivedIouSigner(await iouRootOf(wallet), "cardano:preprod", TAG);
+  const cfg = { ...config, payerAuthorizer: key.publicKey };
+  const address = channelAddress(0);
+  const reserve = channelReserve(address, constantsOf(cfg, TAG), 4310n);
+  const at = (ref: string, held: bigint) =>
+    ({ ref, address, lovelace: held, amount: held, utxo: {}, datum: { ownHash: SUBBIT_HASH, constants: constantsOf(cfg, TAG), stage: { kind: "opened", subbed: 0n } } }) as unknown as ChannelView;
+  // Where the top-up spent the channel from (room for 10,000), and where it put it (20,000).
+  const before = at(`${"aa".repeat(32)}#0`, reserve + 10_000n);
+  const after = at(`${"bb".repeat(32)}#0`, reserve + 20_000n);
+  let reads = 0;
+  const chain = { followChannel: async () => (++reads < 2 ? before : after), coinsPerUtxoByte: async () => 4310n } as unknown as Chain;
+  const storage = new FileClientStorage(mkdtempSync(join(tmpdir(), "x402-topup-")));
+  const client = new BatchSettlementCardanoClient({ wallet, storage, chain });
+  await storage.set({
+    channelId: TAG,
+    serverKey: serverKey(baseReq, parseExtra(baseReq)),
+    channelConfig: cfg,
+    iouKey: "derived",
+    network: "cardano:preprod",
+    scriptHash: SUBBIT_HASH,
+    channelRef: before.ref,
+    deposit: "0",
+    balance: "10000",
+    chargedCumulativeAmount: "10000",
+    status: "open",
+    openedAt: 1,
+  });
+  // The top-up this client just made; its receipt never came back, so the record still says 10,000.
+  (client as unknown as { topUps: Map<string, unknown> }).topUps.set(TAG, { from: before.ref, tx: "cc".repeat(32), at: Date.now() });
+
+  const p = parseClientPayload((await client.createPaymentPayload(2, baseReq)).payload);
+  assert.equal(p.type, "voucher", "a voucher on the larger channel, not a second top-up of an output that is gone");
+  assert.equal(p.voucher.maxClaimableAmount, "11000");
+  assert.equal(reads, 2, "the index was read again once it still showed the old position");
+  assert.equal((await storage.get(TAG))!.channelRef, after.ref);
+});
+
+test("client: elapse without waiting refuses a channel whose elapse_at the chain has not reached", async () => {
+  const address = channelAddress(0);
+  const elapseAt = 1_790_000_000_000n;
+  const closed = { ref: `${"dd".repeat(32)}#0`, address, lovelace: 5_000_000n, amount: 5_000_000n, utxo: {}, datum: { ownHash: SUBBIT_HASH, constants: constantsOf(config, TAG), stage: { kind: "closed", subbed: 0n, elapseAt } } } as unknown as ChannelView;
+  let tips = 0;
+  // The tip is a slot before elapse_at: preprod slot 0 is 1654041600 s.
+  const chain = { followChannel: async () => closed, tipSlot: async () => (tips++, 1_000n) } as unknown as Chain;
+  const storage = new FileClientStorage(mkdtempSync(join(tmpdir(), "x402-elapse-")));
+  const client = new BatchSettlementCardanoClient({ wallet: {} as never, storage, chain });
+  await storage.set({ channelId: TAG, serverKey: "k", channelConfig: config, channelRef: closed.ref, network: "cardano:preprod", scriptHash: SUBBIT_HASH, deposit: "0", balance: "0", chargedCumulativeAmount: "0", status: "closing", openedAt: 1 });
+  await assert.rejects(client.elapse(TAG, { wait: false }), /^Error: not yet: the channel's elapse_at is 2026-09-21T/);
+  assert.equal(tips, 1, "one read of the tip, no waiting");
+});

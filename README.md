@@ -50,14 +50,14 @@ Each run's wallets reconcile to the lovelace against the fees of its transaction
 
 ```
 npm install
-npm test            # 31 chain-free tests
+npm test            # 33 chain-free tests
 npm run typecheck
 ```
 
 As a dependency, `npm i subbit-x402` (built, from npm) or a GitHub commit (which builds itself on
 install); it exports `subbit-x402/subbit` and `subbit-x402/x402/<module>` (`client`, `server`,
 `facilitator`, `manager`, `chain`, `cardano`, `txcheck`, `types`, `claimtx`). It takes the SDK's
-objects, a wallet among them, so use the `@evolution-sdk/evolution` version it pins (0.5.13).
+objects, a wallet among them, so use the `@evolution-sdk/evolution` version it pins (0.5.14).
 [ada-agent-wallet](https://github.com/loveaihq/ada-agent-wallet) uses the client that way: its
 signing daemon runs `BatchSettlementCardanoClient` with an `authorize` hook that puts every
 voucher and deposit through its spend policy.

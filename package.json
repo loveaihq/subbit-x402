@@ -1,6 +1,6 @@
 {
   "name": "subbit-x402",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "x402 batch-settlement on Cardano over Subbit.xyz payment channels: binding spec draft and reference implementation, preprod only",
   "type": "module",
   "license": "Apache-2.0",
@@ -48,7 +48,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@evolution-sdk/evolution": "0.5.13",
+    "@evolution-sdk/evolution": "0.5.14",
     "@noble/hashes": "2.4.0",
     "@x402/core": "2.27.0"
   },
