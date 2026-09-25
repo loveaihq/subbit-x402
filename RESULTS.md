@@ -548,15 +548,72 @@ before: open 0.175005, claim 0.256727–0.256807, refund 0.232545.
 **Reconciliation.** Consumer 70.179634 → 68.091062, provider 16.016461 → 15.267197 tADA; the two
 lost 2.837836 tADA, exactly the fees of the 11 transactions.
 
+## Step 9: answering a retry, and a server that holds no key
+
+**A retry of the latest voucher.** When a paid request's response is lost on the way back, the
+server has served and charged it and the client has not seen that, so the client's next request
+carries the same voucher. The server now keeps, for each channel, its latest paid request: the
+voucher and the response. A request with that very voucher gets the kept response, without the
+handler running or a second charge (SVM's rule). An earlier voucher is still stale and gets the
+corrective 402: a client resyncing after losing its records sends earlier amounts, and must get
+the server's count, not old answers. In tADA, `out/x402-step9/`:
+
+| Step | Transaction | Result |
+|---|---|---|
+| request 1 | `de2d61d909d8c9e73f3f02bf3d198c659a0d9c0569eb5b17db3b1dbe9f6d24b1` | opens; 3 requests |
+| request 4 | none | sent by hand and its response thrown away: the server served `{"n":4,…}` and counts 4,000, the client 3,000 |
+| retry | none | the same voucher, 2 HTTP calls: the same body back, byte for byte; the server still counts 4,000, the client catches up to 4,000 |
+| request 5 | none | charged as usual, 5,000 |
+| claim | `1a1fd9f1b1b93294f84add662be25675bacce4404a30ec0144ab2635cc596e07` | 0.005 tADA |
+| refund | `e3684faf856de84c9622d1d7e71b0c61d7575f53cc34628d9e38e9af0f8a3879` | 1.515075 tADA back |
+
+Reconciliation, from the chain, since the next run changed the wallets before this one's report:
+consumer 68.091062 → 67.678512, provider 15.267197 → 15.015467 tADA, 0.664280 lost, exactly the
+three transactions' fees. The closing balances are the next run's opening ones, the consumer's
+plus the 30 tADA it then sent and that transaction's fee (0.171309, `1625a5d5…`).
+
+**A server that holds no key.** A second resource server (127.0.0.1:7412, 0.1 tADA a request)
+runs with no key at all. The facilitator holds its provider key, account 3 of the test mnemonic,
+registered with the server's `payTo` and a secret the two share; the server's channels name that
+key as `provider`. The facilitator builds, signs and pays the fees of the server's claims, paying
+everything redeemed to `payTo` in one output, and co-signs its refunds, each only on the server's
+authentication (`delegationMac`); after each claim the server checks on chain that `payTo` got
+what was redeemed. Subbit does not restrict where a redemption pays, so the server trusts the
+facilitator with its revenue. Account 3 got 30 tADA first (`1625a5d5…`); state in
+`out/x402-step9-delegate/`:
+
+| Channel | Step | Transaction | Result |
+|---|---|---|---|
+| A | request 1 | `c7ca1138fb1770b8fff28e3be6f4ef31da28aecdd07e78a1b8d37e5de3d1144e` | opens on the keyless server; its `provider` is account 3's key |
+| | claim | `c844a2acd3c1fd5164200d0ecca96541252c16afef1ff05385644ad3c3223e5f` | after 10 requests, built and signed by the facilitator: 1.0 tADA to `payTo`, fee 0.259764 from account 3 |
+| | claim | `f08a4e02763b49b354face04b281d848b6ebb6d0a06c19179f0bb5165bd97e60` | 5 more requests, 0.5 tADA: paid out as 0.969750, the min-UTxO, 0.469750 of it from account 3 |
+| | refund | `f9a3b33deac02a083ed5e7e94440ea325fbd1cd3395e005aaf4ba6b7bffca127` | `Mutual`, co-signed by the facilitator: 2.000075 tADA back |
+| B | request 1 | `cae44b2d7f8502613a9c8c06938a935082cdbc042d0417cb99dcba9b9e3fd340` | 12 requests |
+| | close | `77915cfb1cb003003dea02927ae59440eaf4221c9a9474e6ef8d90d00ff15627` | the consumer alone |
+| | settle | `ab35b98e828cf7777f2d141b4fcd67a85c02ec93084af2d65a3788d5d4cf2463` | the server's watcher asked, the facilitator settled: 1.2 tADA to `payTo` |
+| | end | `dfe559d4503e21a13d10c7edbc9bcbfb59f2cebaf80e0ad0773680dc23ed6339` | the rest back |
+
+A delegated claim is 872 B and 0.259764 tADA against 803 B and 0.256727 for the server's own: the
+payout is an output of its own, which is also why min-UTxO binds. Account 3 went 30.000000 →
+28.750961 tADA: 0.779289 in fees for three claims and 0.469750 topping up the 0.5 tADA payout.
+`payTo` got 3.169750, the 2.7 redeemed plus that top-up.
+
+**Reconciliation.** Consumer 37.507203 → 33.743683, `payTo` 15.015467 → 18.185217, account 3
+30.000000 → 28.750961 tADA: the three lost 1.842809 tADA, exactly the fees of the 8 transactions.
+The run first recorded account 3 at 0: it took its balances right after the funding, before the
+address index listed it. Account 3's first transaction is that funding, which paid it exactly 30
+tADA, so its opening balance is that; the funding step now waits for the index.
+
 ## What this does not show yet
 
 - The real tUSDM. The stand-in has its shape and takes the same code paths; only the asset id
   differs.
-- The facilitator holding the provider key for servers that run none (DESIGN.md §8).
 - The watcher at scale: each pass reads every channel the server holds, two or three Blockfrost
   queries each. With many channels a server would follow the chain rather than poll it.
 - Recovery in a token currency: step 8 ran in tADA. `elapse` has not run on a token channel; its
   token handling is `end`'s, which step 7 ran.
+- Delegation in a token currency: step 9 ran in tADA. A token payout needs its own min-UTxO of ADA
+  (about 1.17 tADA), which under delegation the facilitator's wallet puts up on every claim.
 
 ## Notes for the binding spec
 
@@ -626,6 +683,14 @@ lost 2.837836 tADA, exactly the fees of the 11 transactions.
   and without the server `elapse` needs only the consumer's key and the close period.
 - A server that loses its records loses what it charged and did not redeem. Its count comes back
   with the client's next voucher, which is cumulative, and runs on from there.
+- A lost response costs nothing when the server keeps each channel's latest answer: the retry
+  carries the same voucher and gets the same answer, uncharged. Only the latest, or a client
+  resyncing from `subbed` gets old answers instead of the corrective 402.
+- Delegating the provider key is custody on Subbit: the key can pay a redemption anywhere. It
+  takes a key per server tied to its `payTo`, the server's authentication on every claim and
+  refund (a channel settles once, and the key would otherwise settle on a consumer's say-so), and
+  an audit of each payout. And each payout is an output of its own, so a delegated claim should
+  redeem at least min-UTxO; the facilitator tops up anything less.
 
 ## Reproduce
 
@@ -659,6 +724,10 @@ npm run x402 -- wallets after && npm run x402 -- report
 
 export X402_OUT=x402-step8   # step 8: recovery after losing the records (unset SUBBIT_CURRENCY)
 npm run x402 -- recover && npm run x402 -- recover-elapse && npm run x402 -- report   # ~30 min
+
+X402_OUT=x402-step9 npm run x402 -- replay            # step 9: a lost response, retried
+X402_OUT=x402-step9-delegate npm run x402 -- delegate  # a keyless server, account 3 held by the facilitator
+X402_OUT=x402-step9-delegate npm run x402 -- report
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

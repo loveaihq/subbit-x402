@@ -14,6 +14,10 @@
 //   recover     after losing its records the client finds its channels again: one with a derived
 //               IOU key goes on serving; one with a random key can only be closed, settled and ended
 //   recover-elapse  both sides lose their records; the consumer closes and, ~20 min on, elapses
+//   replay      a paid request whose response is lost; the client's retry of the same voucher gets
+//               the same response, charged once
+//   delegate    a server with no key (127.0.0.1:7412, 0.1 tADA a request): the facilitator holds its
+//               provider key, builds and signs its claims and settles, co-signs its refunds
 //   wallets [label]  how each wallet's UTxOs are split, recorded under the label
 //   report      every transaction's fee, and the wallets reconciled
 //
@@ -21,12 +25,13 @@
 // Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID; SUBBIT_CURRENCY=token prices the
 //        route in the sUSDM stand-in (`npm run mint -- mint`) instead of lovelace, state in out/x402-token/;
 //        X402_OUT=<name> keeps a run's state in out/<name>/ instead
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { rmSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { x402Facilitator } from "@x402/core/facilitator";
 import { HTTPFacilitatorClient, x402HTTPResourceServer, x402ResourceServer, type HTTPAdapter, type RoutesConfig } from "@x402/core/server";
-import { decodePaymentRequiredHeader, decodePaymentResponseHeader } from "@x402/core/http";
+import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
 import type { PaymentRequirements } from "@x402/core/types";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
 import { Address, Assets, KeyHash } from "@evolution-sdk/evolution";
@@ -38,7 +43,7 @@ import { BatchSettlementCardanoFacilitator } from "../../src/x402/facilitator.ts
 import { ChannelManager, type ClaimResult } from "../../src/x402/manager.ts";
 import { BatchSettlementCardanoServer, FileChannelStorage, walletProviderSigner } from "../../src/x402/server.ts";
 import { Err, parseExtra, toBase64, type DepositPayload } from "../../src/x402/types.ts";
-import { REF_STATE, BF_BASE, ada, bf, consumer, expectEq, iso, keyHashHex, load, log, must, provider, run, save, scriptsFailed } from "../chain.ts";
+import { REF_STATE, BF_BASE, ada, bf, consumer, delegateWallet, expectEq, iso, keyHashHex, load, log, must, provider, run, save, scriptsFailed, submit } from "../chain.ts";
 import { TOKEN, amountOf, onlyCurrency, token, unitName } from "../currency.ts";
 
 const NETWORK = "cardano:preprod" as const;
@@ -46,6 +51,12 @@ const PRICE = 1_000n;
 const FAC_PORT = 7413;
 const RES_PORT = 7411;
 const URL_DATA = `http://127.0.0.1:${RES_PORT}/data`;
+/** The keyless server's route: 0.1 tADA a request, so that a claim of ten clears min-UTxO. */
+const PRICE_D = 100_000n;
+const DEL_PORT = 7412;
+const URL_DELEGATED = `http://127.0.0.1:${DEL_PORT}/delegated`;
+/** Shared by the keyless server and the facilitator holding its key; both run in this process. */
+const DELEGATION_SECRET = randomBytes(32).toString("hex");
 const OUT = new URL(`../../out/${process.env.X402_OUT ?? (TOKEN ? "x402-token" : "x402")}/`, import.meta.url);
 const ASSET = TOKEN ? token!.unit : "lovelace";
 const dir = (p: string) => fileURLToPath(new URL(p, OUT));
@@ -54,6 +65,8 @@ const RESULTS = new URL("results.json", OUT);
 interface Wallets {
   consumer: bigint;
   provider: bigint;
+  /** Account 3, the key the facilitator holds for the keyless server; recorded from step 9 on. */
+  delegate?: bigint;
   /** The currency's units, when it is a token. */
   consumerTokens: bigint;
   providerTokens: bigint;
@@ -70,6 +83,7 @@ interface Results {
   /** The consumer's own transactions outside x402. */
   exits?: Array<{ what: "close" | "end" | "elapse"; channelId: string; transaction: string }>;
   recoveries?: Array<{ channel: string; channelId: string; status: string; exitOnly: boolean; charged: string; balance: string; httpCalls?: number }>;
+  replay?: { channelId: string; lost: string; retried: string; httpCalls: number; chargedBefore: string; chargedAfter: string };
   autosettle?: { channelId: string; close: string; settle: string; end: string; closeToSettleSec: number; settleBeforeElapseSec: number; watchIntervalMs: number };
   checks?: Array<{ phase: string; what: string; outcome: string }>;
   /** Wallet housekeeping during the run (a `mint -- tidy`), so the report counts its fee. */
@@ -102,8 +116,10 @@ async function stack() {
   const ref = load<{ out?: { txHash: string; index: number } }>(REF_STATE).out;
   const referenceScript = ref ? `${ref.txHash}#${ref.index}` : undefined;
 
-  // Facilitator: no key, broadcast only.
-  const facilitator = new x402Facilitator().register(NETWORK, new BatchSettlementCardanoFacilitator(chain, { scriptHash: SUBBIT_HASH, confirmationTimeoutMs: 120_000 }));
+  // Facilitator: no key of its own; it holds account 3's for the keyless server below.
+  const delegateKeyHash = keyHashHex(await delegateWallet.address());
+  const delegates = [{ wallet: delegateWallet, keyHash: delegateKeyHash, payTo, secret: DELEGATION_SECRET, ...(referenceScript ? { referenceScript } : {}) }];
+  const facilitator = new x402Facilitator().register(NETWORK, new BatchSettlementCardanoFacilitator(chain, { scriptHash: SUBBIT_HASH, confirmationTimeoutMs: 120_000, delegates }));
   const facServer = await listen(FAC_PORT, async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (req.method === "GET" && url.pathname === "/supported") return json(res, 200, facilitator.getSupported());
@@ -142,9 +158,9 @@ async function stack() {
   const http = new x402HTTPResourceServer(resource, routes);
   await http.initialize();
   let served = 0;
-  const resServer = await listen(RES_PORT, async (req, res) => {
-    const url = new URL(req.url ?? "/", `http://127.0.0.1:${RES_PORT}`);
-    if (url.pathname !== "/data") return json(res, 404, { error: "not found" });
+  const serve = (http: x402HTTPResourceServer, route: string, port: number) => async (req: IncomingMessage, res: ServerResponse) => {
+    const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
+    if (url.pathname !== route) return json(res, 404, { error: "not found" });
     await body(req);
     const context = { adapter: adapter(req, url), path: url.pathname, method: req.method ?? "GET" };
     const result = await http.processHTTPRequest(context);
@@ -160,17 +176,43 @@ async function stack() {
       return send(res, settle.response.status, { ...settle.headers, ...settle.response.headers }, settle.response.body ?? {});
     }
     send(res, 200, settle.headers, payload);
-  });
-
+  };
+  const resServer = await listen(RES_PORT, serve(http, "/data", RES_PORT));
   const manager = new ChannelManager({ storage, wallet: provider, providerKeyHash, chain, facilitator: facilitatorClient, network: NETWORK, payTo, scriptHash: SUBBIT_HASH, ...(referenceScript ? { referenceScript } : {}) });
+
+  // A second resource server with no key at all: its channels name account 3 as provider, which
+  // the facilitator holds; it vouches for its claims and refunds with the shared secret.
+  const dStorage = new FileChannelStorage(dir("server-delegated"));
+  const keyless = new BatchSettlementCardanoServer({
+    payTo,
+    receiverAuthorizer: delegateKeyHash,
+    scriptHash: SUBBIT_HASH,
+    ...(referenceScript ? { referenceScript } : {}),
+    withdrawDelay: 900,
+    storage: dStorage,
+    delegationSecret: DELEGATION_SECRET,
+    chain,
+    ...(TOKEN ? { assetDecimals: { [ASSET]: token!.decimals } } : {}),
+  });
+  const dHttp = new x402HTTPResourceServer(new x402ResourceServer(facilitatorClient).register(NETWORK, keyless), {
+    "GET /delegated": {
+      accepts: { scheme: "batch-settlement", network: NETWORK, payTo, price: { asset: ASSET, amount: PRICE_D.toString() }, maxTimeoutSeconds: 300, extra: {} },
+      description: `one datum for 0.1 ${unitName}, from a server with no key`,
+    },
+  });
+  await dHttp.initialize();
+  const dServer = await listen(DEL_PORT, serve(dHttp, "/delegated", DEL_PORT));
+  const dManager = new ChannelManager({ storage: dStorage, providerKeyHash: delegateKeyHash, delegationSecret: DELEGATION_SECRET, chain, facilitator: facilitatorClient, network: NETWORK, payTo, scriptHash: SUBBIT_HASH, ...(referenceScript ? { referenceScript } : {}) });
   return {
     payTo,
     storage,
     manager,
     facilitator,
+    delegated: { storage: dStorage, manager: dManager, keyHash: delegateKeyHash },
     close: async () => {
       await new Promise((r) => facServer.close(r));
       await new Promise((r) => resServer.close(r));
+      await new Promise((r) => dServer.close(r));
     },
   };
 }
@@ -190,8 +232,8 @@ function payer(storageDir: string, capacity: bigint, spent = spentInputs, iouKey
   return { storage, scheme, pay: wrapFetchWithPayment(counting, client), calls: () => calls, reset: () => (calls = 0) };
 }
 
-async function paid(p: ReturnType<typeof payer>) {
-  const res = await p.pay(URL_DATA);
+async function paid(p: ReturnType<typeof payer>, url = URL_DATA) {
+  const res = await p.pay(url);
   const header = res.headers.get("PAYMENT-RESPONSE");
   const text = await res.text();
   if (res.status !== 200 || !header) throw new Error(`paid request failed: ${res.status} ${text.slice(0, 300)}`);
@@ -235,9 +277,9 @@ async function phasePay(s: Stack, n: number) {
   log(`pay: server count ${ch?.chargedCumulativeAmount}, channel ${ch?.channelRef}`);
 }
 
-async function phaseClaim(s: Stack, label = "claim", opts: { channelIds?: string[]; maxPerTx?: number } = {}): Promise<ClaimResult[]> {
+async function phaseClaim(s: Stack, label = "claim", opts: { channelIds?: string[]; maxPerTx?: number } = {}, manager = s.manager): Promise<ClaimResult[]> {
   const r = load<Results>(RESULTS);
-  const results = await s.manager.claim(opts);
+  const results = await manager.claim(opts);
   for (const c of results) {
     const fee = BigInt((await bf(`/txs/${c.transaction}`)).fees);
     const taken = c.channels.reduce((x, y) => x + y.taken, 0n);
@@ -270,11 +312,11 @@ async function phaseCorrective(s: Stack) {
   save(RESULTS, r);
 }
 
-async function phaseRefund(s: Stack, storageDir = "client") {
+async function phaseRefund(s: Stack, storageDir = "client", via = { manager: s.manager, url: URL_DATA }) {
   const p = payer(storageDir, 3_000_000n);
   for (const ch of (await p.storage.list()).filter((c) => c.status === "open")) {
-    await phaseClaim(s, "claim before refund", { channelIds: [ch.channelId] });
-    const settle = await p.scheme.refund(URL_DATA, fetch, ch.channelId);
+    await phaseClaim(s, "claim before refund", { channelIds: [ch.channelId] }, via.manager);
+    const settle = await p.scheme.refund(via.url, fetch, ch.channelId);
     log(`refund: ${ch.channelId.slice(0, 16)}… closed by ${settle.transaction}, ${ada(BigInt(settle.amount || "0"))} ${unitName} back to the consumer`);
     const r = load<Results>(RESULTS); // after the claim, which saved its own entry
     (r.refunds ??= []).push({ channelId: ch.channelId, transaction: settle.transaction });
@@ -520,10 +562,10 @@ async function phaseWallets(label: string) {
 // ---- step 8: after losing the records -------------------------------------------------
 
 /** Opens a channel for `storageDir` and pays `n` requests on it, claiming after the `claimAt`-th. */
-async function payRun(s: Stack, p: ReturnType<typeof payer>, label: string, n: number, claimAt?: number): Promise<string> {
+async function payRun(s: Stack, p: ReturnType<typeof payer>, label: string, n: number, claimAt?: number, url = URL_DATA): Promise<string> {
   let id = "";
   for (let i = 1; i <= n; i++) {
-    const settle = await paid(p);
+    const settle = await paid(p, url);
     if (i === 1) {
       id = (settle.extra?.channelState as { channelId: string }).channelId;
       record((r) => (r.deposits ??= []).push({ channelId: id, transaction: settle.transaction }));
@@ -633,6 +675,106 @@ async function phaseRecoverElapse(s: Stack) {
   log(`recover C: the consumer elapsed it in ${elapse}, in a block ${Number(t.block_time) - Number(elapseAt / 1000n)} s after elapse_at: all ${ada(view.amount)} ${unitName}${TOKEN ? ` and ${ada(view.lovelace)} tADA` : ""} back, the 3 requests never redeemed`);
 }
 
+// ---- step 9: the answer to a lost response -------------------------------------------------
+
+/**
+ * A channel serves 3 requests. The 4th is sent by hand and its response thrown away, as when a
+ * connection drops on the way back: the server has served and charged it, the client has not seen
+ * that. The client's next request carries the same voucher, since its count did not move, and the
+ * server answers it with the response it already sent, charging nothing more. The 5th is charged as
+ * usual; a refund closes the channel.
+ */
+async function phaseReplay(s: Stack) {
+  const before = await walletsAda();
+  record((r) => (r.before ??= before));
+  const p = payer("replay", 20n * PRICE);
+  const id = await payRun(s, p, "replay", 3);
+  const req = await requirements();
+  const made = await p.scheme.createPaymentPayload(2, req);
+  const lost = await fetch(URL_DATA, { headers: { "PAYMENT-SIGNATURE": encodePaymentSignatureHeader({ x402Version: 2, accepted: req, payload: made.payload }) } });
+  const lostBody = await lost.text();
+  if (lost.status !== 200) throw new Error(`the hand-sent request failed: ${lost.status} ${lostBody.slice(0, 200)}`);
+  const chargedBefore = (await s.storage.get(id))!.chargedCumulativeAmount;
+  log(`replay: request 4 served (${lostBody}), its response thrown away; the server counts ${chargedBefore}, the client ${(await p.storage.get(id))!.chargedCumulativeAmount}`);
+  p.reset();
+  const res = await p.pay(URL_DATA);
+  const retried = await res.text();
+  const calls = p.calls();
+  const chargedAfter = (await s.storage.get(id))!.chargedCumulativeAmount;
+  log(`replay: the retry (${calls} HTTP calls) got ${retried}; the server counts ${chargedAfter}, the client ${(await p.storage.get(id))!.chargedCumulativeAmount}`);
+  expectEq("the retry gets the same response", retried, lostBody);
+  expectEq("the retry is not charged again", chargedAfter, chargedBefore);
+  expectEq("the client catches up with the server", (await p.storage.get(id))!.chargedCumulativeAmount, chargedAfter);
+  await paid(p);
+  expectEq("the next request is charged as usual", (await s.storage.get(id))!.chargedCumulativeAmount, (BigInt(chargedAfter) + PRICE).toString());
+  record((r) => (r.replay = { channelId: id, lost: lostBody, retried, httpCalls: calls, chargedBefore, chargedAfter }));
+  await phaseRefund(s, "replay");
+}
+
+// ---- step 9: a server that holds no key -------------------------------------------------------
+
+/**
+ * The keyless server: the facilitator holds its provider key (account 3), builds, signs and pays
+ * the fees of its claims, paying everything redeemed to the server's payTo, and co-signs its
+ * refunds; the server vouches for each claim and refund with the shared secret and checks each
+ * claim on chain. A: 10 requests and a claim; 5 more and a refund, whose claim of 0.5 tADA is
+ * short of min-UTxO, so the facilitator's wallet tops the payout up. B: 12 requests; the consumer
+ * closes, the server's watcher has the facilitator settle, the consumer ends.
+ */
+async function phaseDelegate(s: Stack) {
+  await fundDelegate();
+  const before = await walletsAda();
+  record((r) => (r.before ??= before));
+  const d = s.delegated;
+  const via = { manager: d.manager, url: URL_DELEGATED };
+
+  const aId = await payRun(s, payer("delegate-a", 20n * PRICE_D), "delegate A", 10, undefined, URL_DELEGATED);
+  const v = await chain.followChannel((await d.storage.get(aId))!.channelRef, SUBBIT_HASH, aId);
+  expectEq("the channel's provider is the key the facilitator holds", v!.datum.constants.provider, d.keyHash);
+  await phaseClaim(s, "delegate A: claim", { channelIds: [aId] }, d.manager);
+  for (let i = 0; i < 5; i++) await paid(payer("delegate-a", 20n * PRICE_D), URL_DELEGATED);
+  await phaseRefund(s, "delegate-a", via);
+
+  const b = payer("delegate-b", 20n * PRICE_D);
+  const bId = await payRun(s, b, "delegate B", 12, undefined, URL_DELEGATED);
+  const got: { settled?: ClaimResult } = {};
+  const watcher = d.manager.watch({
+    intervalMs: 15_000,
+    onEvent: (e) => {
+      if (e.kind === "settled") got.settled ??= e.results.find((x) => x.channels.some((c) => c.channelId === bId));
+      if (e.kind === "error") log(`delegate B: watcher: a pass failed, the next one retries: ${String((e.error as Error)?.message ?? e.error).slice(0, 240)}`);
+    },
+  });
+  try {
+    const { transaction: close } = await b.scheme.close(bId);
+    record((r) => (r.exits ??= []).push({ what: "close", channelId: bId, transaction: close }));
+    log(`delegate B: the consumer closed it in ${close}`);
+    const deadline = Date.now() + 12 * 60_000;
+    while (!got.settled && Date.now() < deadline) await new Promise((res) => setTimeout(res, 3_000));
+  } finally {
+    watcher.stop();
+  }
+  if (!got.settled) throw new Error("delegate B: the watcher did not have the channel settled within 12 minutes");
+  record((r) => (r.claims ??= []).push({ phase: "delegate B: settle", n: got.settled!.channels.length, transaction: got.settled!.transaction }));
+  log(`delegate B: the facilitator settled it in ${got.settled.transaction}, ${ada(got.settled.channels[0]!.taken)} ${unitName} to payTo`);
+  const end = await b.scheme.end(bId);
+  record((r) => (r.exits ??= []).push({ what: "end", channelId: bId, transaction: end }));
+  log(`delegate B: the consumer ended it in ${end}`);
+}
+
+/** Gives account 3, the key the facilitator holds, ADA for fees and collateral, once. */
+async function fundDelegate() {
+  const held = (await delegateWallet.getWalletUtxos()).filter((u) => Assets.hasOnlyLovelace(u.assets)).reduce((a, u) => a + Assets.lovelaceOf(u.assets), 0n);
+  if (held >= 20_000_000n) return;
+  const me = await consumer.address();
+  const adaOnly = (await consumer.getWalletUtxos()).filter((u) => Assets.hasOnlyLovelace(u.assets));
+  const sb = await consumer.newTx().payToAddress({ address: await delegateWallet.address(), assets: Assets.fromLovelace(30_000_000n) }).build({ changeAddress: me, availableUtxos: adaOnly });
+  const hash = await submit("fund the delegated key", await sb.sign(), consumer);
+  // Balances are taken next: wait until the address index lists the new output (it trails a block by ~20 s).
+  while ((await delegateWallet.getWalletUtxos()).reduce((a, u) => a + Assets.lovelaceOf(u.assets), 0n) < held + 30_000_000n) await new Promise((res) => setTimeout(res, 5_000));
+  log(`delegate: account 3 funded with 30 tADA in ${hash}, before the run's balances are taken`);
+}
+
 /** The route's payment requirements, as its 402 states them. */
 async function requirements(): Promise<PaymentRequirements> {
   const res = await fetch(URL_DATA);
@@ -666,8 +808,11 @@ async function phaseReport() {
   const open = await openChannelValue();
   const b = r.before!;
   log(`consumer ${ada(b.consumer)} → ${ada(now.consumer)}; provider ${ada(b.provider)} → ${ada(now.provider)} tADA; still in open channels ${ada(open.lovelace)} tADA`);
-  const lost = b.consumer + b.provider - now.consumer - now.provider - open.lovelace;
-  log(`${lost === fees ? "  ok " : "  MISMATCH"} the two wallets lost ${ada(lost)} tADA, the ${txs.length} transactions' fees total ${ada(fees)}`);
+  // From step 9 on, account 3 (the key the facilitator holds) is one of the parties.
+  const withDelegate = b.delegate !== undefined;
+  if (withDelegate) log(`facilitator's delegated key ${ada(b.delegate!)} → ${ada(now.delegate!)} tADA`);
+  const lost = b.consumer + b.provider - now.consumer - now.provider - open.lovelace + (withDelegate ? b.delegate! - now.delegate! : 0n);
+  log(`${lost === fees ? "  ok " : "  MISMATCH"} the ${withDelegate ? "three" : "two"} wallets lost ${ada(lost)} tADA, the ${txs.length} transactions' fees total ${ada(fees)}`);
   if (TOKEN) {
     log(`consumer ${ada(b.consumerTokens)} → ${ada(now.consumerTokens)}; provider ${ada(b.providerTokens)} → ${ada(now.providerTokens)} ${unitName}; still in open channels ${ada(open.amount)}`);
     const moved = now.consumerTokens + now.providerTokens + open.amount - b.consumerTokens - b.providerTokens;
@@ -678,10 +823,10 @@ async function phaseReport() {
 // ---- helpers ------------------------------------------------------------------
 
 async function walletsAda(): Promise<Wallets> {
-  const [c, p] = [await consumer.getWalletUtxos(), await provider.getWalletUtxos()];
+  const [c, p, d] = [await consumer.getWalletUtxos(), await provider.getWalletUtxos(), await delegateWallet.getWalletUtxos()];
   const ada_ = (us: typeof c) => us.reduce((a, u) => a + Assets.lovelaceOf(u.assets), 0n);
   const tok = (us: typeof c) => (TOKEN ? us.reduce((a, u) => a + amountOf(u.assets), 0n) : 0n);
-  return { consumer: ada_(c), provider: ada_(p), consumerTokens: tok(c), providerTokens: tok(p) };
+  return { consumer: ada_(c), provider: ada_(p), delegate: ada_(d), consumerTokens: tok(c), providerTokens: tok(p) };
 }
 
 async function settledWallets() {
@@ -698,7 +843,7 @@ async function settledWallets() {
 async function openChannelValue(): Promise<{ lovelace: bigint; amount: bigint }> {
   let lovelace = 0n;
   let amount = 0n;
-  for (const d of ["client", "topup", "autosettle", "recover-a", "recover-b", "recover-c", ...Array.from({ length: 10 }, (_, i) => `batch/${i}`)]) {
+  for (const d of ["client", "topup", "autosettle", "recover-a", "recover-b", "recover-c", "replay", "delegate-a", "delegate-b", ...Array.from({ length: 10 }, (_, i) => `batch/${i}`)]) {
     if (!existsSync(dir(d))) continue;
     for (const c of await new FileClientStorage(dir(d)).list()) {
       if ((c.status !== "open" && c.status !== "closing") || !c.channelRef) continue;
@@ -768,6 +913,8 @@ async function main() {
     if (phase === "batch" || phase === "all") await phaseBatch(s);
     if (phase === "batch-refund" || phase === "all") await phaseBatchRefund(s);
     if (phase === "wallets") await phaseWallets(process.argv[3] ?? new Date().toISOString());
+    if (phase === "replay") await phaseReplay(s);
+    if (phase === "delegate") await phaseDelegate(s);
     if (phase === "recover") await phaseRecover(s);
     if (phase === "recover-elapse") await phaseRecoverElapse(s);
     if (phase === "topup") await phaseTopUp(s);

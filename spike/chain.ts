@@ -45,6 +45,8 @@ export const SCRIPT_MODE = scriptMode();
  * wallet the output could go out as plain ADA in the next ordinary transaction.
  */
 export const refHolder = wallet(2);
+/** Account 3: the provider key a facilitator holds for a server that has none (x402 step 9). */
+export const delegateWallet = wallet(3);
 export const REF_STATE = new URL("../out/refscript.json", import.meta.url);
 
 /** A step's state file. Each mode keeps its own, so a run in one never resumes the other's. */

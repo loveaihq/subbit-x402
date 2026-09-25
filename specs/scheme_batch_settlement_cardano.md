@@ -312,6 +312,13 @@ the channel; reuse means opening a new one.
    itself (the same rules as the facilitator's) and added its signature as `providerWitness`.
 4. **Failure or cancellation** releases the reservation; a channel that only existed for that
    request is dropped.
+5. **Retries.** A voucher equal to the channel's latest committed one, same amount and same
+   signature, is a retry of that request, as a client sends it when the response never reached
+   it: the server SHOULD answer with the response it gave that request, without running the
+   handler or charging again (SVM's rule), and MAY bound how long it keeps it (the reference
+   server: 10 minutes, in memory). Only the latest: an earlier voucher is stale and gets the
+   corrective 402. A client resyncing after losing its records sends earlier amounts, and would
+   otherwise be served old answers instead of the server's count.
 
 The **corrective 402** carries, in the matching `accepts[]` entry's `extra`:
 `channelState { channelId, channelRef, balance, totalClaimed, withdrawRequestedAt, chargedCumulativeAmount }`
@@ -392,7 +399,7 @@ A valid response carries `extra` = `{ channelId, channelRef, balance, totalClaim
 |---|---|---|
 | `deposit` | client | re-verify, broadcast the exact bytes received, wait for the confirmation policy |
 | `refund` | server (client-originated) | add `providerWitness`, re-verify, broadcast, wait |
-| `claim` | server | check every channel input is redeemed through `Main`/`Defer` and not `Mutual`, and that `claims` lists them all; evaluate; broadcast; wait. Covers `Sub` and `Settle` alike |
+| `claim` | server | check every channel input is redeemed through `Main`/`Defer` and not `Mutual`, and that `claims` lists them all; evaluate; broadcast; wait. Covers `Sub` and `Settle` alike. Without `transaction`: build and sign it with a delegated key (*Delegating the provider key*) |
 | `voucher` | — | refused: vouchers settle on the server |
 
 ```ts
@@ -409,8 +416,37 @@ again. On preprod one deposit confirmed 2.5 minutes after submission.
 
 ### `GET /supported`
 
-`kinds: [{ x402Version: 2, scheme: "batch-settlement", network }]` with no `extra`, and no signers:
-the facilitator signs nothing.
+`kinds: [{ x402Version: 2, scheme: "batch-settlement", network }]` with no `extra`. `signers` lists
+the provider keys the facilitator holds for servers (*Delegating the provider key*), and is empty
+when it holds none.
+
+### Delegating the provider key
+
+A server MAY run without the provider key: a facilitator holds it, one key per server, registered
+with that server's `payTo` and a secret the two share, and the server gives that key as
+`receiverAuthorizer`, so its channels name it as `provider`. The validator does not restrict where
+a redemption pays, so this is custody, not an authorisation: the server trusts the facilitator
+with its revenue. (EVM's contract pays the receiver whoever authorises the claim; SVM's draft does
+not delegate.)
+
+- **Claims.** The server sends a `claim` without `transaction`; each entry adds the channel's
+  `channelRef` and the `voucher` to redeem (`maxClaimableAmount`, `signature`). The facilitator
+  MUST check `delegationMac`, then for each channel: that its `provider` is the key held for this
+  `payTo`, its stage is not `Settled`, the voucher verifies under its `iouKey`, and
+  `subbed < totalClaimed ≤ maxClaimableAmount`. It builds the claim (`Sub`, or `Settle` for a
+  closed channel) with its own wallet paying fee and collateral, pays everything redeemed to
+  `payTo` in one output, signs and broadcasts it. That output is subject to min-UTxO (about 0.97
+  tADA, or a token's min-UTxO): a server SHOULD claim at least that much, and below it the
+  facilitator's wallet tops the output up (on preprod a 0.5 tADA claim paid 0.969750).
+- **Refunds.** The server passes the `refund` on without `providerWitness`, with a
+  `delegationMac`; the facilitator checks the `Mutual` as above and co-signs it.
+- **`delegationMac`** = HMAC-SHA256(secret, canonical JSON of `{ payTo, payload }`), with
+  `payload` the payload without this field and canonical JSON sorting every object's keys. The
+  facilitator signs for a server only what carries it. Without it a consumer could have a closed
+  channel settled with an early, smaller voucher (a channel settles once), or a refund co-signed
+  that pays the server less than it charged.
+- **Audit.** A server SHOULD check each claim on chain: that its outputs at `payTo` hold at least
+  what it redeemed. The reference manager does, and fails the claim otherwise.
 
 ## Claim and settlement strategy
 
@@ -515,7 +551,9 @@ non-terminal `settlement_pending`.
   `Close` and `Elapse`.
 - **The server** can redeem any IOU it holds while the channel is open, and for at least the
   close period after the consumer closes; it MUST settle before `elapseAt`.
-- **The facilitator** holds no key and no funds: it can broadcast only what the parties signed.
+- **The facilitator** holds no key and no funds unless a server delegates its provider key to
+  it: then it holds that server's revenue in trust (*Delegating the provider key*). Otherwise it
+  can broadcast only what the parties signed.
 - **The server's signature** covers a whole transaction, so the server co-signs only a refund of
   exactly the shape in *Facilitator interface*, checked by itself.
 - **A token channel's ADA** is protected only down to its exact min-UTxO, a margin of about 0.09
@@ -525,9 +563,6 @@ non-terminal `settlement_pending`.
 - **Derived IOU keys** are as secret as the wallet's signature of the root message; a client MUST
   NOT sign that message for any other party.
 
-Not in the reference implementation yet: a response cache for exact repeats of a voucher, and
-delegating the provider key to the facilitator. Delegation would make the facilitator custodian of the redemptions it signs, since
-the validator does not restrict where a redemption pays out.
 
 ## Reference implementation
 
@@ -536,7 +571,8 @@ This repository: `src/x402/` implements the client, resource-server and facilita
 Blockfrost. `RESULTS.md` records every preprod transaction: steps 1–3 exercise the validator,
 step 4 the ADA binding end to end, step 5 a token binding, step 6 top-ups and the automatic
 settle after a consumer's close, step 7 a client that folds its token UTxOs, step 8 recovery
-after state loss.
+after state loss, step 9 retries answered from the kept response and a server whose provider key
+the facilitator holds.
 
 ## Version history
 
@@ -545,3 +581,4 @@ after state loss.
 | 0.1 | 2026-09-24 | First draft, from the reference implementation and preprod runs |
 | 0.2 | 2026-09-24 | Top-ups (`Add`) and their verification; the server watches its channels and settles a closed one; a voucher above the recorded balance is checked against the chain; token outputs are folded, by the server and the client |
 | 0.3 | 2026-09-24 | IOU keys derived from the wallet; recovery after state loss, for the client and the server |
+| 0.4 | 2026-09-25 | Retries of the latest voucher answered from the kept response; delegating the provider key to the facilitator |

@@ -183,9 +183,13 @@ validator itself gives settle no deadline, so after `elapse_at` it races the con
   storage with EVM's `get / list / updateChannel` interface); redeems.
 - **Facilitator**: no key and no funds, like `@x402/cardano`'s `exact` facilitator. It verifies
   against the chain and broadcasts transactions other parties signed. It is not a channel party.
-  Delegating the provider key to a facilitator (EVM's delegated `receiverAuthorizer`) is possible
-  later, but on Subbit that key can send redeemed funds anywhere, so it would be custody, not an
-  authorisation: out of scope for now.
+  Delegating the provider key to a facilitator (EVM's delegated `receiverAuthorizer`) is possible,
+  but on Subbit that key can send redeemed funds anywhere, so it is custody, not an
+  authorisation. Built in step 9 as an option: the facilitator holds one key per server,
+  registered with that server's `payTo` and a shared secret; it builds, signs and pays for the
+  server's claims, paying everything redeemed to `payTo`, and co-signs its refunds, but only for
+  requests the server authenticates (`delegationMac`); the server checks each claim's payout on
+  chain. Spec: *Delegating the provider key*.
 
 ## 9. The seven network requirements
 
@@ -217,7 +221,8 @@ batched `claim`, cooperative `refund`. Deferred: top-up by `Add`, the manager's 
 after a unilateral close, token channels (USDM), provider-key delegation, the upstream spec text.
 Since done (RESULTS.md): token channels in step 5, the spec draft
 (`specs/scheme_batch_settlement_cardano.md`), top-ups and the automatic settle in step 6, token
-UTxO folding in step 7, recovery after state loss (IOU keys derived from the wallet) in step 8.
+UTxO folding in step 7, recovery after state loss (IOU keys derived from the wallet) in step 8,
+the response kept for retries and provider-key delegation in step 9.
 
 Code, in this repo:
 - `src/x402/`: shared types and checks; client scheme (`SchemeNetworkClient`); server scheme

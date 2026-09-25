@@ -4,22 +4,28 @@
 // `Settle` for one its consumer has closed), the rest with `Defer`, one continuing output per
 // channel in the same order, and the redeemed value to `payTo`. The provider key signs it here;
 // the facilitator only checks and broadcasts. `watch` does this on its own for closed channels,
-// which must be settled before their `elapse_at`.
+// which must be settled before their `elapse_at`. When the facilitator holds the provider key
+// instead (no `wallet`), the manager sends it the vouchers and checks, once each claim is on chain,
+// that it paid `payTo` everything it redeemed.
 import type { FacilitatorClient } from "@x402/core/server";
 import type { PaymentRequirements } from "@x402/core/types";
-import { Address, Assets, KeyHash, Transaction, TransactionHash } from "@evolution-sdk/evolution";
-import { Redeemer, Step, inlineDatum, subbitScript, type Stage } from "../subbit.ts";
-import { FOLD, refOf, valueFor, type ChannelView } from "./cardano.ts";
-import { retryQueries, type Chain } from "./chain.ts";
-import { collateralTarget, signedHex, type SeedWallet } from "./client.ts";
+import { subbedOf, type ChannelView } from "./cardano.ts";
+import type { Chain } from "./chain.ts";
+import { buildClaimTx, compareRefs, type ClaimLine, type ClaimRow } from "./claimtx.ts";
+import type { SeedWallet } from "./client.ts";
 import type { ChannelStorage, ServerChannel } from "./server.ts";
-import { LOVELACE, SCHEME, toBase64, type CardanoNetwork } from "./types.ts";
+import { LOVELACE, SCHEME, delegationMac, toBase64, type CardanoNetwork } from "./types.ts";
 
 export interface ManagerOptions {
   storage: ChannelStorage;
-  /** The provider's wallet: its key is the datum's `provider`; it pays fees and collateral. */
-  wallet: SeedWallet;
+  /**
+   * The provider's wallet: its key is the datum's `provider`; it pays fees and collateral. Absent
+   * when the facilitator holds the provider key and builds each claim (`delegationSecret`).
+   */
+  wallet?: SeedWallet;
   providerKeyHash: string;
+  /** The secret shared with the facilitator that holds the provider key: authenticates each claim. */
+  delegationSecret?: string;
   chain: Chain;
   facilitator: FacilitatorClient;
   network: CardanoNetwork;
@@ -30,7 +36,7 @@ export interface ManagerOptions {
 
 export interface ClaimResult {
   transaction: string;
-  channels: Array<{ channelId: string; taken: bigint; totalClaimed: bigint; channelRef: string }>;
+  channels: ClaimRow[];
 }
 
 export class ChannelManager {
@@ -67,57 +73,10 @@ export class ChannelManager {
   }
 
   /** Builds and signs one claim over `batch` (already in ledger order); nothing is submitted. */
-  async buildClaim(batch: Array<{ c: ServerChannel; v: ChannelView }>): Promise<{ hex: string; rows: ClaimResult["channels"] }> {
-    const steps = batch.map(({ c, v }) =>
-      v.datum.stage.kind === "closed" ? Step.settle(BigInt(c.signedMaxClaimable), c.signature) : Step.sub(BigInt(c.signedMaxClaimable), c.signature),
-    );
-    let tx = this.o.wallet.newTx();
-    batch.forEach(({ v }, i) => {
-      tx = tx.collectFrom({ inputs: [v.utxo], redeemer: i === 0 ? Redeemer.main(steps) : Redeemer.defer() });
-    });
-    const ref = this.o.referenceScript ? await this.o.chain.getUnspent(this.o.referenceScript) : undefined;
-    tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
-    const rows: ClaimResult["channels"] = [];
-    let redeemedTokens: Assets.Assets | undefined;
-    for (const { c, v } of batch) {
-      const stage = v.datum.stage;
-      if (stage.kind === "settled") throw new Error("a settled channel has nothing left to claim");
-      const charged = BigInt(c.chargedCumulativeAmount);
-      const taken = charged - stage.subbed;
-      // The channel keeps its ADA: for a token channel that is the reserve, which is the consumer's.
-      const value = valueFor(v.datum.constants.currency, v.amount - taken, v.lovelace);
-      const next: Stage = stage.kind === "closed" ? { kind: "settled" } : { kind: "opened", subbed: charged };
-      tx = tx.payToAddress({ address: v.address, assets: value, datum: inlineDatum(v.datum.constants, next) });
-      rows.push({ channelId: c.channelId, taken, totalClaimed: charged, channelRef: "" });
-      const cur = v.datum.constants.currency;
-      if (cur.kind !== "ada") redeemedTokens = Assets.merge(redeemedTokens ?? Assets.zero, Assets.fromHexStrings(cur.policy, cur.name, taken, 0n));
-    }
-    const listed = await this.o.wallet.getWalletUtxos();
-    const refs = new Set(listed.map(refOf));
-    for (const [r, at] of [...this.spent]) if (!refs.has(r) || Date.now() - at > 5 * 60_000) this.spent.delete(r);
-    const unspent = listed.filter((u) => !this.spent.has(refOf(u)));
-    if (redeemedTokens) {
-      // Redeemed tokens go to payTo in an output of their own, so the provider's change stays
-      // ADA-only: otherwise each claim folds an ADA-only UTxO, which collateral needs, into
-      // tokens. Earlier such outputs are folded into it, up to FOLD of them: each holds a
-      // min-UTxO of ADA, and one new output per claim spread the provider's ADA until no ADA-only
-      // UTxO was big enough for collateral (after step 5 and part of step 6's token run).
-      const units = new Set(Assets.getUnits(redeemedTokens));
-      const mine = Address.toBech32(await this.o.wallet.address()) === this.o.payTo;
-      const folds = mine ? unspent.filter((u) => !Assets.hasOnlyLovelace(u.assets) && Assets.getUnits(u.assets).every((x) => x === "lovelace" || units.has(x))).slice(0, FOLD) : [];
-      for (const u of folds) {
-        tx = tx.collectFrom({ inputs: [u] });
-        redeemedTokens = Assets.merge(redeemedTokens, Assets.withoutLovelace(u.assets));
-      }
-      tx = tx.payToAddress({ address: Address.fromBech32(this.o.payTo), assets: redeemedTokens, autoMinUtxo: true });
-    }
-    // ADA-only wallet UTxOs for fees and collateral: a token-laden collateral input can leave its return below min-UTxO.
-    const availableUtxos = unspent.filter((u) => Assets.hasOnlyLovelace(u.assets));
-    const signed = tx.addSigner({ keyHash: KeyHash.fromHex(this.o.providerKeyHash) });
-    const sb = await retryQueries("claim", () => signed.build({ changeAddress: Address.fromBech32(this.o.payTo), availableUtxos, setCollateral: collateralTarget(availableUtxos) }));
-    const hex = await signedHex(sb);
-    for (const i of Transaction.fromCBORHex(hex).body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
-    return { hex, rows };
+  async buildClaim(batch: Array<{ c: ServerChannel; v: ChannelView }>): Promise<{ hex: string; rows: ClaimRow[] }> {
+    if (!this.o.wallet) throw new Error("the facilitator holds the provider key: it builds the claims");
+    const b = { wallet: this.o.wallet, providerKeyHash: this.o.providerKeyHash, chain: this.o.chain, payTo: this.o.payTo, payout: "own" as const, spent: this.spent };
+    return buildClaimTx(this.o.referenceScript ? { ...b, referenceScript: this.o.referenceScript } : b, batch.map(lineOf));
   }
 
   /** Redeems every claimable channel, `maxPerTx` per transaction, through the facilitator. */
@@ -127,11 +86,24 @@ export class ChannelManager {
     const results: ClaimResult[] = [];
     for (let i = 0; i < all.length; i += per) {
       const batch = all.slice(i, i + per);
-      const { hex, rows } = await this.buildClaim(batch);
       const req: PaymentRequirements = { scheme: SCHEME, network: this.o.network, asset: LOVELACE, amount: "0", payTo: this.o.payTo, maxTimeoutSeconds: 0, extra: {} };
-      const payload = { type: "claim", transaction: toBase64(hex), claims: rows.map((r) => ({ channelId: r.channelId, totalClaimed: r.totalClaimed.toString() })) };
+      let payload: Record<string, unknown>;
+      let rows: ClaimRow[];
+      if (this.o.wallet) {
+        const built = await this.buildClaim(batch);
+        rows = built.rows;
+        payload = { type: "claim", transaction: toBase64(built.hex), claims: rows.map((r) => ({ channelId: r.channelId, totalClaimed: r.totalClaimed.toString() })) };
+      } else {
+        // The facilitator builds and signs it from the vouchers, on the server's authentication.
+        if (!this.o.delegationSecret) throw new Error("no provider wallet and no delegation secret");
+        rows = batch.map(({ c, v }) => ({ channelId: c.channelId, taken: BigInt(c.chargedCumulativeAmount) - subbedOf(v.datum.stage), totalClaimed: BigInt(c.chargedCumulativeAmount), channelRef: "" }));
+        const claims = batch.map(({ c, v }) => ({ channelId: c.channelId, totalClaimed: c.chargedCumulativeAmount, channelRef: v.ref, voucher: { maxClaimableAmount: c.signedMaxClaimable, signature: c.signature } }));
+        const body = { type: "claim", claims };
+        payload = { ...body, delegationMac: delegationMac(this.o.delegationSecret, this.o.payTo, body) };
+      }
       const res = await this.o.facilitator.settle({ x402Version: 2, accepted: req, payload }, req);
       if (!res.success) throw new Error(`claim refused: ${res.errorReason} ${res.errorMessage ?? ""} ${res.transaction}`);
+      if (!this.o.wallet) await this.audit(res.transaction, rows, batch);
       // Follow each channel to where the claim left it, and record what is now redeemed.
       for (const [j, { c, v }] of batch.entries()) {
         const now = await this.after(v, c.channelId, res.transaction);
@@ -150,6 +122,23 @@ export class ChannelManager {
       results.push({ transaction: res.transaction, channels: rows });
     }
     return results;
+  }
+
+  /**
+   * A delegated claim is the facilitator's own transaction, and nothing on chain makes it pay the
+   * server: check that its outputs at `payTo` hold at least everything it redeemed.
+   */
+  private async audit(txHash: string, rows: ClaimRow[], batch: Array<{ v: ChannelView }>) {
+    const paid = await this.o.chain.paidTo(txHash, this.o.payTo);
+    const owed = new Map<string, bigint>();
+    rows.forEach((r, j) => {
+      const c = batch[j]!.v.datum.constants.currency;
+      const unit = c.kind === "ada" ? LOVELACE : c.policy + c.name;
+      owed.set(unit, (owed.get(unit) ?? 0n) + r.taken);
+    });
+    for (const [unit, amount] of owed) {
+      if ((paid.get(unit) ?? 0n) < amount) throw new Error(`the facilitator's claim ${txHash} paid ${paid.get(unit) ?? 0n} ${unit} to payTo, having redeemed ${amount}`);
+    }
   }
 
   /** Where a channel sits once `txHash` has spent it, waiting out an index that still shows it unspent. */
@@ -232,8 +221,9 @@ export function watchChannels(manager: ChannelManager, o: ManagerOptions, opts: 
   return { stop: () => clearInterval(timer), tick };
 }
 
-export function compareRefs(a: string, b: string): number {
-  const [ha, ia] = a.split("#") as [string, string];
-  const [hb, ib] = b.split("#") as [string, string];
-  return ha < hb ? -1 : ha > hb ? 1 : Number(ia) - Number(ib);
+export { compareRefs };
+
+/** A channel's line in a claim: the server's count, on the voucher it holds. */
+function lineOf({ c, v }: { c: ServerChannel; v: ChannelView }): ClaimLine {
+  return { channelId: c.channelId, totalClaimed: BigInt(c.chargedCumulativeAmount), amount: BigInt(c.signedMaxClaimable), signature: c.signature, v };
 }

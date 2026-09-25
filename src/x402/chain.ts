@@ -28,12 +28,16 @@ export interface Chain {
   channels(scriptHash: string): Promise<ChannelView[]>;
   /** The slot of the latest block. */
   tipSlot(): Promise<bigint>;
+  /** What a transaction's outputs at `address` hold, by unit (`lovelace`, or policy and name run together). */
+  paidTo(txHash: string, address: string): Promise<Map<string, bigint>>;
 }
 
 interface BfOutput {
   address: string;
   output_index: number;
   consumed_by_tx?: string | null;
+  amount?: Array<{ unit: string; quantity: string }>;
+  collateral?: boolean;
 }
 
 export class BlockfrostChain implements Chain {
@@ -145,6 +149,17 @@ export class BlockfrostChain implements Chain {
     const r = await fetch(`${this.baseUrl}/blocks/latest`, { headers: { project_id: this.projectId } });
     if (!r.ok) throw new Error(`Blockfrost /blocks/latest: ${r.status}`);
     return BigInt(((await r.json()) as { slot: number }).slot);
+  }
+
+  async paidTo(txHash: string, address: string): Promise<Map<string, bigint>> {
+    const outs = await this.txOutputs(txHash);
+    if (!outs) throw new Error(`transaction ${txHash.slice(0, 16)}… is not known`);
+    const paid = new Map<string, bigint>();
+    for (const o of outs) {
+      if (o.address !== address || o.collateral) continue;
+      for (const a of o.amount ?? []) paid.set(a.unit, (paid.get(a.unit) ?? 0n) + BigInt(a.quantity));
+    }
+    return paid;
   }
 
   /** A transaction's outputs with their spent-by field, or undefined if Blockfrost does not know it. */

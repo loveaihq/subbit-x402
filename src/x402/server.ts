@@ -2,7 +2,8 @@
 // @x402/core runs around each paid request, and the corrective 402. It follows @x402/evm's
 // batch-settlement server step for step; what differs is Cardano's: the channel's position
 // (`channelRef`) moves with each redemption, capacity keeps an ADA reserve, and the server
-// co-signs a client-built `Mutual` refund after checking its shape itself.
+// co-signs a client-built `Mutual` refund after checking its shape itself. A retry of a channel's
+// latest voucher gets the answer it already paid for, not a second charge (SVM's rule).
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -33,6 +34,7 @@ import {
   SCHEME,
   commitmentId,
   configBindingError,
+  delegationMac,
   fromBase64,
   parseClientPayload,
   parseExtra,
@@ -146,8 +148,18 @@ export interface ServerConfig {
   withdrawDelay?: number;
   storage?: ChannelStorage;
   onchainStateTtlMs?: number;
-  /** Co-signs refunds as provider. */
-  signAsProvider: ProviderSigner;
+  /**
+   * How long the answer to each channel's latest paid request is kept, for a retry of that very
+   * voucher (a client whose response was lost); 0 keeps none. Default 10 minutes.
+   */
+  replayTtlMs?: number;
+  /** Co-signs refunds as provider. Absent when the facilitator holds the provider key (`delegationSecret`). */
+  signAsProvider?: ProviderSigner;
+  /**
+   * The secret shared with the facilitator that holds this server's provider key: the server then
+   * authenticates each refund it passes on (`delegationMac`) instead of signing it.
+   */
+  delegationSecret?: string;
   /** Resolves a refund's collateral inputs before the provider signs. */
   chain: Chain;
   /** Decimals of the token assets the server prices in, for `$`-free settlement overrides. */
@@ -160,6 +172,19 @@ interface RequestContext {
   channelSnapshot?: ServerChannel;
   localVerify?: boolean;
   reservationCommitted?: boolean;
+  /** This request repeats the channel's latest voucher: it gets that request's answer again. */
+  replay?: Replay;
+}
+
+/** A channel's latest paid request: its voucher, the handler's response, and the settlement answered. */
+interface Replay {
+  amount: string;
+  signature: string;
+  contentType: string;
+  body: unknown;
+  result: SettleResponse;
+  enrichment?: Record<string, unknown>;
+  at: number;
 }
 
 type Payload = DeepReadonly<PaymentPayload>;
@@ -168,6 +193,8 @@ const MIN_PENDING_TTL_MS = 5_000;
 /** How often a voucher above a channel's recorded balance may send the server back to the chain. */
 const RESYNC_MS = 30_000;
 const MAX_PENDING_TTL_MS = 10 * 60_000;
+/** At most this many channels' latest answers are kept; the oldest go first. */
+const MAX_REPLAYS = 10_000;
 
 export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   readonly scheme = SCHEME;
@@ -180,9 +207,13 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   /** When each channel was last re-read for a voucher above its recorded balance. */
   private readonly resyncedAt = new Map<string, number>();
   private readonly contexts = new WeakMap<object, RequestContext>();
+  /** Each channel's latest paid request, by channel id, oldest first. */
+  private readonly replays = new Map<string, Replay>();
+  private readonly replayTtlMs: number;
 
   constructor(private readonly config: ServerConfig) {
     this.withdrawDelay = config.withdrawDelay ?? MIN_WITHDRAW_DELAY;
+    this.replayTtlMs = config.replayTtlMs ?? 10 * 60_000;
     this.storage = config.storage ?? new InMemoryChannelStorage();
     this.ttlMs = config.onchainStateTtlMs ?? Math.min(300_000, Math.max(30_000, Math.floor((this.withdrawDelay * 1000) / 3)));
     this.schemeHooks = {
@@ -247,6 +278,14 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
       const channelId = p.voucher.channelId;
       const snapshot = await this.storage.get(channelId);
       const isRefund = p.type === "refund";
+      // The channel's latest voucher again, as a retry sends it: that request's answer, no charge.
+      // An earlier voucher is stale and gets the corrective 402 below, which is what a client
+      // resyncing after losing its records needs, rather than old answers.
+      const replay = isRefund ? undefined : this.replayOf(snapshot, p.voucher);
+      if (replay) {
+        this.merge(payload, { channelId, replay });
+        return { skip: true as const, result: { isValid: true, payer: p.channelConfig.payer } };
+      }
       const charged = snapshot?.chargedCumulativeAmount ?? inferCharged(p.voucher.maxClaimableAmount, req.amount, !isRefund);
       const expected = isRefund ? BigInt(charged) : BigInt(charged) + BigInt(req.amount);
       if (BigInt(p.voucher.maxClaimableAmount) !== expected) {
@@ -277,6 +316,8 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   }
 
   private async afterVerify(payload: Payload, req: PaymentRequirements, result: VerifyResponse) {
+    const replay = this.contexts.get(payload)?.replay;
+    if (replay) return { skipHandler: true as const, response: { contentType: replay.contentType, body: replay.body } };
     if (!result.isValid || !result.payer) return;
     const p = parseClientPayload(payload.payload);
     const ctx = this.contexts.get(payload);
@@ -327,6 +368,8 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   }
 
   private async beforeSettle(payload: Payload, req: PaymentRequirements) {
+    const replay = this.contexts.get(payload)?.replay;
+    if (replay) return { skip: true as const, result: structuredClone(replay.result) };
     const p = parseClientPayload(payload.payload);
     if (p.type !== "voucher") return;
     const pendingId = this.contexts.get(payload)?.pendingId;
@@ -393,11 +436,14 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
     const owed = BigInt(ch.chargedCumulativeAmount) - BigInt(ch.totalClaimed);
     checkMutual(hex, ctx.requirements.network, this.config.scriptHash, ch.channelRef, ch.channelConfig.payer, this.config.receiverAuthorizer, this.config.payTo, currencyOf(ch.channelConfig.token), owed, collateral);
     this.merge(ctx.paymentPayload, { channelSnapshot: ch });
-    return { providerWitness: await this.config.signAsProvider(hex) };
+    if (this.config.signAsProvider) return { providerWitness: await this.config.signAsProvider(hex) };
+    // The facilitator holds the key: it signs this refund, having seen the server vouch for it.
+    if (this.config.delegationSecret) return { delegationMac: delegationMac(this.config.delegationSecret, this.config.payTo, ctx.paymentPayload.payload) };
+    throw new Error("this server holds no provider key and has no delegation");
   };
 
   private async afterSettle(payload: Payload, req: PaymentRequirements, result: SettleResponse) {
-    if (!result.success) return;
+    if (!result.success || this.contexts.get(payload)?.replay) return;
     const p = parseClientPayload(payload.payload);
     const pendingId = this.contexts.get(payload)?.pendingId;
     if (p.type === "refund") {
@@ -425,17 +471,69 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   }
 
   enrichSettlementResponse = async (ctx: SettleResultContext): Promise<Record<string, unknown> | void> => {
+    const replay = this.contexts.get(ctx.paymentPayload)?.replay;
+    if (replay) {
+      this.take(ctx.paymentPayload);
+      return replay.enrichment && structuredClone(replay.enrichment);
+    }
     const p = parseClientPayload(ctx.paymentPayload.payload);
-    if (p.type === "voucher") return;
+    if (p.type === "voucher") {
+      this.keep(p.voucher, ctx);
+      return;
+    }
     const ch = this.take(ctx.paymentPayload)?.channelSnapshot;
     if (!ch) return;
-    if (p.type === "refund") return { channelState: { chargedCumulativeAmount: ch.chargedCumulativeAmount } };
-    return {
+    if (p.type === "refund") {
+      this.replays.delete(p.voucher.channelId);
+      return { channelState: { chargedCumulativeAmount: ch.chargedCumulativeAmount } };
+    }
+    const enrichment = {
       chargedAmount: ctx.requirements.amount,
       commitmentId: commitmentId(p.voucher.channelId, p.voucher.maxClaimableAmount),
       channelState: { chargedCumulativeAmount: ch.chargedCumulativeAmount },
     };
+    this.keep(p.voucher, ctx, enrichment);
+    return enrichment;
   };
+
+  /** The kept answer to this very voucher, if it is still the channel's latest. */
+  private replayOf(snapshot: ServerChannel | undefined, v: { channelId: string; maxClaimableAmount: string; signature: string }): Replay | undefined {
+    const r = this.replays.get(v.channelId);
+    if (!r || !snapshot) return undefined;
+    if (Date.now() - r.at > this.replayTtlMs) {
+      this.replays.delete(v.channelId);
+      return undefined;
+    }
+    return r.amount === v.maxClaimableAmount && r.signature === v.signature && snapshot.chargedCumulativeAmount === r.amount ? r : undefined;
+  }
+
+  /** Keeps a paid request's answer as its channel's latest: the handler's response (HTTP only) and the settlement. */
+  private keep(v: { channelId: string; maxClaimableAmount: string; signature: string }, ctx: SettleResultContext, enrichment?: Record<string, unknown>) {
+    if (this.replayTtlMs <= 0 || !ctx.result.success) return;
+    const t = ctx.transportContext as { responseBody?: Uint8Array; responseHeaders?: Record<string, string> } | undefined;
+    if (!t?.responseBody) return;
+    const contentType = Object.entries(t.responseHeaders ?? {}).find(([k]) => k.toLowerCase() === "content-type")?.[1] ?? "application/json";
+    const bytes = Buffer.from(t.responseBody);
+    let body: unknown = bytes;
+    if (/json/i.test(contentType)) {
+      try {
+        body = JSON.parse(bytes.toString("utf8"));
+      } catch {
+        body = bytes.toString("utf8");
+      }
+    } else if (/^text\//i.test(contentType)) body = bytes.toString("utf8");
+    this.replays.delete(v.channelId); // re-inserted, so the map stays oldest first
+    this.replays.set(v.channelId, {
+      amount: v.maxClaimableAmount,
+      signature: v.signature,
+      contentType,
+      body,
+      result: structuredClone(ctx.result) as SettleResponse,
+      ...(enrichment ? { enrichment: structuredClone(enrichment) } : {}),
+      at: Date.now(),
+    });
+    while (this.replays.size > MAX_REPLAYS) this.replays.delete(this.replays.keys().next().value!);
+  }
 
   /** On `cumulative_amount_mismatch`, tell the client where the server's count stands and what it last signed. */
   enrichPaymentRequiredResponse = async (ctx: SchemePaymentRequiredContext): Promise<PaymentRequirements[] | void> => {

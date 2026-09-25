@@ -1,6 +1,7 @@
 // Wire types of the Cardano `batch-settlement` binding (DESIGN.md §3–§6): the requirements'
 // `extra`, the client payloads, the server's claim, and the channel snapshot every response
 // carries. Shapes and names follow x402's EVM and SVM bindings wherever Subbit allows.
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { PaymentRequirements } from "@x402/core/types";
 
 export const SCHEME = "batch-settlement";
@@ -106,13 +107,27 @@ export interface RefundPayload {
   transaction: string;
   /** Added by the server before `/settle`: its witness set, CBOR hex. */
   providerWitness?: string;
+  /** Added instead by a server whose provider key the facilitator holds: see `delegationMac`. */
+  delegationMac?: string;
 }
 
 export interface ClaimPayload {
   type: "claim";
-  /** Base64 CBOR of a `Sub` transaction over one or more channels, signed by the provider. */
-  transaction: string;
-  claims: Array<{ channelId: string; totalClaimed: string }>;
+  /**
+   * Base64 CBOR of a claim transaction (`Sub` and `Settle` steps) over one or more channels,
+   * signed by the provider. Absent when the server has delegated its provider key to the
+   * facilitator, which then builds and signs the claim from the vouchers listed.
+   */
+  transaction?: string;
+  claims: Array<{
+    channelId: string;
+    totalClaimed: string;
+    /** Without a transaction: where the channel was last seen, and the voucher it redeems. */
+    channelRef?: string;
+    voucher?: { maxClaimableAmount: string; signature: string };
+  }>;
+  /** Without a transaction: the delegating server's authentication, see `delegationMac`. */
+  delegationMac?: string;
 }
 
 export type ClientPayload = DepositPayload | VoucherPayload | RefundPayload;
@@ -209,12 +224,14 @@ export function parseClientPayload(v: unknown): ClientPayload {
     case "refund":
       need(str(p.transaction, base64), "refund.transaction");
       need(p.providerWitness === undefined || (typeof p.providerWitness === "string" && /^[0-9a-f]+$/.test(p.providerWitness)), "refund.providerWitness");
+      need(p.delegationMac === undefined || str(p.delegationMac, hex32), "refund.delegationMac");
       return {
         type: "refund",
         channelConfig,
         voucher,
         transaction: p.transaction as string,
         ...(p.providerWitness !== undefined ? { providerWitness: p.providerWitness as string } : {}),
+        ...(p.delegationMac !== undefined ? { delegationMac: p.delegationMac as string } : {}),
       };
     default:
       throw new PayloadError(Err.payloadType, `unknown payload type ${String(p.type)}`);
@@ -225,15 +242,64 @@ export function parseClaimPayload(v: unknown): ClaimPayload {
   need(isObj(v), "payload is not an object");
   const p = v as Record<string, unknown>;
   if (p.type !== "claim") throw new PayloadError(Err.payloadType, `unknown payload type ${String(p.type)}`);
-  need(str(p.transaction, base64), "claim.transaction");
+  need(p.transaction === undefined || str(p.transaction, base64), "claim.transaction");
   need(Array.isArray(p.claims) && p.claims.length > 0, "claim.claims");
   const claims = (p.claims as unknown[]).map((c) => {
     need(isObj(c), "claim entry");
     const o = c as Record<string, unknown>;
     need(str(o.channelId, hex32) && str(o.totalClaimed, uint), "claim entry fields");
-    return { channelId: o.channelId as string, totalClaimed: o.totalClaimed as string };
+    need(o.channelRef === undefined || str(o.channelRef, outRef), "claim entry channelRef");
+    let voucher: { maxClaimableAmount: string; signature: string } | undefined;
+    if (o.voucher !== undefined) {
+      need(isObj(o.voucher), "claim entry voucher");
+      const w = o.voucher as Record<string, unknown>;
+      need(str(w.maxClaimableAmount, uint) && str(w.signature, hex64), "claim entry voucher fields");
+      voucher = { maxClaimableAmount: w.maxClaimableAmount as string, signature: w.signature as string };
+    }
+    if (p.transaction === undefined) need(o.channelRef !== undefined && voucher !== undefined, "a claim without a transaction names each channel's position and voucher");
+    return {
+      channelId: o.channelId as string,
+      totalClaimed: o.totalClaimed as string,
+      ...(o.channelRef !== undefined ? { channelRef: o.channelRef as string } : {}),
+      ...(voucher ? { voucher } : {}),
+    };
   });
-  return { type: "claim", transaction: p.transaction as string, claims };
+  need(p.delegationMac === undefined || str(p.delegationMac, hex32), "claim.delegationMac");
+  return {
+    type: "claim",
+    ...(p.transaction !== undefined ? { transaction: p.transaction as string } : {}),
+    claims,
+    ...(p.delegationMac !== undefined ? { delegationMac: p.delegationMac as string } : {}),
+  };
+}
+
+/**
+ * What a server whose provider key a facilitator holds adds to each claim and refund it asks the
+ * facilitator to sign: HMAC-SHA256, keyed with the secret the two share, over the server's `payTo`
+ * and the payload without this field, as canonical JSON. The facilitator signs for that server
+ * only what carries it: a consumer could otherwise have it settle a closed channel with an early,
+ * smaller voucher, or co-sign a refund that pays the server less than it charged.
+ */
+export function delegationMac(secret: string, payTo: string, payload: object): string {
+  const { delegationMac: _, ...rest } = payload as Record<string, unknown>;
+  return createHmac("sha256", secret).update(canonicalJson({ payTo, payload: rest })).digest("hex");
+}
+
+export function checkDelegationMac(secret: string, payTo: string, payload: object): boolean {
+  const given = (payload as { delegationMac?: unknown }).delegationMac;
+  if (typeof given !== "string" || !/^[0-9a-f]{64}$/.test(given)) return false;
+  return timingSafeEqual(Buffer.from(given, "hex"), Buffer.from(delegationMac(secret, payTo, payload), "hex"));
+}
+
+/** JSON with every object's keys sorted and undefined members left out. */
+function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v !== null && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    const keys = Object.keys(o).filter((k) => o[k] !== undefined).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v);
 }
 
 /** The scheme's `extra`, checked field by field. */

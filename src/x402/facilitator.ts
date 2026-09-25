@@ -1,22 +1,31 @@
-// The facilitator side of the Cardano binding (DESIGN.md §6, §8): no key and no funds. It checks
-// payloads against the chain and broadcasts transactions other parties signed: the client's
-// channel opening, the server's batched `Sub`, and the co-signed `Mutual` refund.
+// The facilitator side of the Cardano binding (DESIGN.md §6, §8). By default it holds no key and
+// no funds: it checks payloads against the chain and broadcasts transactions other parties signed,
+// the client's channel opening, the server's batched claim, the co-signed `Mutual` refund. A server
+// may instead delegate its provider key to it (`delegates`): the facilitator then builds and signs
+// that server's claims and co-signs its refunds, paying only the server's registered `payTo`, and
+// only for requests the server has authenticated. Subbit does not restrict where a redemption pays,
+// so this is custody, not an authorisation: the server trusts the facilitator with its revenue.
+import { TransactionWitnessSet } from "@evolution-sdk/evolution";
 import type { PaymentPayload, PaymentRequirements, SchemeNetworkFacilitator, SettleResponse, VerifyResponse } from "@x402/core/types";
 import { Address, Data, Transaction, TransactionHash } from "@evolution-sdk/evolution";
 import { capacityOf, channelStateOf, datumBindingError, readChannel, txHashOf, verifyVoucherSignature, type ChannelView } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
+import { buildClaimTx, compareRefs, type ClaimLine } from "./claimtx.ts";
+import type { SeedWallet } from "./client.ts";
 import { channelOutputIndex, checkDeposit, checkInputWitnesses, checkMutual, checkTopUp, decodeTx, sortedInputRefs, spendRedeemers, TxCheckError } from "./txcheck.ts";
 import {
   Err,
   PayloadError,
   SCHEME,
   SETTLEMENT_PENDING,
+  checkDelegationMac,
   configBindingError,
   fromBase64,
   parseClaimPayload,
   parseClientPayload,
   parseExtra,
   type BatchExtra,
+  type ClaimPayload,
   type DepositPayload,
   type RefundPayload,
   type VoucherPayload,
@@ -27,6 +36,20 @@ export interface FacilitatorOptions {
   scriptHash: string;
   /** How long `/settle` waits for a transaction to reach a block before answering `settlement_pending`. */
   confirmationTimeoutMs?: number;
+  /** Provider keys servers have delegated to this facilitator, one per server. */
+  delegates?: Delegate[];
+}
+
+/** A provider key held for one server. */
+export interface Delegate {
+  /** Its key is the `provider` of that server's channels; it pays claim fees and collateral. */
+  wallet: SeedWallet;
+  keyHash: string;
+  /** The server's `payTo`: every claim this key signs pays there, and every refund it co-signs must. */
+  payTo: string;
+  /** Shared with the server, which authenticates each claim and refund with it (`delegationMac`). */
+  secret: string;
+  referenceScript?: string;
 }
 
 type Verified = { ok: true; payer: string; extra: Record<string, unknown>; channel?: ChannelView } | { ok: false; reason: string; message: string; payer?: string };
@@ -36,18 +59,26 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
   readonly caipFamily = "cardano:*";
   /** Transactions already broadcast, so a retried `/settle` waits on the same one. */
   private readonly submitted = new Set<string>();
+  /** Delegated keys by the `payTo` they serve, and the inputs each one's claims just spent. */
+  private readonly delegates = new Map<string, { d: Delegate; spent: Map<string, number> }>();
 
   constructor(
     private readonly chain: Chain,
     private readonly options: FacilitatorOptions,
-  ) {}
+  ) {
+    for (const d of options.delegates ?? []) {
+      if (this.delegates.has(d.payTo)) throw new Error(`two delegated keys for ${d.payTo}`);
+      this.delegates.set(d.payTo, { d, spent: new Map() });
+    }
+  }
 
   getExtra(): Record<string, unknown> | undefined {
     return undefined;
   }
 
+  /** The provider keys it holds for servers, if any. Each server is told its own out of band. */
   getSigners(): string[] {
-    return [];
+    return [...this.delegates.values()].map(({ d }) => d.keyHash);
   }
 
   async verify(paymentPayload: PaymentPayload, requirements: PaymentRequirements): Promise<VerifyResponse> {
@@ -73,7 +104,7 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
       if (!v.ok) return failed(v.reason, v.message, "", v.payer);
       const p = parseClientPayload(paymentPayload.payload);
       if (p.type === "deposit") return await this.settleDeposit(p, requirements, v.payer);
-      if (p.type === "refund") return await this.settleRefund(p, requirements, v.payer, v.channel!);
+      if (p.type === "refund") return await this.settleRefund(p, paymentPayload.payload, requirements, v.payer, v.channel!);
       return failed(Err.payloadType, "unsupported payload");
     } catch (e) {
       if (e instanceof PayloadError || e instanceof TxCheckError) return failed(e.reason, e.message);
@@ -255,9 +286,20 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     };
   }
 
-  private async settleRefund(p: RefundPayload, req: PaymentRequirements, payer: string, ch: ChannelView): Promise<SettleResponse> {
-    if (!p.providerWitness) return { success: false, errorReason: Err.refundTransaction, errorMessage: "the provider has not signed", transaction: "", network: req.network, payer };
-    const hex = Transaction.addVKeyWitnessesHex(fromBase64(p.transaction), p.providerWitness);
+  private async settleRefund(p: RefundPayload, raw: object, req: PaymentRequirements, payer: string, ch: ChannelView): Promise<SettleResponse> {
+    let witness = p.providerWitness;
+    if (!witness) {
+      // A delegated key signs only its own server's refunds, and only those the server vouched for.
+      const held = this.delegates.get(req.payTo);
+      if (!held || held.d.keyHash !== ch.datum.constants.provider) {
+        return { success: false, errorReason: Err.refundTransaction, errorMessage: "the provider has not signed", transaction: "", network: req.network, payer };
+      }
+      if (!checkDelegationMac(held.d.secret, req.payTo, raw)) {
+        return { success: false, errorReason: Err.refundTransaction, errorMessage: "refund not authenticated by the server whose key this facilitator holds", transaction: "", network: req.network, payer };
+      }
+      witness = TransactionWitnessSet.toCBORHex(await held.d.wallet.signTx(fromBase64(p.transaction)));
+    }
+    const hex = Transaction.addVKeyWitnessesHex(fromBase64(p.transaction), witness);
     const { txHash, confirmed } = await this.broadcast(hex);
     if (!confirmed) return { success: false, errorReason: SETTLEMENT_PENDING, transaction: txHash, network: req.network, payer };
     const subbed = ch.datum.stage.kind === "opened" ? ch.datum.stage.subbed : 0n;
@@ -283,6 +325,7 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
    */
   private async settleClaim(paymentPayload: PaymentPayload, req: PaymentRequirements): Promise<SettleResponse> {
     const p = parseClaimPayload(paymentPayload.payload);
+    if (p.transaction === undefined) return this.settleDelegatedClaim(p, paymentPayload.payload, req);
     const hex = fromBase64(p.transaction);
     const tx = decodeTx(hex, Err.claimTransaction);
     const scriptHash = this.options.scriptHash;
@@ -308,6 +351,39 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     const { txHash, confirmed } = await this.broadcast(hex);
     if (!confirmed) return { success: false, errorReason: SETTLEMENT_PENDING, transaction: txHash, network: req.network };
     return { success: true, transaction: txHash, network: req.network, extra: { claims: p.claims } };
+  }
+
+  /**
+   * A claim for a server whose provider key this facilitator holds: the server names each channel
+   * and the voucher to redeem, and authenticates the request. The facilitator checks every
+   * voucher against its channel on chain, then builds, signs and broadcasts the claim itself,
+   * paying everything it redeems to the server's `payTo` in one output.
+   */
+  private async settleDelegatedClaim(p: ClaimPayload, raw: object, req: PaymentRequirements): Promise<SettleResponse> {
+    const failed = (reason: string, message: string): SettleResponse => ({ success: false, errorReason: reason, errorMessage: message, transaction: "", network: req.network });
+    const held = this.delegates.get(req.payTo);
+    if (!held) return failed(Err.claimTransaction, "this facilitator holds no provider key for that payTo");
+    if (!checkDelegationMac(held.d.secret, req.payTo, raw)) return failed(Err.claimTransaction, "claim not authenticated by the server whose key this facilitator holds");
+    const lines: ClaimLine[] = [];
+    for (const c of p.claims) {
+      const v = await this.chain.followChannel(c.channelRef!, this.options.scriptHash, c.channelId);
+      if (!v) return failed(Err.channelNotFound, `channel ${c.channelId.slice(0, 16)}… not found`);
+      if (v.datum.constants.provider !== held.d.keyHash) return failed(Err.claimTransaction, `channel ${c.channelId.slice(0, 16)}… is not this server's`);
+      const stage = v.datum.stage;
+      if (stage.kind === "settled") return failed(Err.channelClosed, `channel ${c.channelId.slice(0, 16)}… is settled`);
+      const amount = BigInt(c.voucher!.maxClaimableAmount);
+      const total = BigInt(c.totalClaimed);
+      if (!verifyVoucherSignature(v.datum.constants.iouKey, c.channelId, amount, c.voucher!.signature)) return failed(Err.voucherSignature, `voucher for ${c.channelId.slice(0, 16)}… does not verify`);
+      if (total > amount) return failed(Err.chargeExceedsSignedCumulative, `claiming ${total} on a voucher for ${amount}`);
+      if (total <= stage.subbed) return failed(Err.cumulativeBelowClaimed, `claiming ${total}, already redeemed ${stage.subbed}`);
+      lines.push({ channelId: c.channelId, totalClaimed: total, amount, signature: c.voucher!.signature, v });
+    }
+    lines.sort((a, b) => compareRefs(a.v.ref, b.v.ref));
+    const { d, spent } = held;
+    const { hex } = await buildClaimTx({ wallet: d.wallet, providerKeyHash: d.keyHash, chain: this.chain, ...(d.referenceScript ? { referenceScript: d.referenceScript } : {}), payTo: d.payTo, payout: "delegated", spent }, lines);
+    const { txHash, confirmed } = await this.broadcast(hex);
+    if (!confirmed) return { success: false, errorReason: SETTLEMENT_PENDING, transaction: txHash, network: req.network };
+    return { success: true, transaction: txHash, network: req.network, extra: { claims: p.claims.map((c) => ({ channelId: c.channelId, totalClaimed: c.totalClaimed })) } };
   }
 }
 

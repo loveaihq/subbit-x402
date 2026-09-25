@@ -11,7 +11,7 @@ import { capacityOf, channelReserve, constantsOf, datumBindingError, planTokens,
 import type { Chain } from "../src/x402/chain.ts";
 import { BatchSettlementCardanoClient, FileClientStorage, derivedIouSigner, iouRootOf } from "../src/x402/client.ts";
 import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x402/server.ts";
-import { Err, PayloadError, configBindingError, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
+import { Err, PayloadError, checkDelegationMac, configBindingError, delegationMac, parseClaimPayload, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
 
 const PAY_TO = "addr_test1qrxchm0g4la6hqfd9wq6vuuldx7l20az52t7lvgpgujr8pvwmpzru5kuf4mpmvtaf0hlsjtz7t4r2h7tj9v3c02dhljq0wqkef";
 const PROVIDER = "cd8bede8affbab812d2b81a6739f69bdf53fa2a297efb10147243385";
@@ -54,6 +54,21 @@ test("client payloads parse strictly", () => {
   for (const [p, reason] of bad) {
     assert.throws(() => parseClientPayload(p), (e: unknown) => e instanceof PayloadError && e.reason === reason);
   }
+});
+
+test("a claim for the facilitator to build names each channel's position and voucher, and carries the server's MAC", () => {
+  const entry = { channelId: TAG, totalClaimed: "5000", channelRef: `${"cd".repeat(32)}#0`, voucher: { maxClaimableAmount: "6000", signature: "ab".repeat(64) } };
+  const body = { type: "claim", claims: [entry] };
+  const payload = { ...body, delegationMac: delegationMac("s3cret", PAY_TO, body) };
+  assert.deepEqual(parseClaimPayload(payload), payload);
+  assert.throws(() => parseClaimPayload({ type: "claim", claims: [{ channelId: TAG, totalClaimed: "5000" }] }), PayloadError);
+  // The MAC holds for the same content in any key order, and for nothing else.
+  const reordered = { delegationMac: payload.delegationMac, claims: [{ voucher: { signature: entry.voucher.signature, maxClaimableAmount: "6000" }, channelRef: entry.channelRef, totalClaimed: "5000", channelId: TAG }], type: "claim" };
+  assert.ok(checkDelegationMac("s3cret", PAY_TO, reordered));
+  assert.ok(!checkDelegationMac("other", PAY_TO, payload));
+  assert.ok(!checkDelegationMac("s3cret", "addr_test1vqsomewhereelse", payload));
+  assert.ok(!checkDelegationMac("s3cret", PAY_TO, { ...payload, claims: [{ ...entry, totalClaimed: "1000" }] }));
+  assert.ok(!checkDelegationMac("s3cret", PAY_TO, body));
 });
 
 test("extra: the close period stays within 900 s – 30 days and at or above maxTimeoutSeconds", () => {
@@ -337,6 +352,36 @@ test("server: with no record of a channel, the next voucher rebuilds it, the cou
   assert.equal(rebuilt.chargedCumulativeAmount, "7000");
   assert.equal(rebuilt.signedMaxClaimable, "7000");
   assert.equal(rebuilt.totalClaimed, "4000");
+});
+
+test("server: a retry of the latest voucher gets the same answer, charged once; an earlier voucher gets the corrective 402", async () => {
+  const { server, storage, req } = await serverWithChannel();
+  const h = server.schemeHooks;
+  const pay = async (amount: bigint, body?: string) => {
+    const r = await paidRequest(server, req, voucher(amount));
+    if (r.stage === "settled" && body) {
+      const result = { success: true, transaction: "", network: req.network, extra: r.extra };
+      await server.enrichSettlementResponse({ paymentPayload: r.paymentPayload, requirements: req, declaredExtensions: {}, phase: "after-handler", result, transportContext: { responseBody: Buffer.from(body) } } as never);
+    }
+    return r;
+  };
+  await pay(1000n, '{"n":1}');
+  await pay(2000n, '{"n":2}');
+  // The voucher for 2,000 again, as a client sends it when the response never reached it.
+  const again = payloadFor(req, voucher(2000n));
+  const before = (await h.onBeforeVerify!({ paymentPayload: again, requirements: req, declaredExtensions: {} } as never)) as { skip?: true };
+  assert.equal(before?.skip, true);
+  const after = (await h.onAfterVerify!({ paymentPayload: again, requirements: req, declaredExtensions: {}, result: { isValid: true, payer: config.payer } } as never)) as { skipHandler?: true; response?: { body: unknown } };
+  assert.equal(after?.skipHandler, true);
+  assert.deepEqual(after?.response?.body, { n: 2 });
+  const settled = (await h.onBeforeSettle!({ paymentPayload: again, requirements: req, declaredExtensions: {}, phase: "after-handler" } as never)) as unknown as { skip: true; result: { extra: { chargedAmount: string } } };
+  assert.equal(settled.result.extra.chargedAmount, "1000");
+  assert.equal((await storage.get(TAG))!.chargedCumulativeAmount, "2000");
+  // An earlier voucher is stale: the corrective 402, not an old answer.
+  assert.equal((await paidRequest(server, req, voucher(1000n))).reason, Err.cumulativeAmountMismatch);
+  // The next one is charged as usual.
+  assert.equal((await pay(3000n)).stage, "settled");
+  assert.equal((await storage.get(TAG))!.chargedCumulativeAmount, "3000");
 });
 
 test("server: one request per channel at a time", async () => {
