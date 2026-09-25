@@ -1,7 +1,6 @@
 {
   "name": "subbit-x402",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "description": "x402 batch-settlement on Cardano over Subbit.xyz payment channels: binding spec draft and reference implementation, preprod only",
   "type": "module",
   "license": "Apache-2.0",
@@ -10,6 +9,16 @@
     "type": "git",
     "url": "git+https://github.com/loveaihq/subbit-x402.git"
   },
+  "homepage": "https://github.com/loveaihq/subbit-x402#readme",
+  "bugs": "https://github.com/loveaihq/subbit-x402/issues",
+  "keywords": [
+    "cardano",
+    "x402",
+    "batch-settlement",
+    "payment-channels",
+    "subbit",
+    "micropayments"
+  ],
   "exports": {
     "./subbit": {
       "types": "./dist/subbit.d.ts",
@@ -41,11 +50,11 @@
   "dependencies": {
     "@evolution-sdk/evolution": "0.5.13",
     "@noble/hashes": "2.4.0",
-    "@x402/core": "2.27.0",
-    "@x402/fetch": "2.27.0"
+    "@x402/core": "2.27.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.4",
+    "@x402/fetch": "2.27.0",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   }
