@@ -1,5 +1,6 @@
-// The currency the spike's channels run in: ADA (steps 1–4), or the sUSDM stand-in (step 5,
-// SUBBIT_CURRENCY=token, after `npm run mint -- mint`). Amounts are in the currency's own units,
+// The currency the spike's channels run in: ADA (steps 1–4), the sUSDM stand-in (step 5,
+// SUBBIT_CURRENCY=token, after `npm run mint -- mint`), or Moneta's real preprod tUSDM (step 10,
+// SUBBIT_CURRENCY=tusdm, claimed from tusdm.moneta.global). Amounts are in the currency's own units,
 // which for both is 10⁻⁶ of a whole coin, so step 2's figures carry over unchanged. A token
 // channel's value is that many tokens plus the ADA the output needs; the validator counts only
 // the tokens.
@@ -19,12 +20,16 @@ export interface TokenState {
   mintTx: string;
 }
 
-export const TOKEN = process.env.SUBBIT_CURRENCY === "token";
-if (process.env.SUBBIT_CURRENCY !== undefined && !["ada", "token"].includes(process.env.SUBBIT_CURRENCY)) {
-  throw new Error(`SUBBIT_CURRENCY must be ada or token, not ${process.env.SUBBIT_CURRENCY}`);
-}
+const MODE = process.env.SUBBIT_CURRENCY ?? "ada";
+if (!["ada", "token", "tusdm"].includes(MODE)) throw new Error(`SUBBIT_CURRENCY must be ada, token or tusdm, not ${MODE}`);
 
-export const token: TokenState | undefined = TOKEN ? readToken() : undefined;
+/** Moneta's preprod tUSDM, the asset `@x402/cardano` names, 6 decimals. */
+const TUSDM = "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d";
+
+export const TOKEN = MODE !== "ada";
+
+export const token: TokenState | undefined =
+  MODE === "token" ? readToken() : MODE === "tusdm" ? { policyId: TUSDM.split(".")[0]!, unit: TUSDM, extraUnit: "", decimals: 6, lockSlot: "", mintTx: "" } : undefined;
 
 function readToken(): TokenState {
   if (!existsSync(TOKEN_STATE)) throw new Error("no token yet: run `npm run mint -- mint` first");
@@ -34,7 +39,7 @@ function readToken(): TokenState {
 const [policy, name] = token ? (token.unit.split(".") as [string, string]) : ["", ""];
 
 export const currency: Currency = token ? { kind: "asset", policy, name } : { kind: "ada" };
-export const unitName = token ? "sUSDM" : "tADA";
+export const unitName = MODE === "tusdm" ? "tUSDM" : token ? "sUSDM" : "tADA";
 /** The SDK's unit: policy and name run together (its doc comment says dot-separated). */
 const sdkUnit = policy + name;
 

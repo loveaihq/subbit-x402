@@ -572,7 +572,7 @@ Blockfrost. `RESULTS.md` records every preprod transaction: steps 1–3 exercise
 step 4 the ADA binding end to end, step 5 a token binding, step 6 top-ups and the automatic
 settle after a consumer's close, step 7 a client that folds its token UTxOs, step 8 recovery
 after state loss, step 9 retries answered from the kept response and a server whose provider key
-the facilitator holds.
+the facilitator holds, step 10 the binding in Moneta's preprod tUSDM.
 
 ## Version history
 

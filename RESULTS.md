@@ -604,10 +604,38 @@ The run first recorded account 3 at 0: it took its balances right after the fund
 address index listed it. Account 3's first transaction is that funding, which paid it exactly 30
 tADA, so its opening balance is that; the funding step now waits for the index.
 
+## Step 10: Moneta's real tUSDM
+
+Steps 5–7 ran in sUSDM, a stand-in minted for the purpose. This one runs in Moneta's preprod
+tUSDM, the asset `@x402/cardano` names (`e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d`,
+6 decimals). Its claim page (tusdm.moneta.global) sent the consumer 1,000 tUSDM and 5 tADA in
+`628eca2962e60d5666e84718d708a1789b73b673a39175af2f4af43bc73ef4be` a few minutes after the address
+was submitted. `SUBBIT_CURRENCY=tusdm` runs step 6's two phases in it, with step 7's folding;
+state in `out/x402-step10-tusdm/`:
+
+| Phase | Step | Transaction | Result |
+|---|---|---|---|
+| top-up | request 1 | `46335d0ac7ed15f43edfb226d6bc1788da389a942d1d4155e72d2de57fb720ed` | opens with room for 10 requests and the 2.133450 tADA reserve, from the faucet's UTxO |
+| | claim | `30edbe18b3cec0973b3462612ad0be67fa03bc8e160fb3f680f75fc43c04b6d1` | after request 5, 0.005 tUSDM |
+| | request 11 | `8914fba9b2dd1196d90b95a64d8592e499497f40451e34f358f684692e652b1c` | top-up after the claim, room for 20; 108.2 s (a slow block). The four build-only checks came out as before |
+| | claim | `e61b93e1e57ec7ae5d560d5734b5deb9f3cb65ca5e5f5165fe1678ce46179226` | 0.010 tUSDM, the provider's first tUSDM output folded in |
+| | refund | `0fe5048967c996db22f98108f620ee887b9c48a52a93a8e3b6053d9fc24206b8` | 0.005 tUSDM and the reserve back |
+| automatic settle | request 1 | `99667614943332e9637d400bae7f09930806c8f8b0def4c4ca4b2373da96c599` | 12 requests |
+| | close | `b09f876ccee525fd5fb02a6b572ec710e42a18efdabf8850295e1fa513b01bb8` | the consumer alone |
+| | settle | `4e95e4283b8f1e588f08f11f9c00e0746c4940e6467d833e5f8c7359c1623b35` | the watcher, 58 s after the close, 18.9 min before `elapse_at`: 0.012 tUSDM |
+| | end | `7ef6d2058e9a36abe3d48705e265c684179f91535a5455c67f5891722272b635` | 0.008 tUSDM and 2.133450 tADA back |
+
+Nothing in the code changed for it: only the asset id differs from the stand-in, as step 5
+expected. Fees and sizes match sUSDM's (a claim 1,001–1,037 B and 0.267–0.269 tADA, a top-up 970
+B and 0.261476), and the wallets kept their shape: the consumer's tUSDM sat in one UTxO before and
+after, the provider's in one after.
+
+**Reconciliation.** ADA: consumer 38.743683 → 37.382944, provider 18.185217 → 17.379374 tADA,
+account 3 untouched; the wallets lost 2.166582 tADA, exactly the fees of the 9 transactions. tUSDM:
+consumer 1,000 → 999.973, provider 0 → 0.027, nothing left in channels, so none created or lost.
+
 ## What this does not show yet
 
-- The real tUSDM. The stand-in has its shape and takes the same code paths; only the asset id
-  differs.
 - The watcher at scale: each pass reads every channel the server holds, two or three Blockfrost
   queries each. With many channels a server would follow the chain rather than poll it.
 - Recovery in a token currency: step 8 ran in tADA. `elapse` has not run on a token channel; its
@@ -728,6 +756,10 @@ npm run x402 -- recover && npm run x402 -- recover-elapse && npm run x402 -- rep
 X402_OUT=x402-step9 npm run x402 -- replay            # step 9: a lost response, retried
 X402_OUT=x402-step9-delegate npm run x402 -- delegate  # a keyless server, account 3 held by the facilitator
 X402_OUT=x402-step9-delegate npm run x402 -- report
+
+export SUBBIT_CURRENCY=tusdm X402_OUT=x402-step10-tusdm   # step 10: Moneta's tUSDM, once the wallet holds some
+npm run x402 -- wallets before && npm run x402 -- topup && npm run x402 -- autosettle
+npm run x402 -- wallets after && npm run x402 -- report
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,
