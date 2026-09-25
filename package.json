@@ -2,10 +2,14 @@
   "name": "subbit-x402",
   "version": "0.0.0",
   "private": true,
-  "description": "Spike: x402 batch-settlement on Cardano, using Subbit.xyz channels",
+  "description": "x402 batch-settlement on Cardano over Subbit.xyz payment channels: binding spec draft and reference implementation, preprod only",
   "type": "module",
   "license": "Apache-2.0",
   "author": "Vincent <loveaihqhq@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/loveaihq/subbit-x402.git"
+  },
   "scripts": {
     "spike": "tsx spike/run.ts",
     "lifecycle": "tsx spike/lifecycle.ts",

@@ -1,7 +1,7 @@
 # Scheme: `batch-settlement` on `Cardano`
 
-Status: **draft**, v0.1 (2026-09-24). Reference implementation and preprod measurements in this
-repository (`src/x402/`, `RESULTS.md`).
+Status: **draft**, v0.6 (2026-09-25). Reference implementation and preprod measurements:
+[loveaihq/subbit-x402](https://github.com/loveaihq/subbit-x402) (`src/x402/`, [`RESULTS.md`](https://github.com/loveaihq/subbit-x402/blob/main/RESULTS.md)).
 
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are to be read as in RFC 2119.
 
@@ -576,9 +576,10 @@ non-terminal `settlement_pending`.
 
 ## Reference implementation
 
-This repository: `src/x402/` implements the client, resource-server and facilitator schemes for
-`@x402/core` 2.27.0 and the server's channel manager, on `@evolution-sdk/evolution` 0.5.13 and
-Blockfrost. `RESULTS.md` records every preprod transaction: steps 1–3 exercise the validator,
+[loveaihq/subbit-x402](https://github.com/loveaihq/subbit-x402): `src/x402/` implements the client, resource-server and
+facilitator schemes for `@x402/core` 2.27.0 and the server's channel manager, on
+`@evolution-sdk/evolution` 0.5.13 and Blockfrost, with 28 chain-free tests.
+[`RESULTS.md`](https://github.com/loveaihq/subbit-x402/blob/main/RESULTS.md) records every preprod transaction: steps 1–3 exercise the validator,
 step 4 the ADA binding end to end, step 5 a token binding, step 6 top-ups and the automatic
 settle after a consumer's close, step 7 a client that folds its token UTxOs, step 8 recovery
 after state loss, step 9 retries answered from the kept response and a server whose provider key
