@@ -90,6 +90,29 @@ signature         d09aac1f109a70db6328acec3e83d01f9d894d6bab248b03e8689ac3818526
 
 IOUs carry no expiry.
 
+Each channel has its own IOU key. A client SHOULD derive it from its wallet, so that a client
+that has lost its records can make the key again from the chain (*Client verification rules*).
+The reference client signs, once, the message below with the wallet's payment key (CIP-8
+`signData`), takes the Ed25519 signature out of the resulting COSE_Sign1, and derives
+
+```
+root = HKDF-SHA256(ikm = that signature, salt = "x402 batch-settlement cardano", info = "iou root v1", 32 bytes)
+seed = HKDF-SHA256(ikm = root, salt = "x402 batch-settlement cardano", info = "iou key v1 <network> <tag hex>", 32 bytes)
+```
+
+with `seed` the channel's Ed25519 private key. The message:
+
+```
+x402 batch-settlement on Cardano, IOU keys v1. Sign this only for your own x402 client: this signature derives the keys that authorize payments from your channels.
+```
+
+Anyone holding that signature can derive the IOU key of every channel the wallet opens, so a
+wallet MUST sign this message for its own client only. Ed25519 is deterministic, so the same
+wallet software gives the same keys every time; wallet software that encodes the COSE headers
+differently gives other keys, and a channel whose key does not derive again can only be left
+(*Client verification rules*). The derivation is the client's own business: nothing on chain or
+at the server depends on it.
+
 ### Identity and position
 
 - `channelId` is the channel's `tag`, 32 bytes, lower-case hex. The client MUST derive it as
@@ -443,9 +466,19 @@ until it knows the first cannot land: it adopts the channel if the opening is on
 from `subbed`, as the server never counted the request), and gives it up only when one of the
 opening's inputs has been spent by a different transaction.
 
-**Recovery after state loss.** The client finds its channels by their `payer` key hash at the
-validator's address and follows each from any known position. It cannot recover the server's
-count; it can always leave through the unilateral exit. *Not in the reference implementation yet.*
+**Recovery after state loss.** A client that has lost its records finds its channels at the
+validator's address by the datum's `consumer` = its `payer` key hash, and follows each to its
+current position (an address index can trail the chain). For each it derives the IOU key again;
+where that matches the datum's `iouKey`, the channel is usable: the datum gives every config
+field but `receiver`, which the next 402 on the channel's terms (`receiverAuthorizer`, asset,
+close period, script, network) supplies, and the client binds the channel to that server. Its
+count starts from `subbed`, the most the chain proves; the server's answer to the first voucher is
+a corrective 402, and the client adopts the server's count only as the rules above allow, that is
+only when the server holds a voucher of this very key for at least that much. A channel whose key
+does not derive again can only be left: `Close`, then `End` once the server has settled, or
+`Elapse` from `elapseAt` on without it. A server that has lost its records has lost what it
+charged and did not redeem; the client's next voucher, being cumulative, restores its count from
+there.
 
 ## Network requirements
 
@@ -487,8 +520,10 @@ non-terminal `settlement_pending`.
   exactly the shape in *Facilitator interface*, checked by itself.
 - **A token channel's ADA** is protected only down to its exact min-UTxO, a margin of about 0.09
   tADA when the client deposits exactly the reserve.
-- **Channel identity.** A tag derived from a spent input, with a fresh IOU key per channel, keeps
-  an IOU from being redeemable against any channel but its own.
+- **Channel identity.** A tag derived from a spent input, with a key per channel, keeps an IOU
+  from being redeemable against any channel but its own.
+- **Derived IOU keys** are as secret as the wallet's signature of the root message; a client MUST
+  NOT sign that message for any other party.
 
 Not in the reference implementation yet: a response cache for exact repeats of a voucher, and
 delegating the provider key to the facilitator. Delegation would make the facilitator custodian of the redemptions it signs, since
@@ -500,7 +535,8 @@ This repository: `src/x402/` implements the client, resource-server and facilita
 `@x402/core` 2.27.0 and the server's channel manager, on `@evolution-sdk/evolution` 0.5.13 and
 Blockfrost. `RESULTS.md` records every preprod transaction: steps 1–3 exercise the validator,
 step 4 the ADA binding end to end, step 5 a token binding, step 6 top-ups and the automatic
-settle after a consumer's close, step 7 a client that folds its token UTxOs.
+settle after a consumer's close, step 7 a client that folds its token UTxOs, step 8 recovery
+after state loss.
 
 ## Version history
 
@@ -508,3 +544,4 @@ settle after a consumer's close, step 7 a client that folds its token UTxOs.
 |---|---|---|
 | 0.1 | 2026-09-24 | First draft, from the reference implementation and preprod runs |
 | 0.2 | 2026-09-24 | Top-ups (`Add`) and their verification; the server watches its channels and settles a closed one; a voucher above the recorded balance is checked against the chain; token outputs are folded, by the server and the client |
+| 0.3 | 2026-09-24 | IOU keys derived from the wallet; recovery after state loss, for the client and the server |

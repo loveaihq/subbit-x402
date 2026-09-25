@@ -33,12 +33,23 @@ export const msOfSlot = (network: string, slot: bigint) => Time.slotToUnixTime(s
 /** The slot containing a Unix ms time; the SDK floors validity bounds the same way. */
 export const slotOfMs = (network: string, ms: bigint) => Time.unixTimeToSlot(ms, SLOTS[network as CardanoNetwork]);
 
+/** The first slot starting at or after `ms`: a lower validity bound the script sees as ≥ `ms`. */
+export const slotAtOrAfter = (network: string, ms: bigint) => {
+  const s = slotOfMs(network, ms);
+  return msOfSlot(network, s) < ms ? s + 1n : s;
+};
+
 /** `lovelace` or `<policyId>.<assetNameHex>`, as Cardano `exact`. */
 export function currencyOf(asset: string): Currency {
   if (asset === LOVELACE) return { kind: "ada" };
   const m = /^([0-9a-f]{56})\.([0-9a-f]{0,64})$/.exec(asset);
   if (!m) throw new Error(`not a Cardano asset id: ${asset}`);
   return { kind: "asset", policy: m[1]!, name: m[2]! };
+}
+
+/** A currency's x402 asset id: the inverse of `currencyOf`. */
+export function assetOf(c: Currency): string {
+  return c.kind === "ada" ? LOVELACE : `${c.policy}.${c.name}`;
 }
 
 export function constantsOf(config: ChannelConfig, tag: string): Constants {

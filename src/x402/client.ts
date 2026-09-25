@@ -1,8 +1,9 @@
 // The client side of the Cardano binding (DESIGN.md §5–§6): opens a Subbit channel with the first
 // paid request, signs a cumulative IOU for each one after it, keeps its count in step with the
 // server's responses (and the corrective 402), and closes the channel cooperatively with a
-// `Mutual` refund. It builds and signs every transaction itself and pays their fees.
-import { createPrivateKey, sign as edSign } from "node:crypto";
+// `Mutual` refund. It builds and signs every transaction itself and pays their fees. Its IOU keys
+// derive from the wallet, so after losing its records it finds its channels again (`recover`).
+import { createPrivateKey, hkdfSync, sign as edSign } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
@@ -16,8 +17,9 @@ import type {
 } from "@x402/core/types";
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
 import { Address, Assets, Client, InlineDatum, KeyHash, ScriptHash, Transaction, TransactionHash, TransactionInput, TransactionWitnessSet, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
-import { Redeemer, Step, channelAddress, iouBody, inlineDatum, newIouSigner, subbitScript, tagFromInput, type Currency } from "../subbit.ts";
+import { Redeemer, Step, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, subbitScript, tagFromInput, type Currency } from "../subbit.ts";
 import {
+  assetOf,
   capacityOf,
   channelReserve,
   constantsOf,
@@ -26,7 +28,9 @@ import {
   networkIdOf,
   planTokens,
   refOf,
+  slotAtOrAfter,
   slotOfMs,
+  subbedOf,
   txHashOf,
   valueFor,
   verifyVoucherSignature,
@@ -63,7 +67,7 @@ export interface ClientChannel {
   deposit: string;
   balance: string;
   chargedCumulativeAmount: string;
-  /** `failed`: the opening transaction never reached the chain. `closing`: closed on chain by this client, not yet ended. */
+  /** `failed`: the opening transaction never reached the chain. `closing`: closed on chain, not yet ended or elapsed. */
   status: "pending" | "open" | "closing" | "closed" | "failed";
   openTx?: string;
   /** Position of the channel output in the opening transaction, and the inputs it spends. */
@@ -74,8 +78,14 @@ export interface ClientChannel {
   network?: string;
   scriptHash?: string;
   referenceScript?: string;
-  /** Set once this client has closed the channel on its own. */
+  /** Set once the channel is closed on chain. */
   elapseAt?: string;
+  /** How its IOU key was made: derived from the wallet, so `recover` can make it again, or random. */
+  iouKey?: "derived" | "random";
+  /** When `recover` found it on chain. Until a 402 binds it to a server, `serverKey` and `channelConfig.receiver` are empty. */
+  recoveredAt?: number;
+  /** Found by `recover` with an IOU key this wallet cannot derive: it can only be closed, then ended or elapsed. */
+  exitOnly?: boolean;
 }
 
 /** `{dir}/{channelId}.json`. The throwaway IOU keys live here, so the directory stays out of git. */
@@ -114,6 +124,13 @@ export interface ClientOptions {
   maxDeposit?: bigint;
   /** Shared by every client instance on one wallet: inputs their transactions just spent, and when. */
   spentInputs?: Map<string, number>;
+  /**
+   * How IOU keys are made. `derived` (the default): from the channel's tag and the wallet's
+   * signature of `IOU_ROOT_MESSAGE`, so a client that has lost its records derives them again
+   * and keeps using its channels. `random`: a fresh key per channel, kept only in the records;
+   * such a channel, once its record is lost, can only be closed.
+   */
+  iouKeys?: "derived" | "random";
 }
 
 /** How long spent inputs are held back from coin selection. */
@@ -124,6 +141,8 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   readonly schemeHooks: SchemeClientHooks;
   /** Inputs spent recently, kept out of coin selection until the wallet's view drops them. */
   private readonly spent: Map<string, number>;
+  /** The wallet's IOU root, asked for once. */
+  private root?: Promise<Uint8Array>;
 
   constructor(private readonly o: ClientOptions) {
     this.spent = o.spentInputs ?? new Map<string, number>();
@@ -142,7 +161,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     currencyOf(req.asset); // lovelace or policy.name, else throws
     const extra = parseExtra(req);
     const amount = BigInt(req.amount);
-    let ch = await this.o.storage.current(serverKey(req, extra));
+    let ch = (await this.o.storage.current(serverKey(req, extra))) ?? (await this.bindRecovered(req, extra));
     if (ch?.status === "pending") ch = await this.settlePending(ch, extra);
     if (ch?.status === "open") {
       const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
@@ -228,15 +247,6 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const w = this.o.wallet;
     const me = await w.address();
     const payer = keyHash(me);
-    const signer = newIouSigner();
-    const config: ChannelConfig = {
-      payer,
-      payerAuthorizer: signer.publicKey,
-      receiver: req.payTo,
-      receiverAuthorizer: extra.receiverAuthorizer,
-      token: req.asset,
-      withdrawDelay: extra.withdrawDelay,
-    };
     const cur = currencyOf(req.asset);
     const floor = [this.o.capacity ?? 0n, extra.minDeposit ? BigInt(extra.minDeposit) : 0n, 10n * amount].reduce((a, b) => (a > b ? a : b));
     const all = await this.available();
@@ -250,6 +260,16 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     if (!seed) throw new Error(`no UTxO to open a ${req.asset} channel from`);
     // The tag must be unique per IOU key; Subbit's ADR: hash an input this transaction spends.
     const tag = tagFromInput(new TransactionInput.TransactionInput({ transactionId: seed.transactionId, index: seed.index }));
+    const random = this.o.iouKeys === "random";
+    const signer = random ? newIouSigner() : derivedIouSigner(await this.iouRoot(), req.network, tag);
+    const config: ChannelConfig = {
+      payer,
+      payerAuthorizer: signer.publicKey,
+      receiver: req.payTo,
+      receiverAuthorizer: extra.receiverAuthorizer,
+      token: req.asset,
+      withdrawDelay: extra.withdrawDelay,
+    };
     const constants = constantsOf(config, tag);
     const address = channelAddress(networkIdOf(req.network));
     if (ScriptHash.toHex(address.paymentCredential as ScriptHash.ScriptHash) !== extra.scriptHash) throw new Error("server asks for a validator this client does not have");
@@ -278,6 +298,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       serverKey: serverKey(req, extra),
       channelConfig: config,
       iouPrivateKeyPem: signer.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      iouKey: random ? "random" : "derived",
       deposit: deposit.toString(),
       balance: floor.toString(),
       chargedCumulativeAmount: "0",
@@ -363,8 +384,9 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const req = pr.accepts.find((a) => a.scheme === SCHEME);
     if (!req) throw new Error(`no ${SCHEME} option at ${url}`);
     const extra = parseExtra(req);
-    const ch = channelId ? await this.o.storage.get(channelId) : await this.o.storage.current(serverKey(req, extra));
-    if (!ch || ch.status !== "open" || !ch.channelRef) throw new Error("no open channel with this server");
+    let ch = channelId ? await this.o.storage.get(channelId) : ((await this.o.storage.current(serverKey(req, extra))) ?? (await this.bindRecovered(req, extra)));
+    if (ch && ch.status === "open" && this.bindable(ch, req, extra)) ch = await this.bind(ch, req, extra);
+    if (!ch || ch.status !== "open" || !ch.channelRef || ch.serverKey !== serverKey(req, extra)) throw new Error("no open channel with this server");
     const view = await this.o.chain.followChannel(ch.channelRef, extra.scriptHash, ch.channelId);
     if (!view || view.datum.stage.kind !== "opened") throw new Error("the channel is not open on chain");
     const charged = BigInt(ch.chargedCumulativeAmount);
@@ -450,6 +472,122 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     return transaction;
   }
 
+  /**
+   * After `elapse_at`, when the server has not settled: `Main([Elapse])` takes everything back
+   * without it. The lower validity bound is the first slot starting at or after `elapse_at`; a
+   * node refuses the transaction until the chain has reached that slot, so this waits for it.
+   */
+  async elapse(channelId: string): Promise<string> {
+    const { ch, view, network } = await this.openView(channelId);
+    const stage = view.datum.stage;
+    if (stage.kind !== "closed") throw new Error(`channel is ${stage.kind}, not closed`);
+    const from = slotAtOrAfter(network, stage.elapseAt);
+    for (let tip = await this.o.chain.tipSlot(); tip < from; tip = await this.o.chain.tipSlot()) {
+      await new Promise((r) => setTimeout(r, Math.min(60_000, Number(from - tip) * 1_000 + 5_000)));
+    }
+    let tx = this.o.wallet.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.elapse()]) });
+    tx = await this.withValidator(tx, ch.referenceScript);
+    tx = tx.addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) }).setValidity({ from: msOfSlot(network, from) });
+    const c = view.datum.constants.currency;
+    if (c.kind !== "ada") tx = withTokens(tx, await this.o.wallet.address(), c, planTokens(await this.available(), c, 0n, view.amount));
+    const transaction = await this.submitOwn("elapse", tx);
+    await this.o.storage.set({ ...ch, status: "closed" });
+    return transaction;
+  }
+
+  // ---- after losing the records ----------------------------------------------------
+
+  /**
+   * Finds this wallet's channels at the validator's address and records each one it has no
+   * record of, at its current position. A channel whose IOU key this wallet derives again is
+   * usable: the next 402 from a server on its terms binds it (`bindRecovered`), and its count
+   * comes back through the corrective 402, which adopts only a count the server proves with a
+   * voucher of this key. Any other channel is exit-only: `close`, then `end` once the server has
+   * settled, or `elapse` after `elapse_at`. Only the address without a stake credential is
+   * searched: that is where this client opens channels.
+   */
+  async recover(network: string, scriptHash: string): Promise<ClientChannel[]> {
+    const me = keyHash(await this.o.wallet.address());
+    const known = new Set((await this.o.storage.list()).map((c) => c.channelId));
+    const cpb = await this.o.chain.coinsPerUtxoByte();
+    const found: ClientChannel[] = [];
+    for (const seen of await this.o.chain.channels(scriptHash)) {
+      const d = seen.datum.constants;
+      if (d.consumer !== me || known.has(d.tag)) continue;
+      known.add(d.tag);
+      // The address index can trail the chain: take the channel from where it stands now.
+      const v = await this.o.chain.followChannel(seen.ref, scriptHash, d.tag);
+      if (!v) continue;
+      const signer = this.o.iouKeys === "random" ? undefined : derivedIouSigner(await this.iouRoot(), network, d.tag);
+      const usable = signer !== undefined && signer.publicKey === d.iouKey;
+      const stage = v.datum.stage;
+      const subbed = subbedOf(stage);
+      const ch: ClientChannel = {
+        channelId: d.tag,
+        serverKey: "",
+        channelConfig: { payer: me, payerAuthorizer: d.iouKey, receiver: "", receiverAuthorizer: d.provider, token: assetOf(d.currency), withdrawDelay: Number(d.closePeriodMs / 1000n) },
+        iouPrivateKeyPem: usable ? signer.privateKey.export({ type: "pkcs8", format: "pem" }).toString() : "",
+        channelRef: v.ref,
+        // Everything put in so far: what the server has redeemed plus what the channel holds.
+        deposit: (subbed + v.amount).toString(),
+        balance: capacityOf(v, cpb).toString(),
+        // The chain's lower bound; the server's own count comes back with the corrective 402.
+        chargedCumulativeAmount: subbed.toString(),
+        status: stage.kind === "opened" ? "open" : "closing",
+        openedAt: 0,
+        network,
+        scriptHash,
+        ...(stage.kind === "closed" ? { elapseAt: stage.elapseAt.toString() } : {}),
+        ...(usable ? { iouKey: "derived" as const } : { exitOnly: true }),
+        recoveredAt: Date.now(),
+      };
+      await this.o.storage.set(ch);
+      found.push(ch);
+    }
+    return found;
+  }
+
+  /**
+   * A recovered channel not yet bound to a server, on this server's terms, bound to it: the one
+   * with most room left. The 402 supplies the one config field the chain does not hold, the
+   * receiver address, so the config matches the server's record of the channel again.
+   */
+  private async bindRecovered(req: PaymentRequirements, extra: BatchExtra): Promise<ClientChannel | undefined> {
+    const room = (c: ClientChannel) => BigInt(c.balance) - BigInt(c.chargedCumulativeAmount);
+    const fits = (await this.o.storage.list()).filter((c) => c.status === "open" && this.bindable(c, req, extra));
+    const best = fits.sort((a, b) => (room(b) > room(a) ? 1 : room(b) < room(a) ? -1 : 0))[0];
+    return best ? this.bind(best, req, extra) : undefined;
+  }
+
+  private bindable(c: ClientChannel, req: PaymentRequirements, extra: BatchExtra): boolean {
+    const k = c.channelConfig;
+    return (
+      c.serverKey === "" &&
+      !c.exitOnly &&
+      c.network === req.network &&
+      c.scriptHash === extra.scriptHash &&
+      k.receiverAuthorizer === extra.receiverAuthorizer &&
+      k.token === req.asset &&
+      k.withdrawDelay === extra.withdrawDelay
+    );
+  }
+
+  private async bind(c: ClientChannel, req: PaymentRequirements, extra: BatchExtra): Promise<ClientChannel> {
+    const bound: ClientChannel = {
+      ...c,
+      serverKey: serverKey(req, extra),
+      channelConfig: { ...c.channelConfig, receiver: req.payTo },
+      ...(extra.referenceScript ? { referenceScript: extra.referenceScript } : {}),
+    };
+    await this.o.storage.set(bound);
+    return bound;
+  }
+
+  /** The wallet's IOU root, asked for once per client. */
+  private iouRoot(): Promise<Uint8Array> {
+    return (this.root ??= iouRootOf(this.o.wallet));
+  }
+
   /** The channel as it stands on chain, for this client's own exit. */
   async openView(channelId: string) {
     const ch = await this.o.storage.get(channelId);
@@ -484,6 +622,36 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
 }
 
 // ---- helpers -------------------------------------------------------------
+
+/**
+ * What a wallet signs, once, for its IOU keys (CIP-8 `signData` with its payment key). Whoever
+ * holds that signature can derive the IOU key of every channel the wallet opens, so a wallet must
+ * sign this message for its own x402 client and nothing else.
+ */
+export const IOU_ROOT_MESSAGE =
+  "x402 batch-settlement on Cardano, IOU keys v1. Sign this only for your own x402 client: this signature derives the keys that authorize payments from your channels.";
+
+/**
+ * The root of a wallet's IOU keys: HKDF-SHA256 over the Ed25519 signature inside the wallet's
+ * COSE_Sign1 of `IOU_ROOT_MESSAGE`. Ed25519 is deterministic, so the same wallet software
+ * gives the same root every time; another wallet that encodes the COSE headers differently
+ * would not, and its channels would come back exit-only.
+ */
+export async function iouRootOf(wallet: Pick<SeedWallet, "address" | "signMessage">): Promise<Uint8Array> {
+  const { signature } = await wallet.signMessage(await wallet.address(), new TextEncoder().encode(IOU_ROOT_MESSAGE));
+  // The SDK's seed wallet answers the COSE_Sign1 as hex; the type says bytes.
+  const s = signature as unknown as string | Uint8Array;
+  const cose = typeof s === "string" ? Buffer.from(s, "hex") : Buffer.from(s);
+  // A COSE_Sign1 ends with its signature, a 64-byte byte string: 0x58 0x40, then the 64 bytes.
+  const n = cose.length;
+  if (n < 66 || cose[n - 66] !== 0x58 || cose[n - 65] !== 0x40) throw new Error("the wallet's signature is not a COSE_Sign1 ending in an Ed25519 signature");
+  return new Uint8Array(hkdfSync("sha256", cose.subarray(n - 64), "x402 batch-settlement cardano", "iou root v1", 32));
+}
+
+/** A channel's IOU signer: its seed is HKDF-SHA256 of the wallet's IOU root, the network and the channel's tag. */
+export function derivedIouSigner(root: Uint8Array, network: string, tag: string) {
+  return iouSignerFromSeed(new Uint8Array(hkdfSync("sha256", root, "x402 batch-settlement cardano", `iou key v1 ${network} ${tag}`, 32)));
+}
 
 /** `planTokens`' side of a transaction: its inputs, and one output at `me` of what goes back. */
 function withTokens<T extends ReturnType<SeedWallet["newTx"]>>(tx: T, me: Address.Address, c: Currency, plan: { inputs: UTxO.UTxO[]; rest: bigint }): T {

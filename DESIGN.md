@@ -216,7 +216,8 @@ Scope: ADA channels, reading the reference script; `deposit` (open), `voucher`, 
 batched `claim`, cooperative `refund`. Deferred: top-up by `Add`, the manager's automatic settle
 after a unilateral close, token channels (USDM), provider-key delegation, the upstream spec text.
 Since done (RESULTS.md): token channels in step 5, the spec draft
-(`specs/scheme_batch_settlement_cardano.md`), top-ups and the automatic settle in step 6.
+(`specs/scheme_batch_settlement_cardano.md`), top-ups and the automatic settle in step 6, token
+UTxO folding in step 7, recovery after state loss (IOU keys derived from the wallet) in step 8.
 
 Code, in this repo:
 - `src/x402/`: shared types and checks; client scheme (`SchemeNetworkClient`); server scheme

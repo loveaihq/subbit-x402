@@ -2,8 +2,8 @@
 // behind one interface so the checks can run on fixtures. The Blockfrost implementation reads
 // UTxOs through the SDK (it resolves datums and reference scripts) and submits the exact bytes
 // it was given, never a re-encoding, so the signatures on them stay valid.
-import { Client, Transaction, TransactionHash, TransactionInput, preprod, type UTxO } from "@evolution-sdk/evolution";
-import { readChannel, refOf, type ChannelView } from "./cardano.ts";
+import { Address, Client, ScriptHash, Transaction, TransactionHash, TransactionInput, preprod, type UTxO } from "@evolution-sdk/evolution";
+import { networkIdOf, readChannel, refOf, type ChannelView } from "./cardano.ts";
 import type { CardanoNetwork } from "./types.ts";
 
 export interface Chain {
@@ -24,6 +24,10 @@ export interface Chain {
   awaitTx(txHash: string, timeoutMs: number): Promise<boolean>;
   /** Runs every script through the evaluator; throws when one fails. */
   evaluate(cborHex: string, additionalUtxos?: UTxO.UTxO[]): Promise<void>;
+  /** Every channel of this script at its address without a stake credential, as listed now. */
+  channels(scriptHash: string): Promise<ChannelView[]>;
+  /** The slot of the latest block. */
+  tipSlot(): Promise<bigint>;
 }
 
 interface BfOutput {
@@ -126,6 +130,21 @@ export class BlockfrostChain implements Chain {
 
   async evaluate(cborHex: string, additionalUtxos?: UTxO.UTxO[]): Promise<void> {
     await this.provider.evaluateTx(Transaction.fromCBORHex(cborHex), additionalUtxos);
+  }
+
+  async channels(scriptHash: string): Promise<ChannelView[]> {
+    const address = new Address.Address({ networkId: networkIdOf(this.network), paymentCredential: ScriptHash.fromHex(scriptHash) });
+    const utxos = await retryQueries("channels", () => this.provider.getUtxos(address));
+    return utxos.flatMap((u) => {
+      const ch = readChannel(u, scriptHash);
+      return "error" in ch ? [] : [ch];
+    });
+  }
+
+  async tipSlot(): Promise<bigint> {
+    const r = await fetch(`${this.baseUrl}/blocks/latest`, { headers: { project_id: this.projectId } });
+    if (!r.ok) throw new Error(`Blockfrost /blocks/latest: ${r.status}`);
+    return BigInt(((await r.json()) as { slot: number }).slot);
   }
 
   /** A transaction's outputs with their spent-by field, or undefined if Blockfrost does not know it. */

@@ -2,7 +2,7 @@
 // redeemer and IOU encodings its validator checks, and the checks a provider
 // must make itself because opening a channel runs no validator.
 import { readFileSync } from "node:fs";
-import { createPublicKey, generateKeyPairSync, sign, verify, type KeyObject } from "node:crypto";
+import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify, type KeyObject } from "node:crypto";
 import { blake2b } from "@noble/hashes/blake2.js";
 import { Address, Data, InlineDatum, KeyHash, PlutusV3, ScriptHash, TransactionInput } from "@evolution-sdk/evolution";
 
@@ -175,6 +175,20 @@ export interface IouSigner {
 export function newIouSigner(): IouSigner & { readonly privateKey: KeyObject } {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const raw = publicKey.export({ format: "der", type: "spki" }).subarray(-32);
+  return {
+    publicKey: Buffer.from(raw).toString("hex"),
+    privateKey,
+    sign: (tag, amount) => sign(null, iouBody(tag, amount), privateKey).toString("hex"),
+  };
+}
+
+const PKCS8_ED25519 = Buffer.from("302e020100300506032b657004220420", "hex");
+
+/** The IOU signer whose private key is this 32-byte Ed25519 seed (RFC 8032). */
+export function iouSignerFromSeed(seed: Uint8Array): IouSigner & { readonly privateKey: KeyObject } {
+  if (seed.length !== 32) throw new Error("an Ed25519 seed is 32 bytes");
+  const privateKey = createPrivateKey({ key: Buffer.concat([PKCS8_ED25519, seed]), format: "der", type: "pkcs8" });
+  const raw = createPublicKey(privateKey).export({ format: "der", type: "spki" }).subarray(-32);
   return {
     publicKey: Buffer.from(raw).toString("hex"),
     privateKey,

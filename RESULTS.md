@@ -501,6 +501,53 @@ largest ADA-only UTxO shrinks by the claims' fees, which it earns back only in s
 two lost 2.181614 tADA, exactly the fees of the 9 transactions. sUSDM: consumer 999,996.706 →
 999,996.679, provider 3.294 → 3.321, nothing left in channels, so none created or lost.
 
+## Step 8: finding the channels again after losing the records
+
+A client's records hold three things about each channel that the chain does not: which server it
+pays, the count, and the IOU key. The first comes back with the server's next 402 and the second
+with a corrective 402, but a random IOU key, kept only in the records, was gone for good: such a
+client could still leave its channels, never pay from them again. So the key now derives from the
+wallet (spec, *IOUs*): the wallet signs one fixed message once with its payment key (CIP-8), and
+each channel's key comes from that signature, the network and the channel's tag, by HKDF-SHA256.
+`recover()` lists the validator's address, keeps the channels whose datum names this wallet as
+consumer, follows each to where it stands, and derives its key again. Where the key matches the
+datum's, the channel is usable: the next 402 on its terms supplies the one config field the chain
+lacks, the server's address, and binds it. Any other channel can only be left, which `close`,
+`end` and now `elapse` do without the server. In tADA, state in `out/x402-step8/`:
+
+| Channel | Step | Transaction | Result |
+|---|---|---|---|
+| A, derived key | request 1 | `8418c08505da59a96c20b10e45630b5b3dbc8df5c8e4d2dd0bab233d614c97ec` | opens with room for 20 requests |
+| | claim | `d71598b6c5b007081c78473e304a575315653277d574c30f402d1313b1d3c72c` | after request 8, 0.008 tADA; 4 more requests, the server counts 12,000 |
+| | — | — | the client's records deleted; `recover` finds the channel and derives its key again: count 8,000 from the chain, room for 20 |
+| | request 13 | none | binds the channel. Its voucher for 9,000 meets a corrective 402 carrying the server's voucher for 12,000, which verifies under the recovered key; the retry for 13,000 is served. 3 HTTP calls; both sides count 13,000 |
+| | claim | `35102a76d60ac4fca80071f3d3f87fb0ca370a3015e5881a724c51386416d90e` | after 2 more requests, 0.007 tADA |
+| | refund | `86c1821c08a10d0639a92b9f00696b11648b9f8c05fd864e55b2f66fdb0533fe` | `Mutual`, 1.505075 tADA back |
+| B, random key | request 1 | `cb2ed4ad37413248497a16df4bad1d76fc3a71eb035d1b392d88c566dc562d9d` | 6 requests paid |
+| | — | — | the client's records deleted; `recover` finds the channel, but its key does not derive from the wallet: exit-only |
+| | close | `802d927b916a10dca301fd80287e60199fd9ca136bb920d85d5801cbc924b870` | the consumer alone |
+| | settle | `e520f229d8f24fb40773855bf84337228576780c42654df399ecc6b316156532` | the server's watcher, 0.006 tADA |
+| | end | `a417c4a0b998658d85fd0566e95abbd636c3e5a3b2eeff6bfb68bb7ae93f802a` | the rest back |
+| C, both sides lose their records | request 1 | `e2f743018262bbf3bcc35d5cc3f491c76be74fbcf5b5d825039c4e735138c13d` | 3 requests paid |
+| | — | — | the server's record deleted, then the client's; `recover` finds the channel |
+| | close | `ee9e7a988d09be5a6ad8555f6a4be3457677e4aa1f5d481a74de4ff06fbb0434` | `elapse_at` 14:16:45Z |
+| | elapse | `26e04c8e7150cad07b7764e58b1502b9fbfe0fc28d7d07dc115e8e4a8ea0fe07` | in a block 27 s after `elapse_at`, no server signature: all 1.752620 tADA back, the 3 requests never redeemed |
+
+The corrective 402 does the whole resync: the client adopts the server's count only because the
+server shows a voucher of this very key for that much, the rule it already applied (step 4). A
+server that loses its records loses the charges it had not redeemed (C's 3 requests); with the
+client still around, the client's next voucher, being cumulative, rebuilds the server's record and
+count from there on (a chain-free test runs that through the server's hooks; not run on chain).
+
+The exits of B and C cost more than step 6's: close 0.336818 tADA (3,760 B), end 0.317761
+(3,488 B), elapse 0.318615 (3,494 B), against 0.250013 and 0.230954 there. A recovered channel
+not yet bound to a server does not know the server's reference script, which only a 402 names,
+so its transactions carry the validator inline, 0.087 tADA more each. The rest cost what they did
+before: open 0.175005, claim 0.256727–0.256807, refund 0.232545.
+
+**Reconciliation.** Consumer 70.179634 → 68.091062, provider 16.016461 → 15.267197 tADA; the two
+lost 2.837836 tADA, exactly the fees of the 11 transactions.
+
 ## What this does not show yet
 
 - The real tUSDM. The stand-in has its shape and takes the same code paths; only the asset id
@@ -508,6 +555,8 @@ two lost 2.181614 tADA, exactly the fees of the 9 transactions. sUSDM: consumer 
 - The facilitator holding the provider key for servers that run none (DESIGN.md §8).
 - The watcher at scale: each pass reads every channel the server holds, two or three Blockfrost
   queries each. With many channels a server would follow the chain rather than poll it.
+- Recovery in a token currency: step 8 ran in tADA. `elapse` has not run on a token channel; its
+  token handling is `end`'s, which step 7 ran.
 
 ## Notes for the binding spec
 
@@ -569,6 +618,14 @@ two lost 2.181614 tADA, exactly the fees of the 9 transactions. sUSDM: consumer 
 - Every script transaction needs an ADA-only UTxO for collateral, over about 2.2 tADA with the
   margins used here. Token outputs each keep a min-UTxO of ADA, so a party that makes a new one per
   transaction runs out; outputs of the same token should be folded together.
+- The only thing a client's records hold that the chain cannot give back is a channel's IOU key.
+  Derived from the wallet, losing the records costs one corrective 402: the chain gives the
+  channels and every config field but the server's address, the next 402 gives that, and the
+  server's own voucher, which the client checks against the recovered key, gives the count.
+- A channel the client cannot key again still returns everything the server has not redeemed,
+  and without the server `elapse` needs only the consumer's key and the close period.
+- A server that loses its records loses what it charged and did not redeem. Its count comes back
+  with the client's next voucher, which is cumulative, and runs on from there.
 
 ## Reproduce
 
@@ -599,6 +656,9 @@ SUBBIT_CURRENCY=token X402_OUT=x402-step6-token npm run x402 -- topup   # and au
 export SUBBIT_CURRENCY=token X402_OUT=x402-step7-token   # step 7: the same, with the client folding
 npm run x402 -- wallets before && npm run x402 -- topup && npm run x402 -- autosettle
 npm run x402 -- wallets after && npm run x402 -- report
+
+export X402_OUT=x402-step8   # step 8: recovery after losing the records (unset SUBBIT_CURRENCY)
+npm run x402 -- recover && npm run x402 -- recover-elapse && npm run x402 -- report   # ~30 min
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

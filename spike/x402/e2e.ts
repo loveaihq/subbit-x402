@@ -11,6 +11,9 @@
 //   batch-refund  close the 10 batch channels with Mutual
 //   topup       a channel with room for 10 requests serves 15: a claim after the 5th, a top-up (Add) at the 11th
 //   autosettle  the consumer closes a channel alone; the server's watcher settles it; the consumer ends it
+//   recover     after losing its records the client finds its channels again: one with a derived
+//               IOU key goes on serving; one with a random key can only be closed, settled and ended
+//   recover-elapse  both sides lose their records; the consumer closes and, ~20 min on, elapses
 //   wallets [label]  how each wallet's UTxOs are split, recorded under the label
 //   report      every transaction's fee, and the wallets reconciled
 //
@@ -65,7 +68,8 @@ interface Results {
   deposits?: Array<{ channelId: string; transaction: string }>;
   topUps?: Array<{ channelId: string; transaction: string; ms: number; httpCalls: number; capacityBefore: string; capacityAfter: string }>;
   /** The consumer's own transactions outside x402. */
-  exits?: Array<{ what: "close" | "end"; channelId: string; transaction: string }>;
+  exits?: Array<{ what: "close" | "end" | "elapse"; channelId: string; transaction: string }>;
+  recoveries?: Array<{ channel: string; channelId: string; status: string; exitOnly: boolean; charged: string; balance: string; httpCalls?: number }>;
   autosettle?: { channelId: string; close: string; settle: string; end: string; closeToSettleSec: number; settleBeforeElapseSec: number; watchIntervalMs: number };
   checks?: Array<{ phase: string; what: string; outcome: string }>;
   /** Wallet housekeeping during the run (a `mint -- tidy`), so the report counts its fee. */
@@ -174,9 +178,9 @@ async function stack() {
 type Stack = Awaited<ReturnType<typeof stack>>;
 
 /** A paying client with its own channel store, counting the HTTP calls it makes. */
-function payer(storageDir: string, capacity: bigint, spent = spentInputs) {
+function payer(storageDir: string, capacity: bigint, spent = spentInputs, iouKeys: "derived" | "random" = "derived") {
   const storage = new FileClientStorage(dir(storageDir));
-  const scheme = new BatchSettlementCardanoClient({ wallet: consumer, storage, chain, capacity, maxDeposit: 20_000_000n, spentInputs: spent });
+  const scheme = new BatchSettlementCardanoClient({ wallet: consumer, storage, chain, capacity, maxDeposit: 20_000_000n, spentInputs: spent, iouKeys });
   const client = x402Client.fromConfig({ schemes: [{ network: "cardano:*", client: scheme }], spendControls: false });
   let calls = 0;
   const counting: typeof fetch = (input, init) => {
@@ -513,6 +517,122 @@ async function phaseWallets(label: string) {
   log(`wallets, ${label}: consumer ${fmt(shape.consumer)}; provider ${fmt(shape.provider)}`);
 }
 
+// ---- step 8: after losing the records -------------------------------------------------
+
+/** Opens a channel for `storageDir` and pays `n` requests on it, claiming after the `claimAt`-th. */
+async function payRun(s: Stack, p: ReturnType<typeof payer>, label: string, n: number, claimAt?: number): Promise<string> {
+  let id = "";
+  for (let i = 1; i <= n; i++) {
+    const settle = await paid(p);
+    if (i === 1) {
+      id = (settle.extra?.channelState as { channelId: string }).channelId;
+      record((r) => (r.deposits ??= []).push({ channelId: id, transaction: settle.transaction }));
+      log(`${label}: request 1 opened channel ${id.slice(0, 16)}… in ${settle.transaction}`);
+    }
+    if (i === claimAt) await phaseClaim(s, `${label}: claim`, { channelIds: [id] });
+  }
+  return id;
+}
+
+/** Deletes a client's records, then has a fresh client with no records find its channels on chain. */
+async function loseAndRecover(label: string, storageDir: string, channelId: string) {
+  rmSync(dir(storageDir), { recursive: true, force: true });
+  log(`${label}: the client's records are gone`);
+  const p = payer(storageDir, 20n * PRICE);
+  const found = await p.scheme.recover(NETWORK, SUBBIT_HASH);
+  for (const c of found) {
+    log(`${label}: recovered ${c.channelId.slice(0, 16)}… ${c.status}${c.exitOnly ? ", exit-only (its IOU key does not derive from this wallet)" : ", IOU key derived again"}; count ${c.chargedCumulativeAmount} from the chain, room for ${BigInt(c.balance) / PRICE} requests`);
+  }
+  const mine = found.find((c) => c.channelId === channelId);
+  if (!mine) throw new Error(`${label}: channel ${channelId.slice(0, 16)}… not recovered`);
+  record((r) =>
+    (r.recoveries ??= []).push({ channel: label, channelId, status: mine.status, exitOnly: Boolean(mine.exitOnly), charged: mine.chargedCumulativeAmount, balance: mine.balance }),
+  );
+  return { p, mine };
+}
+
+/**
+ * A: a channel with a derived IOU key serves 12 requests, the first 8 claimed, and the client
+ * loses its records. `recover` finds the channel on chain and derives its key again; the next
+ * request binds it to the server, and the corrective 402 brings the server's count back, proved by
+ * a voucher of that key. The channel serves on until a refund closes it.
+ * B: a channel with a random IOU key serves 6 requests, and the client loses its records. It comes
+ * back exit-only: the consumer closes it, the server's watcher settles it, the consumer ends it.
+ */
+async function phaseRecover(s: Stack) {
+  const before = await walletsAda();
+  record((r) => (r.before ??= before));
+
+  const aId = await payRun(s, payer("recover-a", 20n * PRICE), "recover A", 12, 8);
+  const held = (await s.storage.get(aId))!;
+  log(`recover A: 12 requests, 8 claimed; the server counts ${held.chargedCumulativeAmount}`);
+  const { p: a, mine: ra } = await loseAndRecover("recover A", "recover-a", aId);
+  expectEq("A comes back usable", Boolean(ra.exitOnly), false);
+  a.reset();
+  await paid(a);
+  const calls = a.calls();
+  const [client, server] = [(await a.storage.get(aId))!, (await s.storage.get(aId))!];
+  log(`recover A: the next request bound the channel and took ${calls} HTTP calls (a corrective 402); counts client ${client.chargedCumulativeAmount} / server ${server.chargedCumulativeAmount}`);
+  expectEq("client and server count the same 13 requests", client.chargedCumulativeAmount, server.chargedCumulativeAmount);
+  record((r) => {
+    const x = r.recoveries!.find((y) => y.channelId === aId)!;
+    x.httpCalls = calls;
+  });
+  for (let i = 0; i < 2; i++) await paid(a);
+  await phaseRefund(s, "recover-a");
+
+  const bId = await payRun(s, payer("recover-b", 20n * PRICE, spentInputs, "random"), "recover B", 6);
+  const { p: b, mine: rb } = await loseAndRecover("recover B", "recover-b", bId);
+  expectEq("B comes back exit-only", Boolean(rb.exitOnly), true);
+  const got: { settled?: ClaimResult } = {};
+  const watcher = s.manager.watch({
+    intervalMs: 15_000,
+    onEvent: (e) => {
+      if (e.kind === "settled") got.settled ??= e.results.find((x) => x.channels.some((c) => c.channelId === bId));
+      if (e.kind === "error") log(`recover B: watcher: a pass failed, the next one retries: ${String((e.error as Error)?.message ?? e.error).slice(0, 240)}`);
+    },
+  });
+  try {
+    const { transaction: close } = await b.scheme.close(bId);
+    record((r) => (r.exits ??= []).push({ what: "close", channelId: bId, transaction: close }));
+    log(`recover B: the consumer closed it in ${close}`);
+    const deadline = Date.now() + 12 * 60_000;
+    while (!got.settled && Date.now() < deadline) await new Promise((res) => setTimeout(res, 3_000));
+  } finally {
+    watcher.stop();
+  }
+  if (!got.settled) throw new Error("recover B: the watcher did not settle the channel within 12 minutes");
+  const settleTx = got.settled.transaction;
+  record((r) => (r.claims ??= []).push({ phase: "recover B: settle", n: got.settled!.channels.length, transaction: settleTx }));
+  log(`recover B: the server settled it in ${settleTx}, taking ${ada(got.settled.channels.find((c) => c.channelId === bId)!.taken)} ${unitName}`);
+  const end = await b.scheme.end(bId);
+  record((r) => (r.exits ??= []).push({ what: "end", channelId: bId, transaction: end }));
+  log(`recover B: the consumer ended it in ${end}`);
+}
+
+/**
+ * C: a channel serves 3 requests, and then both sides lose their records, as when the server is
+ * gone. The client recovers the channel, closes it, and once `elapse_at` has passed takes
+ * everything back with `elapse`, which needs nothing from the server. The close period is the
+ * binding's minimum, 900 s, so this takes about 20 minutes.
+ */
+async function phaseRecoverElapse(s: Stack) {
+  const before = await walletsAda();
+  record((r) => (r.before ??= before));
+  const cId = await payRun(s, payer("recover-c", 20n * PRICE), "recover C", 3);
+  await s.storage.updateChannel(cId, () => undefined);
+  log("recover C: the server's record is gone");
+  const { p: c } = await loseAndRecover("recover C", "recover-c", cId);
+  const { transaction: close, elapseAt } = await c.scheme.close(cId);
+  record((r) => (r.exits ??= []).push({ what: "close", channelId: cId, transaction: close }));
+  log(`recover C: the consumer closed it in ${close}; elapse_at ${iso(elapseAt)}`);
+  const { view } = await c.scheme.openView(cId);
+  const elapse = await c.scheme.elapse(cId);
+  record((r) => (r.exits ??= []).push({ what: "elapse", channelId: cId, transaction: elapse }));
+  const t = await bf(`/txs/${elapse}`);
+  log(`recover C: the consumer elapsed it in ${elapse}, in a block ${Number(t.block_time) - Number(elapseAt / 1000n)} s after elapse_at: all ${ada(view.amount)} ${unitName}${TOKEN ? ` and ${ada(view.lovelace)} tADA` : ""} back, the 3 requests never redeemed`);
+}
+
 /** The route's payment requirements, as its 402 states them. */
 async function requirements(): Promise<PaymentRequirements> {
   const res = await fetch(URL_DATA);
@@ -578,7 +698,7 @@ async function settledWallets() {
 async function openChannelValue(): Promise<{ lovelace: bigint; amount: bigint }> {
   let lovelace = 0n;
   let amount = 0n;
-  for (const d of ["client", "topup", "autosettle", ...Array.from({ length: 10 }, (_, i) => `batch/${i}`)]) {
+  for (const d of ["client", "topup", "autosettle", "recover-a", "recover-b", "recover-c", ...Array.from({ length: 10 }, (_, i) => `batch/${i}`)]) {
     if (!existsSync(dir(d))) continue;
     for (const c of await new FileClientStorage(dir(d)).list()) {
       if ((c.status !== "open" && c.status !== "closing") || !c.channelRef) continue;
@@ -648,6 +768,8 @@ async function main() {
     if (phase === "batch" || phase === "all") await phaseBatch(s);
     if (phase === "batch-refund" || phase === "all") await phaseBatchRefund(s);
     if (phase === "wallets") await phaseWallets(process.argv[3] ?? new Date().toISOString());
+    if (phase === "recover") await phaseRecover(s);
+    if (phase === "recover-elapse") await phaseRecoverElapse(s);
     if (phase === "topup") await phaseTopUp(s);
     if (phase === "autosettle") await phaseAutoSettle(s);
     if (phase === "report" || phase === "all") await phaseReport();

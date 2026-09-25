@@ -3,12 +3,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createPrivateKey, sign as edSign } from "node:crypto";
+import { createPrivateKey, createPublicKey, sign as edSign, verify as edVerify } from "node:crypto";
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
-import { Assets, TxOut, type UTxO } from "@evolution-sdk/evolution";
-import { SUBBIT_HASH, channelAddress, iouBody, inlineDatum, newIouSigner, parseDatum, datumData } from "../src/subbit.ts";
+import { Assets, Client, KeyHash, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
+import { SUBBIT_HASH, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, parseDatum, datumData, type Stage } from "../src/subbit.ts";
 import { capacityOf, channelReserve, constantsOf, datumBindingError, planTokens, type ChannelView } from "../src/x402/cardano.ts";
-import { BatchSettlementCardanoClient, FileClientStorage } from "../src/x402/client.ts";
+import type { Chain } from "../src/x402/chain.ts";
+import { BatchSettlementCardanoClient, FileClientStorage, derivedIouSigner, iouRootOf } from "../src/x402/client.ts";
 import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x402/server.ts";
 import { Err, PayloadError, configBindingError, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
 
@@ -153,6 +154,94 @@ test("the ADA reserve covers every continuing output the channel can have", () =
   }
 });
 
+// ---- IOU keys a wallet can derive again, and recovery -------------------------------------
+
+test("an IOU signer from a seed signs the test vector", () => {
+  assert.equal(
+    iouSignerFromSeed(new Uint8Array(32).fill(7)).sign(TAG, 203000n),
+    "d09aac1f109a70db6328acec3e83d01f9d894d6bab248b03e8689ac3818526582426262cbd8c14ec2d763696910748159405ff38ee3d049c1a3954ddfa073a08",
+  );
+});
+
+// The public all-zero-entropy test mnemonic; signing needs no network, so no provider is reached.
+const TEST_MNEMONIC = `${"abandon ".repeat(23)}art`;
+const testWallet = () => Client.make(preprod).withBlockfrost({ baseUrl: "http://127.0.0.1:9", projectId: "unused" }).withSeed({ mnemonic: TEST_MNEMONIC, accountIndex: 0 });
+
+test("IOU keys derive again from the wallet: the same root each time, a different key per tag and network", async () => {
+  const root = await iouRootOf(testWallet());
+  assert.deepEqual(await iouRootOf(testWallet()), root);
+  const k = derivedIouSigner(root, "cardano:preprod", TAG).publicKey;
+  assert.equal(derivedIouSigner(root, "cardano:preprod", TAG).publicKey, k);
+  assert.notEqual(derivedIouSigner(root, "cardano:preprod", "22".repeat(32)).publicKey, k);
+  assert.notEqual(derivedIouSigner(root, "cardano:mainnet", TAG).publicKey, k);
+  // Another account of the same mnemonic is another root.
+  const other = Client.make(preprod).withBlockfrost({ baseUrl: "http://127.0.0.1:9", projectId: "unused" }).withSeed({ mnemonic: TEST_MNEMONIC, accountIndex: 1 });
+  assert.notDeepEqual(await iouRootOf(other), root);
+});
+
+test("recover: this wallet's channels come back, usable when their IOU key derives again, and the next 402 binds one", async () => {
+  const wallet = testWallet();
+  const me = KeyHash.toHex((await wallet.address()).paymentCredential as KeyHash.KeyHash);
+  const root = await iouRootOf(wallet);
+  const address = channelAddress(0);
+  const view = (tag: string, consumer: string, iouKey: string, stage: Stage, held: bigint, i: number) =>
+    ({
+      ref: `${"ef".repeat(32)}#${i}`,
+      address,
+      lovelace: held,
+      amount: held,
+      datum: { ownHash: SUBBIT_HASH, constants: { ...constantsOf({ ...config, payer: consumer, payerAuthorizer: iouKey }, tag), consumer }, stage },
+    }) as unknown as ChannelView;
+  const reserve = channelReserve(address, constantsOf(config, TAG), 4310n);
+  const [a, b, c, d] = ["a1", "b2", "c3", "d4"].map((x) => x.repeat(32)) as [string, string, string, string];
+  const views = [
+    // Opened with a derived key: 8,000 redeemed, 12,000 of room left.
+    view(a, me, derivedIouSigner(root, "cardano:preprod", a).publicKey, { kind: "opened", subbed: 8_000n }, reserve + 12_000n, 0),
+    // A random key: only the exit is left.
+    view(b, me, newIouSigner().publicKey, { kind: "opened", subbed: 0n }, reserve + 5_000n, 1),
+    // Closed already, key derivable: it comes back closing, with its elapse_at.
+    view(c, me, derivedIouSigner(root, "cardano:preprod", c).publicKey, { kind: "closed", subbed: 0n, elapseAt: 1_790_000_000_000n }, reserve + 3_000n, 2),
+    // Someone else's.
+    view(d, "cd".repeat(28), newIouSigner().publicKey, { kind: "opened", subbed: 0n }, reserve + 9_000n, 3),
+  ];
+  const chain = {
+    network: "cardano:preprod",
+    channels: async () => views,
+    followChannel: async (ref: string) => views.find((v) => v.ref === ref),
+    coinsPerUtxoByte: async () => 4310n,
+  } as unknown as Chain;
+  const storage = new FileClientStorage(mkdtempSync(join(tmpdir(), "recover-")));
+  const client = new BatchSettlementCardanoClient({ wallet, storage, chain });
+
+  const found = await client.recover("cardano:preprod", SUBBIT_HASH);
+  assert.deepEqual(found.map((x) => [x.channelId.slice(0, 2), x.status, Boolean(x.exitOnly)]), [["a1", "open", false], ["b2", "open", true], ["c3", "closing", false]]);
+  const ra = found[0]!;
+  assert.equal(ra.balance, "20000");
+  assert.equal(ra.chargedCumulativeAmount, "8000");
+  assert.equal(ra.channelConfig.receiver, "");
+  assert.equal(found[2]!.elapseAt, "1790000000000");
+  // Running it again finds nothing new.
+  assert.equal((await client.recover("cardano:preprod", SUBBIT_HASH)).length, 0);
+
+  // The next 402 on this channel's terms binds it: the receiver comes from the 402, the count
+  // starts from what the chain shows redeemed (a corrective 402 brings the server's), and the
+  // IOU is this channel's key's.
+  const made = await client.createPaymentPayload(2, baseReq);
+  const p = parseClientPayload(made.payload);
+  assert.equal(p.type, "voucher");
+  assert.equal(p.voucher.channelId, a);
+  assert.equal(p.voucher.maxClaimableAmount, "9000");
+  assert.equal(p.channelConfig.receiver, PAY_TO);
+  assert.ok(iouVerifierOf(views[0]!)(a, 9000n, p.voucher.signature));
+  assert.equal((await storage.get(a))!.serverKey !== "", true);
+  assert.equal((await storage.get(b))!.serverKey, "");
+});
+
+const iouVerifierOf = (v: ChannelView) => (tag: string, amount: bigint, sig: string) => {
+  const key = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(v.datum.constants.iouKey, "hex")]), format: "der", type: "spki" });
+  return edVerify(null, iouBody(tag, amount), key, Buffer.from(sig, "hex"));
+};
+
 // ---- the server's count, through its real hooks -------------------------------------
 
 async function serverWithChannel(balance = 1_000_000n) {
@@ -231,6 +320,23 @@ test("server: vouchers past capacity, signed by another key, or on a closed chan
   assert.equal((await paidRequest(server, req, voucher(2000n))).reason, Err.cumulativeExceedsBalance);
   await storage.updateChannel(TAG, (c) => ({ ...c!, balance: "10000", withdrawRequestedAt: 1_790_000_000 }));
   assert.equal((await paidRequest(server, req, voucher(2000n))).reason, Err.channelClosed);
+});
+
+test("server: with no record of a channel, the next voucher rebuilds it, the count taken from that voucher", async () => {
+  const { server, storage, req } = await serverWithChannel();
+  await storage.updateChannel(TAG, () => undefined);
+  const paymentPayload = payloadFor(req, voucher(7000n));
+  const h = server.schemeHooks;
+  // No record, so nothing to verify locally: the facilitator reads the channel.
+  assert.equal(await h.onBeforeVerify!({ paymentPayload, requirements: req, declaredExtensions: {} } as never), undefined);
+  const result = { isValid: true, payer: config.payer, extra: { channelId: TAG, channelRef: `${"cd".repeat(32)}#0`, balance: "1000000", totalClaimed: "4000", withdrawRequestedAt: 0 } };
+  assert.equal(await h.onAfterVerify!({ paymentPayload, requirements: req, declaredExtensions: {}, result } as never), undefined);
+  const settle = (await h.onBeforeSettle!({ paymentPayload, requirements: req, declaredExtensions: {}, phase: "after-handler" } as never)) as { skip: true; result: { success: boolean } };
+  assert.equal(settle.result.success, true);
+  const rebuilt = (await storage.get(TAG))!;
+  assert.equal(rebuilt.chargedCumulativeAmount, "7000");
+  assert.equal(rebuilt.signedMaxClaimable, "7000");
+  assert.equal(rebuilt.totalClaimed, "4000");
 });
 
 test("server: one request per channel at a time", async () => {
