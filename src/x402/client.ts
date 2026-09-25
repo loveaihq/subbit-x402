@@ -3,8 +3,10 @@
 // server's responses (and the corrective 402), and closes the channel cooperatively with a
 // `Mutual` refund. It builds and signs every transaction itself and pays their fees. Its IOU keys
 // derive from the wallet, so after losing its records it finds its channels again (`recover`).
+// A wallet that decides what may leave it (a spend policy) sees each voucher and transaction
+// through `authorize` before anything is handed out or recorded.
 import { createPrivateKey, hkdfSync, sign as edSign } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type {
   PaymentPayload,
@@ -61,7 +63,12 @@ export interface ClientChannel {
   /** Which server (payTo, key, script, asset, close period) the channel is for. */
   serverKey: string;
   channelConfig: ChannelConfig;
-  iouPrivateKeyPem: string;
+  /**
+   * A random IOU key, which exists nowhere else. A derived one is not stored: it is derived again
+   * for each voucher, so a record on disk cannot sign one. (Records from before that change carry
+   * their derived key here too, and it is used.)
+   */
+  iouPrivateKeyPem?: string;
   channelRef?: string;
   /** Currency amount locked, and the capacity IOUs may reach. */
   deposit: string;
@@ -88,17 +95,31 @@ export interface ClientChannel {
   exitOnly?: boolean;
 }
 
-/** `{dir}/{channelId}.json`. The throwaway IOU keys live here, so the directory stays out of git. */
-export class FileClientStorage {
+/** Where a client keeps its channels. */
+export interface ClientStorage {
+  get(id: string): Promise<ClientChannel | undefined>;
+  set(c: ClientChannel): Promise<void>;
+  list(): Promise<ClientChannel[]>;
+  /** The newest channel for this server that is open or still opening. */
+  current(serverKey: string): Promise<ClientChannel | undefined>;
+}
+
+/**
+ * `{dir}/{channelId}.json`, owner-only, each written whole or not at all: a torn record would stop
+ * the client reading any of them. Random IOU keys live here, so the directory stays out of git.
+ */
+export class FileClientStorage implements ClientStorage {
   constructor(private readonly dir: string) {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   async get(id: string): Promise<ClientChannel | undefined> {
     const f = join(this.dir, `${id}.json`);
     return existsSync(f) ? (JSON.parse(readFileSync(f, "utf8")) as ClientChannel) : undefined;
   }
   async set(c: ClientChannel): Promise<void> {
-    writeFileSync(join(this.dir, `${c.channelId}.json`), JSON.stringify(c, null, 2));
+    const f = join(this.dir, `${c.channelId}.json`);
+    writeFileSync(`${f}.tmp`, JSON.stringify(c, null, 2), { mode: 0o600 });
+    renameSync(`${f}.tmp`, f);
   }
   async list(): Promise<ClientChannel[]> {
     return readdirSync(this.dir)
@@ -113,15 +134,48 @@ export class FileClientStorage {
 
 // ---- the scheme ----------------------------------------------------------------
 
+/**
+ * What the client is about to hand out or submit, for `authorize`. `amount` is the voucher's
+ * cumulative `maxClaimableAmount`; `transaction` is signed CBOR hex. Nothing has been recorded
+ * yet, and `channel` is the record as it will be written.
+ */
+export type Authorization =
+  | { kind: "voucher"; channel: ClientChannel; amount: bigint; requirements: PaymentRequirements }
+  | {
+      kind: "open";
+      channel: ClientChannel;
+      amount: bigint;
+      /** What the channel output holds of its currency: an ADA channel's reserve included. */
+      deposit: bigint;
+      /** The ADA the channel keeps for min-UTxO: inside `deposit` for ADA, beside the tokens otherwise. */
+      reserve: bigint;
+      transaction: string;
+      requirements: PaymentRequirements;
+    }
+  | { kind: "topUp"; channel: ClientChannel; amount: bigint; deposit: bigint; transaction: string; view: ChannelView; requirements: PaymentRequirements }
+  | { kind: "refund"; channel: ClientChannel; amount: bigint; /** Paid to `payTo`: charged and not yet redeemed. */ payout: bigint; transaction: string; view: ChannelView; requirements: PaymentRequirements }
+  | { kind: "close" | "end" | "elapse"; channel: ClientChannel; transaction: string; view: ChannelView };
+
 export interface ClientOptions {
   wallet: SeedWallet;
-  storage: FileClientStorage;
+  storage: ClientStorage;
   /** Read-only chain access, for the refund. */
   chain: Chain;
-  /** Capacity to open a channel with; the server's `minDeposit` and 10 × price are the floor. */
-  capacity?: bigint;
-  /** Refuse to lock more than this in one channel. */
-  maxDeposit?: bigint;
+  /**
+   * Capacity to open a channel with, and to add in a top-up: one amount, or one per 402. The
+   * server's `minDeposit` and 10 × price are the floor.
+   */
+  capacity?: bigint | ((req: PaymentRequirements) => bigint);
+  /**
+   * The most one deposit may lock of the currency, an ADA channel's reserve included. The client
+   * locks less than `capacity` to stay within it, and refuses when even the floor would not fit.
+   */
+  maxDeposit?: bigint | ((req: PaymentRequirements) => bigint | undefined);
+  /**
+   * Sees every voucher and transaction before it is handed out or submitted, and before anything
+   * about it is recorded; throwing refuses it, and the client is left as it was.
+   */
+  authorize?: (a: Authorization) => Promise<void>;
   /** Shared by every client instance on one wallet: inputs their transactions just spent, and when. */
   spentInputs?: Map<string, number>;
   /**
@@ -133,8 +187,8 @@ export interface ClientOptions {
   iouKeys?: "derived" | "random";
 }
 
-/** How long spent inputs are held back from coin selection. */
-const PENDING_MS = 5 * 60_000;
+/** How long spent inputs are held back from coin selection (`spentInputs` entries expire after it). */
+export const PENDING_MS = 5 * 60_000;
 
 export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   readonly scheme = SCHEME;
@@ -165,7 +219,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     if (ch?.status === "pending") ch = await this.settlePending(ch, extra);
     if (ch?.status === "open") {
       const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
-      if (ceiling <= BigInt(ch.balance)) return { x402Version, payload: voucherPayload(ch, ceiling) };
+      if (ceiling <= BigInt(ch.balance)) return { x402Version, payload: await this.voucher(ch, ceiling, req) };
       // Short of capacity. Read the channel first: a top-up that landed late may already cover it.
       const view = ch.channelRef ? await this.o.chain.followChannel(ch.channelRef, extra.scriptHash, ch.channelId) : undefined;
       if (view && view.datum.stage.kind === "opened") {
@@ -174,12 +228,33 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
           ch = { ...ch, balance: capacity.toString(), channelRef: view.ref };
           await this.o.storage.set(ch);
         }
-        if (ceiling <= capacity) return { x402Version, payload: voucherPayload(ch, ceiling) };
+        if (ceiling <= capacity) return { x402Version, payload: await this.voucher(ch, ceiling, req) };
         return { x402Version, payload: await this.topUp(req, extra, ch, view, amount) };
       }
       await this.o.storage.set({ ...ch, status: "closed" }); // gone from under us: open a new one
     }
     return { x402Version, payload: await this.openChannel(req, extra, amount) };
+  }
+
+  /** A voucher for `ceiling` on an open channel, once `authorize` has seen it. */
+  private async voucher(ch: ClientChannel, ceiling: bigint, req: PaymentRequirements) {
+    await this.o.authorize?.({ kind: "voucher", channel: ch, amount: ceiling, requirements: req });
+    return {
+      type: "voucher",
+      channelConfig: ch.channelConfig,
+      voucher: { channelId: ch.channelId, maxClaimableAmount: ceiling.toString(), signature: await this.signVoucher(ch, ceiling), ...(ch.channelRef ? { channelRef: ch.channelRef } : {}) },
+    };
+  }
+
+  /** `depositWithin` for this 402: `capacity` wanted, the server's `minDeposit` and 10 × price the floor. */
+  private depositFor(req: PaymentRequirements, extra: BatchExtra, amount: bigint, room?: bigint): bigint {
+    const minDeposit = extra.minDeposit ? BigInt(extra.minDeposit) : 0n;
+    const floor = minDeposit > 10n * amount ? minDeposit : 10n * amount;
+    return depositWithin(typeof this.o.capacity === "function" ? this.o.capacity(req) : (this.o.capacity ?? 0n), floor, room);
+  }
+
+  private maxDepositFor(req: PaymentRequirements): bigint | undefined {
+    return typeof this.o.maxDeposit === "function" ? this.o.maxDeposit(req) : this.o.maxDeposit;
   }
 
   /**
@@ -189,7 +264,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   private async topUp(req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, amount: bigint) {
     const w = this.o.wallet;
     const me = await w.address();
-    const add = [this.o.capacity ?? 0n, extra.minDeposit ? BigInt(extra.minDeposit) : 0n, 10n * amount].reduce((a, b) => (a > b ? a : b));
+    const add = this.depositFor(req, extra, amount, this.maxDepositFor(req));
     const all = await this.available();
     // ADA-only UTxOs pay the ADA and the fee, so no other token rides along into the change; a
     // token channel's tokens come from the UTxOs `planTokens` picks, folding older ones in.
@@ -203,12 +278,13 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
     const sb = await retryQueries("top-up", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
     const signed = await signedHex(sb);
-    for (const i of Transaction.fromCBORHex(signed).body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
     const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
+    await this.o.authorize?.({ kind: "topUp", channel: ch, amount: ceiling, deposit: add, transaction: signed, view, requirements: req });
+    for (const i of Transaction.fromCBORHex(signed).body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
     return {
       type: "deposit",
       channelConfig: ch.channelConfig,
-      voucher: { channelId: ch.channelId, maxClaimableAmount: ceiling.toString(), signature: signIou(ch, ceiling), channelRef: view.ref },
+      voucher: { channelId: ch.channelId, maxClaimableAmount: ceiling.toString(), signature: await this.signVoucher(ch, ceiling), channelRef: view.ref },
       deposit: { amount: add.toString(), transaction: toBase64(signed) },
     };
   }
@@ -248,11 +324,14 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const me = await w.address();
     const payer = keyHash(me);
     const cur = currencyOf(req.asset);
-    const floor = [this.o.capacity ?? 0n, extra.minDeposit ? BigInt(extra.minDeposit) : 0n, 10n * amount].reduce((a, b) => (a > b ? a : b));
+    const cap = this.maxDepositFor(req);
+    // A token channel's deposit is its tokens alone; an ADA channel's holds its reserve too, which
+    // is known only further down.
+    const tokens = cur.kind === "ada" ? undefined : this.depositFor(req, extra, amount, cap);
     const all = await this.available();
     // As for a top-up: ADA from ADA-only UTxOs, a token channel's tokens from `planTokens`.
     const adaOnly = all.filter((u) => Assets.hasOnlyLovelace(u.assets));
-    const plan = cur.kind === "ada" ? undefined : planTokens(all, cur, floor, 0n);
+    const plan = tokens === undefined ? undefined : planTokens(all, cur, tokens, 0n);
     // The tag can come from any input the opening spends. A token channel seeds from the largest
     // UTxO holding its token, which it spends anyway; an ADA channel from the largest ADA-only
     // UTxO. That keeps openings from using up the ADA-only UTxOs that collateral comes from.
@@ -278,8 +357,8 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     // An ADA channel holds its capacity plus the reserve; a token channel holds its capacity in
     // tokens and exactly the reserve in ADA, since the validator does not count that ADA.
     const isAda = constants.currency.kind === "ada";
-    const deposit = isAda ? floor + reserve : floor;
-    if (this.o.maxDeposit !== undefined && deposit > this.o.maxDeposit) throw new Error(`a channel needs ${deposit} units, above maxDeposit ${this.o.maxDeposit}`);
+    const capacity = tokens ?? this.depositFor(req, extra, amount, cap === undefined ? undefined : cap - reserve);
+    const deposit = isAda ? capacity + reserve : capacity;
 
     const tx = (plan ? withTokens(w.newTx(), me, cur, plan) : w.newTx().collectFrom({ inputs: [seed] })).payToAddress({
       address,
@@ -290,17 +369,16 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const signed = await signedHex(sb);
     const built = Transaction.fromCBORHex(signed);
     const openInputs = built.body.inputs.map((i) => `${TransactionHash.toHex(i.transactionId)}#${i.index}`);
-    for (const r of openInputs) this.spent.set(r, Date.now());
     const openIndex = built.body.outputs.findIndex((o) => o.address.paymentCredential instanceof ScriptHash.ScriptHash && ScriptHash.toHex(o.address.paymentCredential) === extra.scriptHash);
 
     const ch: ClientChannel = {
       channelId: tag,
       serverKey: serverKey(req, extra),
       channelConfig: config,
-      iouPrivateKeyPem: signer.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+      ...(random ? { iouPrivateKeyPem: signer.privateKey.export({ type: "pkcs8", format: "pem" }).toString() } : {}),
       iouKey: random ? "random" : "derived",
       deposit: deposit.toString(),
-      balance: floor.toString(),
+      balance: capacity.toString(),
       chargedCumulativeAmount: "0",
       status: "pending",
       openTx: txHashOf(signed),
@@ -311,11 +389,13 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       scriptHash: extra.scriptHash,
       ...(extra.referenceScript ? { referenceScript: extra.referenceScript } : {}),
     };
+    await this.o.authorize?.({ kind: "open", channel: ch, amount, deposit, reserve, transaction: signed, requirements: req });
+    for (const r of openInputs) this.spent.set(r, Date.now());
     await this.o.storage.set(ch);
     return {
       type: "deposit",
       channelConfig: config,
-      voucher: { channelId: tag, maxClaimableAmount: amount.toString(), signature: signIou(ch, amount) },
+      voucher: { channelId: tag, maxClaimableAmount: amount.toString(), signature: signer.sign(tag, amount) },
       deposit: { amount: deposit.toString(), transaction: toBase64(signed) },
     };
   }
@@ -380,9 +460,27 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   async refund(url: string, fetchImpl: typeof fetch = fetch, channelId?: string): Promise<SettleResponse> {
     const probe = await fetchImpl(url);
     if (probe.status !== 402) throw new Error(`refund probe expected 402, got ${probe.status}`);
-    const pr = decodePaymentRequiredHeader(probe.headers.get("PAYMENT-REQUIRED") ?? "");
+    const paymentPayload = await this.refundPayload(decodePaymentRequiredHeader(probe.headers.get("PAYMENT-REQUIRED") ?? ""), channelId);
+    const res = await fetchImpl(url, { headers: { "PAYMENT-SIGNATURE": encodePaymentSignatureHeader(paymentPayload) } });
+    const header = res.headers.get("PAYMENT-RESPONSE");
+    if (res.status !== 200 || !header) {
+      const detail = res.headers.get("PAYMENT-REQUIRED") ? decodePaymentRequiredHeader(res.headers.get("PAYMENT-REQUIRED")!).error : header ? decodePaymentResponseHeader(header).errorReason : await res.text();
+      throw new Error(`refund failed (${res.status}): ${detail}`);
+    }
+    const settle = decodePaymentResponseHeader(header);
+    await this.applySettle(paymentPayload, paymentPayload.accepted, settle);
+    return settle;
+  }
+
+  /**
+   * `refund` without the HTTP: the payload to send `pr`'s server, for its current channel or for
+   * `channelId`. It goes out as a paid request's would, and the answer comes back through
+   * `onPaymentResponse`, which marks the channel closed once it settled. For a wallet that keeps
+   * the network and the key in different processes.
+   */
+  async refundPayload(pr: PaymentRequired, channelId?: string): Promise<PaymentPayload> {
     const req = pr.accepts.find((a) => a.scheme === SCHEME);
-    if (!req) throw new Error(`no ${SCHEME} option at ${url}`);
+    if (!req) throw new Error(`no ${SCHEME} option in this 402`);
     const extra = parseExtra(req);
     let ch = channelId ? await this.o.storage.get(channelId) : ((await this.o.storage.current(serverKey(req, extra))) ?? (await this.bindRecovered(req, extra)));
     if (ch && ch.status === "open" && this.bindable(ch, req, extra)) ch = await this.bind(ch, req, extra);
@@ -415,23 +513,15 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const adaOnly = (await this.available()).filter((u) => Assets.hasOnlyLovelace(u.assets));
     const sb = await retryQueries("refund", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
     const signed = await signedHex(sb);
+    await this.o.authorize?.({ kind: "refund", channel: ch, amount: charged, payout: owed > 0n ? owed : 0n, transaction: signed, view, requirements: req });
 
     const payload: RefundPayload = {
       type: "refund",
       channelConfig: ch.channelConfig,
-      voucher: { channelId: ch.channelId, maxClaimableAmount: charged.toString(), signature: signIou(ch, charged), channelRef: view.ref },
+      voucher: { channelId: ch.channelId, maxClaimableAmount: charged.toString(), signature: await this.signVoucher(ch, charged), channelRef: view.ref },
       transaction: toBase64(signed),
     };
-    const paymentPayload: PaymentPayload = { x402Version: 2, accepted: req, payload: payload as unknown as Record<string, unknown>, ...(pr.resource ? { resource: pr.resource } : {}) };
-    const res = await fetchImpl(url, { headers: { "PAYMENT-SIGNATURE": encodePaymentSignatureHeader(paymentPayload) } });
-    const header = res.headers.get("PAYMENT-RESPONSE");
-    if (res.status !== 200 || !header) {
-      const detail = res.headers.get("PAYMENT-REQUIRED") ? decodePaymentRequiredHeader(res.headers.get("PAYMENT-REQUIRED")!).error : header ? decodePaymentResponseHeader(header).errorReason : await res.text();
-      throw new Error(`refund failed (${res.status}): ${detail}`);
-    }
-    const settle = decodePaymentResponseHeader(header);
-    if (settle.success) await this.o.storage.set({ ...ch, status: "closed" });
-    return settle;
+    return { x402Version: 2, accepted: req, payload: payload as unknown as Record<string, unknown>, ...(pr.resource ? { resource: pr.resource } : {}) };
   }
 
   // ---- the consumer's own exit (outside x402) -----------------------------------------
@@ -452,7 +542,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       .payToAddress({ address: view.address, assets: view.utxo.assets, datum: inlineDatum(view.datum.constants, { kind: "closed", subbed: view.datum.stage.subbed, elapseAt }) })
       .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) })
       .setValidity({ to });
-    const transaction = await this.submitOwn("close", tx);
+    const transaction = await this.submitOwn("close", tx, ch, view);
     await this.o.storage.set({ ...ch, status: "closing", elapseAt: elapseAt.toString() });
     return { transaction, elapseAt };
   }
@@ -467,7 +557,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     // The tokens coming back go out in one output with the wallet's older ones, not as a new UTxO of their own.
     const c = view.datum.constants.currency;
     if (c.kind !== "ada") tx = withTokens(tx, await this.o.wallet.address(), c, planTokens(await this.available(), c, 0n, view.amount));
-    const transaction = await this.submitOwn("end", tx);
+    const transaction = await this.submitOwn("end", tx, ch, view);
     await this.o.storage.set({ ...ch, status: "closed" });
     return transaction;
   }
@@ -490,7 +580,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     tx = tx.addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) }).setValidity({ from: msOfSlot(network, from) });
     const c = view.datum.constants.currency;
     if (c.kind !== "ada") tx = withTokens(tx, await this.o.wallet.address(), c, planTokens(await this.available(), c, 0n, view.amount));
-    const transaction = await this.submitOwn("elapse", tx);
+    const transaction = await this.submitOwn("elapse", tx, ch, view);
     await this.o.storage.set({ ...ch, status: "closed" });
     return transaction;
   }
@@ -526,7 +616,6 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
         channelId: d.tag,
         serverKey: "",
         channelConfig: { payer: me, payerAuthorizer: d.iouKey, receiver: "", receiverAuthorizer: d.provider, token: assetOf(d.currency), withdrawDelay: Number(d.closePeriodMs / 1000n) },
-        iouPrivateKeyPem: usable ? signer.privateKey.export({ type: "pkcs8", format: "pem" }).toString() : "",
         channelRef: v.ref,
         // Everything put in so far: what the server has redeemed plus what the channel holds.
         deposit: (subbed + v.amount).toString(),
@@ -588,6 +677,18 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     return (this.root ??= iouRootOf(this.o.wallet));
   }
 
+  /**
+   * The channel's IOU for `amount`, as hex: with the key its record holds, or, for a derived one,
+   * the key derived again from the wallet, checked against the channel's own.
+   */
+  async signVoucher(ch: ClientChannel, amount: bigint): Promise<string> {
+    if (ch.iouPrivateKeyPem) return edSign(null, iouBody(ch.channelId, amount), createPrivateKey(ch.iouPrivateKeyPem)).toString("hex");
+    if (ch.iouKey !== "derived" || !ch.network) throw new Error(`no IOU key for channel ${ch.channelId.slice(0, 16)}…: it can only be closed`);
+    const signer = derivedIouSigner(await this.iouRoot(), ch.network, ch.channelId);
+    if (signer.publicKey !== ch.channelConfig.payerAuthorizer) throw new Error(`channel ${ch.channelId.slice(0, 16)}… names an IOU key this wallet does not derive`);
+    return signer.sign(ch.channelId, amount);
+  }
+
   /** The channel as it stands on chain, for this client's own exit. */
   async openView(channelId: string) {
     const ch = await this.o.storage.get(channelId);
@@ -598,11 +699,12 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   }
 
   /** Builds, signs and submits a transaction of this client's own, and waits for a block. */
-  private async submitOwn(what: string, tx: ReturnType<SeedWallet["newTx"]>): Promise<string> {
+  private async submitOwn(what: "close" | "end" | "elapse", tx: ReturnType<SeedWallet["newTx"]>, ch: ClientChannel, view: ChannelView): Promise<string> {
     const adaOnly = (await this.available()).filter((u) => Assets.hasOnlyLovelace(u.assets));
     const me = await this.o.wallet.address();
     const sb = await retryQueries(what, () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
     const hex = await signedHex(sb);
+    await this.o.authorize?.({ kind: what, channel: ch, transaction: hex, view });
     for (const i of Transaction.fromCBORHex(hex).body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
     const txHash = await this.o.chain.submit(hex);
     if (!(await this.o.chain.awaitTx(txHash, 300_000))) throw new Error(`${what}: ${txHash} not in a block after 5 minutes`);
@@ -653,6 +755,18 @@ export function derivedIouSigner(root: Uint8Array, network: string, tag: string)
   return iouSignerFromSeed(new Uint8Array(hkdfSync("sha256", root, "x402 batch-settlement cardano", `iou key v1 ${network} ${tag}`, 32)));
 }
 
+/**
+ * How much a deposit puts in, of the currency and before any reserve: `want`, never under
+ * `floor`, and cut to `room` — what `maxDeposit` leaves — when that is given; refused when even
+ * the floor does not fit.
+ */
+export function depositWithin(want: bigint, floor: bigint, room?: bigint): bigint {
+  const amount = want > floor ? want : floor;
+  if (room === undefined || amount <= room) return amount;
+  if (room < floor) throw new Error(`a deposit here needs at least ${floor} units, more than maxDeposit leaves room for (${room < 0n ? 0n : room})`);
+  return room;
+}
+
 /** `planTokens`' side of a transaction: its inputs, and one output at `me` of what goes back. */
 function withTokens<T extends ReturnType<SeedWallet["newTx"]>>(tx: T, me: Address.Address, c: Currency, plan: { inputs: UTxO.UTxO[]; rest: bigint }): T {
   if (c.kind === "ada") return tx;
@@ -661,21 +775,8 @@ function withTokens<T extends ReturnType<SeedWallet["newTx"]>>(tx: T, me: Addres
   return out as T;
 }
 
-function voucherPayload(ch: ClientChannel, ceiling: bigint) {
-  return {
-    type: "voucher",
-    channelConfig: ch.channelConfig,
-    voucher: { channelId: ch.channelId, maxClaimableAmount: ceiling.toString(), signature: signIou(ch, ceiling), ...(ch.channelRef ? { channelRef: ch.channelRef } : {}) },
-  };
-}
-
 export function serverKey(req: PaymentRequirements, extra: BatchExtra): string {
   return [req.network, req.payTo, req.asset, extra.scriptHash, extra.receiverAuthorizer, extra.withdrawDelay].join("|");
-}
-
-/** The channel's IOU for `amount`, as hex. */
-export function signIou(ch: ClientChannel, amount: bigint): string {
-  return edSign(null, iouBody(ch.channelId, amount), createPrivateKey(ch.iouPrivateKeyPem)).toString("hex");
 }
 
 function keyHash(a: Address.Address): string {

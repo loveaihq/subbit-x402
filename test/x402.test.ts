@@ -10,7 +10,7 @@ import { SUBBIT_HASH, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, n
 import { capacityOf, channelReserve, constantsOf, datumBindingError, planTokens, type ChannelView } from "../src/x402/cardano.ts";
 import type { Chain, ChainCursor } from "../src/x402/chain.ts";
 import { ChannelManager, type WatchEvent } from "../src/x402/manager.ts";
-import { BatchSettlementCardanoClient, FileClientStorage, collateralTarget, derivedIouSigner, iouRootOf } from "../src/x402/client.ts";
+import { BatchSettlementCardanoClient, FileClientStorage, collateralTarget, depositWithin, derivedIouSigner, iouRootOf, serverKey, type Authorization } from "../src/x402/client.ts";
 import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x402/server.ts";
 import { Err, PayloadError, checkDelegationMac, configBindingError, delegationMac, parseClaimPayload, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
 
@@ -539,4 +539,67 @@ test("client: adopts the server's count only when the server holds this client's
   const after = (await storage.get(TAG))!;
   assert.equal(after.chargedCumulativeAmount, "3000");
   assert.equal(after.channelRef, `${"ef".repeat(32)}#1`);
+});
+
+// ---- a wallet that decides what leaves it --------------------------------------
+
+test("client: a voucher is seen by authorize before it leaves; refused, nothing is signed or recorded", async () => {
+  const wallet = testWallet();
+  const root = await iouRootOf(wallet);
+  const key = derivedIouSigner(root, "cardano:preprod", TAG);
+  const storage = new FileClientStorage(mkdtempSync(join(tmpdir(), "x402-authorize-")));
+  const seen: Authorization[] = [];
+  let refuse = true;
+  const client = new BatchSettlementCardanoClient({
+    wallet,
+    storage,
+    chain: {} as never,
+    authorize: async (a) => {
+      seen.push(a);
+      if (refuse) throw new Error("over the cap");
+    },
+  });
+  const record = {
+    channelId: TAG,
+    serverKey: serverKey(baseReq, parseExtra(baseReq)),
+    channelConfig: { ...config, payerAuthorizer: key.publicKey },
+    iouKey: "derived" as const,
+    network: "cardano:preprod",
+    scriptHash: SUBBIT_HASH,
+    channelRef: `${"cd".repeat(32)}#0`,
+    deposit: "3000000",
+    balance: "1000000",
+    chargedCumulativeAmount: "4000",
+    status: "open" as const,
+    openedAt: 1,
+  };
+  await storage.set(record);
+
+  await assert.rejects(client.createPaymentPayload(2, baseReq), /over the cap/);
+  assert.deepEqual(seen.map((a) => [a.kind, "amount" in a ? a.amount : undefined]), [["voucher", 5000n]]);
+  assert.deepEqual(await storage.get(TAG), record, "the record is as it was");
+
+  refuse = false;
+  const p = parseClientPayload((await client.createPaymentPayload(2, baseReq)).payload);
+  assert.equal(p.voucher.maxClaimableAmount, "5000");
+  assert.ok(iouVerifierOf({ datum: { constants: { iouKey: key.publicKey } } } as unknown as ChannelView)(TAG, 5000n, p.voucher.signature));
+  // The key was derived again for the signature; nothing on disk holds it.
+  assert.equal((await storage.get(TAG))!.iouPrivateKeyPem, undefined);
+});
+
+test("client: a record naming an IOU key this wallet does not derive signs nothing", async () => {
+  const storage = new FileClientStorage(mkdtempSync(join(tmpdir(), "x402-foreign-")));
+  const client = new BatchSettlementCardanoClient({ wallet: testWallet(), storage, chain: {} as never });
+  const ch = { channelId: TAG, serverKey: "k", channelConfig: config, iouKey: "derived" as const, network: "cardano:preprod", deposit: "1", balance: "1", chargedCumulativeAmount: "0", status: "open" as const, openedAt: 1 };
+  await assert.rejects(client.signVoucher(ch, 1000n), /does not derive/);
+  await assert.rejects(client.signVoucher({ ...ch, iouKey: undefined }, 1000n), /can only be closed/);
+});
+
+test("client: a deposit is what capacity asks, never under the floor, cut to what maxDeposit leaves", () => {
+  assert.equal(depositWithin(50_000n, 10_000n), 50_000n);
+  assert.equal(depositWithin(0n, 10_000n), 10_000n, "the floor when capacity asks less");
+  assert.equal(depositWithin(50_000n, 10_000n, 30_000n), 30_000n, "cut to the room left");
+  assert.equal(depositWithin(50_000n, 10_000n, 10_000n), 10_000n);
+  assert.throws(() => depositWithin(50_000n, 10_000n, 9_999n), /at least 10000/);
+  assert.throws(() => depositWithin(50_000n, 10_000n, -5n), /room for \(0\)/);
 });

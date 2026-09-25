@@ -39,7 +39,7 @@ import { Address, Assets, KeyHash } from "@evolution-sdk/evolution";
 import { Redeemer, Step, SUBBIT_HASH, inlineDatum, subbitScript, type Stage } from "../../src/subbit.ts";
 import { capacityOf, valueFor, type ChannelView } from "../../src/x402/cardano.ts";
 import { BlockfrostChain } from "../../src/x402/chain.ts";
-import { BatchSettlementCardanoClient, FileClientStorage, collateralTarget, signIou, signedHex, type ClientChannel } from "../../src/x402/client.ts";
+import { BatchSettlementCardanoClient, FileClientStorage, collateralTarget, signedHex, type ClientChannel } from "../../src/x402/client.ts";
 import { BatchSettlementCardanoFacilitator } from "../../src/x402/facilitator.ts";
 import { ChannelManager, type ClaimResult, type WatchEvent } from "../../src/x402/manager.ts";
 import { BatchSettlementCardanoServer, FileChannelStorage, walletProviderSigner } from "../../src/x402/server.ts";
@@ -440,7 +440,7 @@ async function topUpChecks(s: Stack, ch: ClientChannel) {
   await refusedFor(`the deposit declares ${ada(add + 1n)}, one unit more than the transaction adds`, { ...made, deposit: { ...made.deposit, amount: (add + 1n).toString() } }, Err.depositTransaction);
   await refusedFor(
     `the voucher is for ${ada(after + 1n)}, one unit past the ${ada(after)} the top-up makes room for`,
-    { ...made, voucher: { ...made.voucher, maxClaimableAmount: (after + 1n).toString(), signature: signIou(ch, after + 1n) } },
+    { ...made, voucher: { ...made.voucher, maxClaimableAmount: (after + 1n).toString(), signature: await probe.scheme.signVoucher(ch, after + 1n) } },
     Err.cumulativeExceedsBalance,
   );
   const view = (await chain.followChannel(made.voucher.channelRef, SUBBIT_HASH, ch.channelId))!;

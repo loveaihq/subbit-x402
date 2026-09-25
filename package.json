@@ -10,7 +10,23 @@
     "type": "git",
     "url": "git+https://github.com/loveaihq/subbit-x402.git"
   },
+  "exports": {
+    "./subbit": {
+      "types": "./dist/subbit.d.ts",
+      "default": "./dist/subbit.js"
+    },
+    "./x402/*": {
+      "types": "./dist/x402/*.d.ts",
+      "default": "./dist/x402/*.js"
+    }
+  },
+  "files": [
+    "dist",
+    "vendor/subbit"
+  ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "spike": "tsx spike/run.ts",
     "lifecycle": "tsx spike/lifecycle.ts",
     "refscript": "tsx spike/refscript.ts",

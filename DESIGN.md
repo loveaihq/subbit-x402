@@ -179,6 +179,10 @@ validator itself gives settle no deadline, so after `elapse_at` it races the con
 
 - **Client**: holds the consumer key (transactions) and a per-channel IOU key (vouchers). Builds
   and signs its own open, `Add` and `Mutual` transactions and pays their fees, as Cardano `exact`.
+  A wallet that enforces a spend policy sees each voucher and transaction through the client's
+  `authorize` hook before anything is handed out or recorded, and can keep the network in another
+  process (`refundPayload` builds a refund without sending it). Derived IOU keys are never written
+  to the client's records: they are derived again for each voucher, so the records cannot sign.
 - **Resource server**: holds the provider key and a chain reader; owns per-channel state (file
   storage with EVM's `get / list / updateChannel` interface); redeems.
 - **Facilitator**: no key and no funds, like `@x402/cardano`'s `exact` facilitator. It verifies

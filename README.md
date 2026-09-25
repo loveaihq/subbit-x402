@@ -50,9 +50,15 @@ Each run's wallets reconcile to the lovelace against the fees of its transaction
 
 ```
 npm install
-npm test            # 28 chain-free tests
+npm test            # 31 chain-free tests
 npm run typecheck
 ```
+
+As a dependency, the package builds itself on install (`prepare`) and exports `subbit-x402/subbit`
+and `subbit-x402/x402/<module>` (`client`, `server`, `facilitator`, `manager`, `chain`, `cardano`,
+`txcheck`, `types`, `claimtx`). [ada-agent-wallet](https://github.com/loveaihq/ada-agent-wallet)
+uses the client that way: its signing daemon runs `BatchSettlementCardanoClient` with an
+`authorize` hook that puts every voucher and deposit through its spend policy.
 
 The preprod runs take `WALLET_MNEMONIC`, a preprod test wallet (these used the public
 all-`abandon` test mnemonic, accounts 0 to 3, which anyone can spend from: keep nothing of value
