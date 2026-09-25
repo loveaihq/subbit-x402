@@ -50,6 +50,12 @@ export interface ServerChannel {
   channelConfig: ChannelConfig;
   /** Current `txHash#index`; empty until the opening transaction is on chain. */
   channelRef: string;
+  /**
+   * A position of the channel deep enough in the chain to stay there (the watcher's `depth`).
+   * Reads start here and follow the channel forward, so a transaction rolled back after
+   * `channelRef` moved on is simply not found again. Absent in older records: `channelRef` serves.
+   */
+  anchorRef?: string;
   balance: string;
   totalClaimed: string;
   withdrawRequestedAt: number;

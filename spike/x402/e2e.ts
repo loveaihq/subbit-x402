@@ -18,6 +18,7 @@
 //               the same response, charged once
 //   delegate    a server with no key (127.0.0.1:7412, 0.1 tADA a request): the facilitator holds its
 //               provider key, builds and signs its claims and settles, co-signs its refunds
+//   scale       ten channels; the watcher polling and following, counting Blockfrost requests
 //   wallets [label]  how each wallet's UTxOs are split, recorded under the label
 //   report      every transaction's fee, and the wallets reconciled
 //
@@ -40,7 +41,7 @@ import { capacityOf, valueFor, type ChannelView } from "../../src/x402/cardano.t
 import { BlockfrostChain } from "../../src/x402/chain.ts";
 import { BatchSettlementCardanoClient, FileClientStorage, collateralTarget, signIou, signedHex, type ClientChannel } from "../../src/x402/client.ts";
 import { BatchSettlementCardanoFacilitator } from "../../src/x402/facilitator.ts";
-import { ChannelManager, type ClaimResult } from "../../src/x402/manager.ts";
+import { ChannelManager, type ClaimResult, type WatchEvent } from "../../src/x402/manager.ts";
 import { BatchSettlementCardanoServer, FileChannelStorage, walletProviderSigner } from "../../src/x402/server.ts";
 import { Err, parseExtra, toBase64, type DepositPayload } from "../../src/x402/types.ts";
 import { REF_STATE, BF_BASE, ada, bf, consumer, delegateWallet, expectEq, iso, keyHashHex, load, log, must, provider, run, save, scriptsFailed, submit } from "../chain.ts";
@@ -84,6 +85,7 @@ interface Results {
   exits?: Array<{ what: "close" | "end" | "elapse"; channelId: string; transaction: string }>;
   recoveries?: Array<{ channel: string; channelId: string; status: string; exitOnly: boolean; charged: string; balance: string; httpCalls?: number }>;
   replay?: { channelId: string; lost: string; retried: string; httpCalls: number; chargedBefore: string; chargedAfter: string };
+  scale?: { channels: number; pollPass: number; followSync: number; followIdle: number; closeSeen: number; closeSettled: number };
   autosettle?: { channelId: string; close: string; settle: string; end: string; closeToSettleSec: number; settleBeforeElapseSec: number; watchIntervalMs: number };
   checks?: Array<{ phase: string; what: string; outcome: string }>;
   /** Wallet housekeeping during the run (a `mint -- tidy`), so the report counts its fee. */
@@ -493,15 +495,21 @@ async function phaseAutoSettle(s: Stack) {
   const channelId = ch.channelId;
   const charged = BigInt(ch.chargedCumulativeAmount);
   const intervalMs = 15_000;
-  const got: { settled?: ClaimResult } = {};
+  const mode = process.argv[3] === "follow" ? "follow" : "poll";
+  const got: { settled?: ClaimResult; settledAt?: number; goneAt?: number } = {};
   const watcher = s.manager.watch({
     intervalMs,
+    mode,
     onEvent: (e) => {
-      if (e.kind === "closed") log(`autosettle: watcher: ${e.channelId.slice(0, 16)}… closed by its consumer, elapse_at ${iso(e.elapseAt)}; its vouchers are refused from here on`);
+      if (e.kind === "closed") log(`autosettle: watcher (${mode}): ${e.channelId.slice(0, 16)}… closed by its consumer, elapse_at ${iso(e.elapseAt)}; its vouchers are refused from here on`);
       else if (e.kind === "settled") {
         for (const x of e.results) log(`autosettle: watcher: settled ${x.channels.length} channel(s) in ${x.transaction}`);
         got.settled ??= e.results.find((x) => x.channels.some((c) => c.channelId === channelId));
-      } else if (e.kind === "gone") log(`autosettle: watcher: ${e.channelId.slice(0, 16)}… needs nothing more from the server; record dropped`);
+        got.settledAt ??= got.settled ? Date.now() : undefined;
+      } else if (e.kind === "gone") {
+        log(`autosettle: watcher: ${e.channelId.slice(0, 16)}… needs nothing more from the server; record dropped`);
+        if (e.channelId === channelId) got.goneAt ??= Date.now();
+      } else if (e.kind === "reopened") log(`autosettle: watcher: ${e.channelId.slice(0, 16)}… is open again (its close rolled back)`);
       else log(`autosettle: watcher: a pass failed, the next one retries: ${String((e.error as Error)?.message ?? e.error).slice(0, 240)}`);
     },
   });
@@ -516,12 +524,15 @@ async function phaseAutoSettle(s: Stack) {
       elapseAt = BigInt(ch.elapseAt!);
     }
     log(`autosettle: the consumer closed ${channelId.slice(0, 16)}… alone in ${close}; elapse_at ${iso(elapseAt)}`);
-    const deadline = Date.now() + 12 * 60_000;
-    while (!got.settled && Date.now() < deadline) await new Promise((res) => setTimeout(res, 3_000));
+    // The settle, then the record's drop once the settle is 3 blocks deep.
+    const deadline = Date.now() + 15 * 60_000;
+    while (!(got.settled && got.goneAt) && Date.now() < deadline) await new Promise((res) => setTimeout(res, 3_000));
   } finally {
     watcher.stop();
   }
-  if (!got.settled) throw new Error("the watcher did not settle the channel within 12 minutes");
+  if (!got.settled) throw new Error("the watcher did not settle the channel within 15 minutes");
+  if (!got.goneAt) throw new Error("the watcher did not drop the settled channel's record within 15 minutes");
+  log(`autosettle: the record went ${((got.goneAt - got.settledAt!) / 1000).toFixed(0)} s after the settle, once it was deep enough`);
   const settle = got.settled.transaction;
   const row = got.settled.channels.find((c) => c.channelId === channelId)!;
   record((r) => (r.claims ??= []).push({ phase: "auto-settle", n: got.settled!.channels.length, transaction: settle }));
@@ -775,6 +786,98 @@ async function fundDelegate() {
   log(`delegate: account 3 funded with 30 tADA in ${hash}, before the run's balances are taken`);
 }
 
+// ---- step 11: the watcher at scale ---------------------------------------------------------
+
+/** Counts this process's Blockfrost requests from here on, the SDK's included (it fetches through the global `fetch`). */
+function countBlockfrost() {
+  const real = globalThis.fetch;
+  let n = 0;
+  globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.startsWith(BF_BASE)) n++;
+    return real(input, init);
+  }) as typeof fetch;
+  return { n: () => n, reset: () => void (n = 0), restore: () => void (globalThis.fetch = real) };
+}
+
+/**
+ * Ten channels with charges, and the watcher run both ways while its Blockfrost requests are
+ * counted. Polling reads every channel on each pass. Following reads them all once, then only the
+ * validator address's new transactions, and the outputs of the ones that spend a channel of this
+ * server. Then one consumer closes and the follower settles; the other nine are claimed in one
+ * transaction and refunded.
+ */
+async function phaseScale(s: Stack) {
+  const before = await walletsAda();
+  record((r) => (r.before ??= before));
+  const K = 10;
+  const clients = Array.from({ length: K }, (_, i) => payer(`scale/${i}`, 20n * PRICE));
+  const ids: string[] = [];
+  for (const [i, p] of clients.entries()) {
+    // A rerun takes up the channels a stopped run left open.
+    const open = (await p.storage.list()).find((c) => c.status === "open");
+    ids.push(open ? open.channelId : await payRun(s, p, `scale ${i + 1}/${K}`, 3));
+  }
+  const count = countBlockfrost();
+  try {
+    // The SDK's queries must be counted too, or polling would look cheaper than it is.
+    count.reset();
+    await chain.getUnspent((await s.storage.get(ids[0]!))!.channelRef);
+    if (count.n() < 2) throw new Error(`the counter saw ${count.n()} of a lookup's 2 requests`);
+    const measure = async (label: string, run: () => Promise<void>) => {
+      count.reset();
+      const t0 = performance.now();
+      await run();
+      log(`scale: ${label}: ${count.n()} Blockfrost requests, ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+      return count.n();
+    };
+    const poller = s.manager.watch({ intervalMs: 3_600_000 });
+    const pollPass = await measure(`a polling pass over ${K} channels`, () => poller.tick());
+    poller.stop();
+
+    const got: { closedAt?: number; settled?: ClaimResult } = {};
+    const follower = s.manager.watch({
+      intervalMs: 3_600_000,
+      mode: "follow",
+      onEvent: (e: WatchEvent) => {
+        if (e.kind === "closed" && e.channelId === ids[0]) got.closedAt = count.n();
+        if (e.kind === "settled") got.settled ??= e.results.find((x) => x.channels.some((c) => c.channelId === ids[0]));
+        if (e.kind === "error") log(`scale: follower: a pass failed: ${String((e.error as Error)?.message ?? e.error).slice(0, 240)}`);
+      },
+    });
+    try {
+      const followSync = await measure("the follower's first pass, which reads every channel once", () => follower.tick());
+      const followIdle = await measure("a following pass with nothing new", () => follower.tick());
+      const { transaction: close } = await clients[0]!.scheme.close(ids[0]!);
+      record((r) => (r.exits ??= []).push({ what: "close", channelId: ids[0]!, transaction: close }));
+      log(`scale: channel 1's consumer closed it in ${close}`);
+      // Passes until the address index shows the close; the pass that sees it also settles.
+      let closeSettled = 0;
+      for (let i = 0; i < 24 && !got.settled; i++) {
+        count.reset();
+        await follower.tick();
+        if (got.settled) closeSettled = count.n();
+        else await new Promise((res) => setTimeout(res, 10_000));
+      }
+      if (!got.settled || got.closedAt === undefined) throw new Error("the follower did not settle the closed channel");
+      log(`scale: the pass that saw the close: ${got.closedAt} requests to find it among ${K} channels, ${closeSettled} with the settle, ${got.settled.transaction}`);
+      record((r) => {
+        (r.claims ??= []).push({ phase: "scale: settle", n: 1, transaction: got.settled!.transaction });
+        r.scale = { channels: K, pollPass, followSync, followIdle, closeSeen: got.closedAt!, closeSettled };
+      });
+    } finally {
+      follower.stop();
+    }
+  } finally {
+    count.restore();
+  }
+  const end = await clients[0]!.scheme.end(ids[0]!);
+  record((r) => (r.exits ??= []).push({ what: "end", channelId: ids[0]!, transaction: end }));
+  log(`scale: channel 1's consumer ended it in ${end}`);
+  await phaseClaim(s, "scale: claim the other nine", { channelIds: ids.slice(1), maxPerTx: 10 });
+  for (let i = 1; i < K; i++) await phaseRefund(s, `scale/${i}`);
+}
+
 /** The route's payment requirements, as its 402 states them. */
 async function requirements(): Promise<PaymentRequirements> {
   const res = await fetch(URL_DATA);
@@ -843,7 +946,7 @@ async function settledWallets() {
 async function openChannelValue(): Promise<{ lovelace: bigint; amount: bigint }> {
   let lovelace = 0n;
   let amount = 0n;
-  for (const d of ["client", "topup", "autosettle", "recover-a", "recover-b", "recover-c", "replay", "delegate-a", "delegate-b", ...Array.from({ length: 10 }, (_, i) => `batch/${i}`)]) {
+  for (const d of ["client", "topup", "autosettle", "recover-a", "recover-b", "recover-c", "replay", "delegate-a", "delegate-b", ...Array.from({ length: 10 }, (_, i) => `batch/${i}`), ...Array.from({ length: 10 }, (_, i) => `scale/${i}`)]) {
     if (!existsSync(dir(d))) continue;
     for (const c of await new FileClientStorage(dir(d)).list()) {
       if ((c.status !== "open" && c.status !== "closing") || !c.channelRef) continue;
@@ -915,6 +1018,7 @@ async function main() {
     if (phase === "wallets") await phaseWallets(process.argv[3] ?? new Date().toISOString());
     if (phase === "replay") await phaseReplay(s);
     if (phase === "delegate") await phaseDelegate(s);
+    if (phase === "scale") await phaseScale(s);
     if (phase === "recover") await phaseRecover(s);
     if (phase === "recover-elapse") await phaseRecoverElapse(s);
     if (phase === "topup") await phaseTopUp(s);

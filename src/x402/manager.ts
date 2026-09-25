@@ -41,7 +41,7 @@ export interface ClaimResult {
 
 export class ChannelManager {
   /** Watches every channel; settles those their consumers close. See `watchChannels`. */
-  watch(opts: { intervalMs?: number; onEvent?: (e: WatchEvent) => void } = {}): Watcher {
+  watch(opts: WatchOptions = {}): Watcher {
     return watchChannels(this, this.o, opts);
   }
 
@@ -64,7 +64,7 @@ export class ChannelManager {
       if (channelIds && !channelIds.includes(c.channelId)) continue;
       if (!c.channelRef) continue;
       if (BigInt(c.chargedCumulativeAmount) <= BigInt(c.totalClaimed)) continue;
-      const v = await this.o.chain.followChannel(c.channelRef, this.o.scriptHash, c.channelId);
+      const v = await this.o.chain.followChannel(c.anchorRef ?? c.channelRef, this.o.scriptHash, c.channelId);
       if (!v || v.datum.stage.kind === "settled") continue;
       if (BigInt(c.chargedCumulativeAmount) <= v.datum.stage.subbed) continue;
       out.push({ c, v });
@@ -109,9 +109,10 @@ export class ChannelManager {
         const now = await this.after(v, c.channelId, res.transaction);
         rows[j]!.channelRef = now?.ref ?? "";
         if (v.datum.stage.kind === "closed") {
-          // Settled, or already ended by its consumer: the server's part in this channel is over.
+          // Settled, or already ended by its consumer. The watcher drops the record once that is
+          // deep enough in the chain to stay: the record holds the voucher should the settle roll back.
           if (now && now.datum.stage.kind !== "settled") throw new Error(`channel ${c.channelId.slice(0, 16)}… is ${now.datum.stage.kind} after its settle`);
-          await this.o.storage.updateChannel(c.channelId, () => undefined);
+          if (now) await this.o.storage.updateChannel(c.channelId, (cur) => (cur ? { ...cur, channelRef: now.ref, onchainSyncedAt: Date.now() } : cur));
           continue;
         }
         if (!now || now.datum.stage.kind === "settled") throw new Error(`channel ${c.channelId.slice(0, 16)}… not found after the claim`);
@@ -159,6 +160,8 @@ export type WatchEvent =
   | { kind: "settled"; results: ClaimResult[] }
   /** The server's part in a channel is over (settled, ended, elapsed or closed by agreement); its record is dropped. */
   | { kind: "gone"; channelId: string }
+  /** A close the watcher had seen is not on chain any more (rolled back): the channel's vouchers are accepted again. */
+  | { kind: "reopened"; channelId: string }
   /** A pass failed; the next one tries again. */
   | { kind: "error"; error: unknown };
 
@@ -168,6 +171,24 @@ export interface Watcher {
   tick(): Promise<void>;
 }
 
+export interface WatchOptions {
+  intervalMs?: number;
+  onEvent?: (e: WatchEvent) => void;
+  /**
+   * `poll` (the default) reads every channel on each pass: two or three queries each. `follow`
+   * reads it all once, then only the validator address's new transactions, and the outputs of
+   * those that spend this server's channels: one query a pass when nothing happens, however many
+   * channels there are.
+   */
+  mode?: "poll" | "follow";
+  /**
+   * How many blocks deep a transaction must be before the watcher treats it as final: before it
+   * drops a record, moves a channel's anchor, or, following, acts on it at all. Default 3; a
+   * rollback deeper than that is outside the model.
+   */
+  depth?: number;
+}
+
 /**
  * Every `intervalMs`, reads each channel the server holds vouchers for. A channel its consumer
  * has closed is marked (so its vouchers are refused) and settled with the latest voucher in one
@@ -175,38 +196,118 @@ export interface Watcher {
  * two passes in a row find no channel at all: one missing read is not proof, since a lagging
  * index can hide a live channel, and the record holds the only copy of the latest voucher.
  */
-export function watchChannels(manager: ChannelManager, o: ManagerOptions, opts: { intervalMs?: number; onEvent?: (e: WatchEvent) => void } = {}): Watcher {
+export function watchChannels(manager: ChannelManager, o: ManagerOptions, opts: WatchOptions = {}): Watcher {
   let running: Promise<void> | undefined;
-  const missing = new Set<string>();
+  const depth = opts.depth ?? 3;
   const drop = async (channelId: string) => {
     await o.storage.updateChannel(channelId, () => undefined);
-    missing.delete(channelId);
     opts.onEvent?.({ kind: "gone", channelId });
   };
-  const pass = async () => {
+  /** A channel found closed: refuse its vouchers from here on; settle it if anything is owed. */
+  const onClosed = async (c: ServerChannel, v: ChannelView, closed: string[]) => {
+    const stage = v.datum.stage;
+    if (stage.kind !== "closed") return;
+    const withdrawRequestedAt = Number((stage.elapseAt - v.datum.constants.closePeriodMs) / 1000n);
+    await o.storage.updateChannel(c.channelId, (cur) => (cur ? { ...cur, channelRef: v.ref, withdrawRequestedAt, onchainSyncedAt: Date.now() } : cur));
+    if (c.withdrawRequestedAt === 0) opts.onEvent?.({ kind: "closed", channelId: c.channelId, elapseAt: stage.elapseAt });
+    if (BigInt(c.chargedCumulativeAmount) > stage.subbed) closed.push(c.channelId);
+  };
+  const settle = async (closed: string[]) => {
+    if (closed.length > 0) opts.onEvent?.({ kind: "settled", results: await manager.claim({ channelIds: closed }) });
+  };
+  let cursor: import("./chain.ts").ChainCursor | undefined;
+  let synced = false;
+  /**
+   * Follows the validator's address from `cursor`, one transaction at a time once it is `depth`
+   * blocks deep: only those that spend a channel of this server cost a second query.
+   */
+  const follow = async () => {
+    const tip = await o.chain.tipHeight();
+    const byRef = new Map((await o.storage.list()).filter((c) => c.channelRef).map((c) => [c.anchorRef ?? c.channelRef, c] as const));
     const closed: string[] = [];
+    for (const t of await o.chain.scriptActivity(o.scriptHash, cursor)) {
+      if (tip - t.height < depth) break; // the rest next pass, once they are deep enough
+      const moves = await o.chain.channelMoves(t.hash, o.scriptHash, (ref) => byRef.has(ref));
+      for (const ref of moves.spent) {
+        const c = byRef.get(ref);
+        if (!c) continue;
+        byRef.delete(ref);
+        const v = moves.channels?.find((x) => x.datum.constants.tag === c.channelId);
+        // Spent with no continuing output (ended, elapsed, closed by agreement), or settled: done.
+        // This read is the spending transaction itself, so a lagging index cannot fake it.
+        if (!v || v.datum.stage.kind === "settled") {
+          await drop(c.channelId);
+          continue;
+        }
+        byRef.set(v.ref, { ...c, channelRef: v.ref, anchorRef: v.ref });
+        await o.storage.updateChannel(c.channelId, (cur) => (cur ? { ...cur, channelRef: v.ref, anchorRef: v.ref, onchainSyncedAt: Date.now() } : cur));
+        await onClosed(c, v, closed);
+      }
+      cursor = t;
+    }
+    await settle(closed);
+  };
+  const pass = async () => {
+    if (opts.mode === "follow") {
+      if (synced) return follow();
+      // Where the address stands before reading every channel once, so nothing slips in between.
+      const tip = await o.chain.scriptTip(o.scriptHash);
+      await poll();
+      cursor = tip;
+      synced = true;
+      return;
+    }
+    await poll();
+  };
+  /**
+   * Reads every channel from its anchor forward. A position the chain has since dropped is not
+   * found again, so the record follows the chain back: a rolled-back claim is claimable again, a
+   * rolled-back close reopens the channel. What cannot be undone waits until it is `depth` deep:
+   * a record goes only once the settle or the exit is, and an anchor moves only to such a position.
+   */
+  const poll = async () => {
+    const closed: string[] = [];
+    const tip = await o.chain.tipHeight();
+    const deep = async (ref: string) => {
+      const h = await o.chain.txHeight(ref.split("#")[0]!);
+      return h !== undefined && tip - h >= depth;
+    };
     for (const c of await o.storage.list()) {
       if (!c.channelRef) continue;
-      const v = await o.chain.followChannel(c.channelRef, o.scriptHash, c.channelId);
+      const from = c.anchorRef ?? c.channelRef;
+      const v = await o.chain.followChannel(from, o.scriptHash, c.channelId);
       if (!v) {
-        if (missing.has(c.channelId)) await drop(c.channelId);
-        else missing.add(c.channelId);
+        // Gone, or the index lags: the transaction that ended it decides, once deep enough to stay.
+        const exit = await o.chain.exitOf(from, o.scriptHash, c.channelId);
+        if (exit && tip - exit.height >= depth) await drop(c.channelId);
         continue;
       }
-      missing.delete(c.channelId);
-      const stage = v.datum.stage;
-      if (stage.kind === "settled") {
-        await drop(c.channelId);
+      const settled = v.datum.stage.kind === "settled";
+      const stable = v.ref === c.anchorRef || (await deep(v.ref));
+      await o.storage.updateChannel(c.channelId, (cur) =>
+        cur
+          ? {
+              ...cur,
+              channelRef: v.ref,
+              // Once deep, the chain's position and what it shows redeemed are the record's, lower
+              // again if a claim was rolled back.
+              ...(stable ? { anchorRef: v.ref, ...(settled ? {} : { totalClaimed: subbedOf(v.datum.stage).toString() }) } : {}),
+              onchainSyncedAt: Date.now(),
+            }
+          : cur,
+      );
+      if (settled) {
+        if (stable) await drop(c.channelId);
         continue;
       }
-      if (stage.kind !== "closed") continue;
-      // Refuse vouchers from here on: the channel can only be settled now.
-      const withdrawRequestedAt = Number((stage.elapseAt - v.datum.constants.closePeriodMs) / 1000n);
-      await o.storage.updateChannel(c.channelId, (cur) => (cur ? { ...cur, channelRef: v.ref, withdrawRequestedAt, onchainSyncedAt: Date.now() } : cur));
-      if (c.withdrawRequestedAt === 0) opts.onEvent?.({ kind: "closed", channelId: c.channelId, elapseAt: stage.elapseAt });
-      if (BigInt(c.chargedCumulativeAmount) > stage.subbed) closed.push(c.channelId);
+      if (v.datum.stage.kind === "opened" && c.withdrawRequestedAt !== 0) {
+        await o.storage.updateChannel(c.channelId, (cur) => (cur ? { ...cur, withdrawRequestedAt: 0 } : cur));
+        opts.onEvent?.({ kind: "reopened", channelId: c.channelId });
+        continue;
+      }
+      await onClosed(c, v, closed);
     }
-    if (closed.length > 0) opts.onEvent?.({ kind: "settled", results: await manager.claim({ channelIds: closed }) });
+    await settle(closed);
   };
   const tick = () => {
     running ??= pass()

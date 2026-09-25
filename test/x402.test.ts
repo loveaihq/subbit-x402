@@ -8,8 +8,9 @@ import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402
 import { Assets, Client, KeyHash, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, parseDatum, datumData, type Stage } from "../src/subbit.ts";
 import { capacityOf, channelReserve, constantsOf, datumBindingError, planTokens, type ChannelView } from "../src/x402/cardano.ts";
-import type { Chain } from "../src/x402/chain.ts";
-import { BatchSettlementCardanoClient, FileClientStorage, derivedIouSigner, iouRootOf } from "../src/x402/client.ts";
+import type { Chain, ChainCursor } from "../src/x402/chain.ts";
+import { ChannelManager, type WatchEvent } from "../src/x402/manager.ts";
+import { BatchSettlementCardanoClient, FileClientStorage, collateralTarget, derivedIouSigner, iouRootOf } from "../src/x402/client.ts";
 import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x402/server.ts";
 import { Err, PayloadError, checkDelegationMac, configBindingError, delegationMac, parseClaimPayload, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
 
@@ -149,6 +150,18 @@ test("token inputs: enough for what is needed, largest first, then folded up to 
   // Needing more than the five largest hold takes as many as it needs.
   assert.equal(planTokens([u(1n), u(1n), u(1n), u(1n), u(1n), u(1n), u(1n)], cur, 6n, 0n).inputs.length, 6);
   assert.throws(() => planTokens(wallet, cur, 2_000_000n, 0n), /1000048 of the currency, 2000000 needed/);
+});
+
+test("collateral: the largest target the SDK's pick of up to three ADA-only inputs can return change from", () => {
+  const ada = (...xs: bigint[]) => xs.map((x) => ({ assets: Assets.fromLovelace(x) }) as unknown as UTxO.UTxO);
+  assert.equal(collateralTarget(ada(30_000_000n)), 5_000_000n);
+  assert.equal(collateralTarget(ada(2_500_000n)), 1_500_000n);
+  // Three small ones: all three go in, 1 ADA comes back.
+  assert.equal(collateralTarget(ada(1_877_274n, 1_800_000n, 1_700_000n, 1_000_000n)), 4_377_274n);
+  assert.equal(collateralTarget(ada(1_900_000n, 1_900_000n)), 2_800_000n);
+  // A big one covers the cap alone; adding the small ones would not be taken anyway.
+  assert.equal(collateralTarget(ada(6_000_000n, 500_000n, 500_000n)), 5_000_000n);
+  assert.throws(() => collateralTarget(ada(1_500_000n)), /no ADA-only UTxOs large enough/);
 });
 
 test("the ADA reserve covers every continuing output the channel can have", () => {
@@ -382,6 +395,114 @@ test("server: a retry of the latest voucher gets the same answer, charged once; 
   // The next one is charged as usual.
   assert.equal((await pay(3000n)).stage, "settled");
   assert.equal((await storage.get(TAG))!.chargedCumulativeAmount, "3000");
+});
+
+test("watcher, following: after one full read a quiet pass costs one query; closes and exits come from the transactions themselves", async () => {
+  const storage = new InMemoryChannelStorage();
+  const A = "a1".repeat(32);
+  const B = "b2".repeat(32);
+  const refA = `${"0a".repeat(32)}#0`;
+  const refB = `${"0b".repeat(32)}#0`;
+  const record = (id: string, ref: string) => ({ channelId: id, channelConfig: config, channelRef: ref, balance: "20000", totalClaimed: "3000", withdrawRequestedAt: 0, chargedCumulativeAmount: "3000", signedMaxClaimable: "3000", signature: "00".repeat(64), onchainSyncedAt: Date.now(), lastRequestTimestamp: Date.now() });
+  await storage.updateChannel(A, () => record(A, refA));
+  await storage.updateChannel(B, () => record(B, refB));
+  const view = (tag: string, ref: string, stage: Stage) => ({ ref, datum: { constants: constantsOf(config, tag), stage } }) as unknown as ChannelView;
+  const calls = { follow: 0, activity: 0, moves: 0 };
+  let activity: ChainCursor[] = [];
+  const moves = new Map<string, { spent: string[]; channels?: ChannelView[] }>();
+  const chain = {
+    followChannel: async (ref: string, _s: string, tag: string) => {
+      calls.follow++;
+      return view(tag, ref, { kind: "opened", subbed: 3000n });
+    },
+    tipHeight: async () => 100,
+    txHeight: async () => 90,
+    scriptTip: async () => ({ hash: "00".repeat(32), height: 1, index: 0 }),
+    scriptActivity: async () => {
+      calls.activity++;
+      const out = activity;
+      activity = [];
+      return out;
+    },
+    channelMoves: async (hash: string, _s: string, wanted: (ref: string) => boolean) => {
+      calls.moves++;
+      const m = moves.get(hash)!;
+      return m.spent.some(wanted) ? m : { spent: m.spent };
+    },
+  } as unknown as Chain;
+  const manager = new ChannelManager({ storage, providerKeyHash: PROVIDER, chain, facilitator: {} as never, network: "cardano:preprod", payTo: PAY_TO, scriptHash: SUBBIT_HASH });
+  const events: WatchEvent[] = [];
+  const w = manager.watch({ intervalMs: 3_600_000, mode: "follow", onEvent: (e) => events.push(e) });
+  try {
+    await w.tick(); // the first pass reads each channel once
+    await w.tick(); // nothing new at the address
+    assert.deepEqual(calls, { follow: 2, activity: 1, moves: 0 });
+    // Someone else's transaction; A's consumer closes (nothing is owed, so nothing to settle); B is closed out by agreement.
+    const closedA = view(A, `${"1a".repeat(32)}#0`, { kind: "closed", subbed: 3000n, elapseAt: 1_790_000_000_000n });
+    moves.set("t1", { spent: [`${"ff".repeat(32)}#0`] });
+    moves.set("t2", { spent: [refA], channels: [closedA] });
+    moves.set("t3", { spent: [refB], channels: [] });
+    activity = ["t1", "t2", "t3"].map((hash, i) => ({ hash, height: 2, index: i }));
+    await w.tick();
+    assert.deepEqual(calls, { follow: 2, activity: 2, moves: 3 });
+    assert.deepEqual(events.map((e) => e.kind), ["closed", "gone"]);
+    const a = (await storage.get(A))!;
+    assert.equal(a.channelRef, closedA.ref);
+    assert.equal(a.anchorRef, closedA.ref);
+    assert.equal(a.withdrawRequestedAt, 1_789_999_100);
+    assert.equal(await storage.get(B), undefined);
+    // A transaction not yet 3 blocks deep waits for a later pass.
+    moves.set("t4", { spent: [closedA.ref], channels: [] });
+    activity = [{ hash: "t4", height: 99, index: 0 }];
+    await w.tick();
+    assert.ok(await storage.get(A));
+  } finally {
+    w.stop();
+  }
+});
+
+test("watcher, polling: rolled-back claims and closes are followed back; a record goes only once its end is deep", async () => {
+  const storage = new InMemoryChannelStorage();
+  const [A, B, C, D] = ["a1", "b2", "c3", "d4"].map((x) => x.repeat(32)) as [string, string, string, string];
+  const pos = (x: string) => `${x.repeat(32)}#0`;
+  const base = (id: string) => ({ channelId: id, channelConfig: config, channelRef: pos("0" + id[1]), anchorRef: pos("0" + id[1]), balance: "20000", totalClaimed: "0", withdrawRequestedAt: 0, chargedCumulativeAmount: "3000", signedMaxClaimable: "3000", signature: "00".repeat(64), onchainSyncedAt: Date.now(), lastRequestTimestamp: Date.now() });
+  // A: a claim took it to 5,000 redeemed at a position the chain then lost. B: seen closed, the
+  // close then rolled back. C: settled one block ago. D: ended by its consumer one block ago.
+  await storage.updateChannel(A, () => ({ ...base(A), channelRef: pos("aa"), totalClaimed: "5000", chargedCumulativeAmount: "5000" }));
+  await storage.updateChannel(B, () => ({ ...base(B), withdrawRequestedAt: 1_789_999_100 }));
+  await storage.updateChannel(C, () => base(C));
+  await storage.updateChannel(D, () => base(D));
+  const view = (tag: string, ref: string, stage: Stage) => ({ ref, datum: { constants: constantsOf(config, tag), stage } }) as unknown as ChannelView;
+  let tip = 100;
+  const chain = {
+    tipHeight: async () => tip,
+    txHeight: async (hash: string) => ({ ["cc".repeat(32)]: 99 })[hash] ?? 50,
+    followChannel: async (_ref: string, _s: string, tag: string) =>
+      tag === A ? view(A, pos("01"), { kind: "opened", subbed: 2000n }) : tag === B ? view(B, pos("02"), { kind: "opened", subbed: 0n }) : tag === C ? view(C, pos("cc"), { kind: "settled" }) : undefined,
+    exitOf: async () => ({ txHash: "dd".repeat(32), height: 99 }),
+  } as unknown as Chain;
+  const manager = new ChannelManager({ storage, providerKeyHash: PROVIDER, chain, facilitator: {} as never, network: "cardano:preprod", payTo: PAY_TO, scriptHash: SUBBIT_HASH });
+  const events: WatchEvent[] = [];
+  const w = manager.watch({ intervalMs: 3_600_000, onEvent: (e) => events.push(e) });
+  try {
+    await w.tick();
+    // A is back where the chain has it, with 2,000 redeemed: claimable again, being charged 5,000.
+    assert.equal((await storage.get(A))!.channelRef, pos("01"));
+    assert.equal((await storage.get(A))!.totalClaimed, "2000");
+    assert.equal((await manager.claimable()).map((x) => x.c.channelId).includes(A), true);
+    // B takes vouchers again.
+    assert.equal((await storage.get(B))!.withdrawRequestedAt, 0);
+    // C and D stay while what ended them is one block deep.
+    assert.ok(await storage.get(C));
+    assert.ok(await storage.get(D));
+    tip = 110;
+    await w.tick();
+    assert.equal(await storage.get(C), undefined);
+    assert.equal(await storage.get(D), undefined);
+    assert.deepEqual(events.map((e) => e.kind), ["reopened", "gone", "gone"]);
+  } finally {
+    w.stop();
+  }
 });
 
 test("server: one request per channel at a time", async () => {

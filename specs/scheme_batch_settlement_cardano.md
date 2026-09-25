@@ -437,7 +437,9 @@ not delegate.)
   closed channel) with its own wallet paying fee and collateral, pays everything redeemed to
   `payTo` in one output, signs and broadcasts it. That output is subject to min-UTxO (about 0.97
   tADA, or a token's min-UTxO): a server SHOULD claim at least that much, and below it the
-  facilitator's wallet tops the output up (on preprod a 0.5 tADA claim paid 0.969750).
+  facilitator's wallet tops the output up (on preprod a 0.5 tADA claim paid 0.969750). A token
+  payout always needs its own ADA, which the facilitator's wallet puts up: 1.176630 tADA per
+  tUSDM claim on preprod.
 - **Refunds.** The server passes the `refund` on without `providerWitness`, with a
   `delegationMac`; the facilitator checks the `Mutual` as above and co-signs it.
 - **`delegationMac`** = HMAC-SHA256(secret, canonical JSON of `{ payTo, payload }`), with
@@ -458,7 +460,15 @@ period. On seeing a close it SHOULD stop accepting the channel's vouchers (set
 batched claim, leaving the channel `Settled` for the consumer to `End`. The reference server polls
 every 15–30 s and drops a channel's record only once the channel is settled, or after two
 consecutive reads find no channel, since one missing read may be a lagging index and the record
-holds the only copy of the latest voucher. On preprod, with a 15 s poll and the 900 s minimum
+holds the only copy of the latest voucher. With many channels a server SHOULD follow the
+validator's address rather than read each channel: the reference server can read every channel
+once and then only the address's new transactions, and the outputs of those that spend its
+channels (on preprod, 1 request a quiet pass against 20 for ten channels polled, and 3 to find a
+close among them). What the server records MUST survive a rollback: its record of a channel holds
+the only copy of the latest voucher. The reference server keeps, for each channel, a position at
+least 3 blocks deep and reads from there forward, so a rolled-back claim leaves the charges
+claimable and a rolled-back close reopens the channel; it drops a record only once the transaction
+that ended the channel is that deep, and, following, acts on a transaction only once it is. On preprod, with a 15 s poll and the 900 s minimum
 close period, the close was seen within 12 s and the settle landed 30–62 s after it, over 18
 minutes before `elapseAt`. A settle costs what a `Sub` does.
 
@@ -572,7 +582,9 @@ Blockfrost. `RESULTS.md` records every preprod transaction: steps 1–3 exercise
 step 4 the ADA binding end to end, step 5 a token binding, step 6 top-ups and the automatic
 settle after a consumer's close, step 7 a client that folds its token UTxOs, step 8 recovery
 after state loss, step 9 retries answered from the kept response and a server whose provider key
-the facilitator holds, step 10 the binding in Moneta's preprod tUSDM.
+the facilitator holds, step 10 the binding in Moneta's preprod tUSDM, step 11 the watcher
+following the chain, and `elapse` and delegation on token channels, step 12 a watcher that
+survives rollbacks.
 
 ## Version history
 
@@ -582,3 +594,5 @@ the facilitator holds, step 10 the binding in Moneta's preprod tUSDM.
 | 0.2 | 2026-09-24 | Top-ups (`Add`) and their verification; the server watches its channels and settles a closed one; a voucher above the recorded balance is checked against the chain; token outputs are folded, by the server and the client |
 | 0.3 | 2026-09-24 | IOU keys derived from the wallet; recovery after state loss, for the client and the server |
 | 0.4 | 2026-09-25 | Retries of the latest voucher answered from the kept response; delegating the provider key to the facilitator |
+| 0.5 | 2026-09-25 | Following the validator's address instead of polling each channel; token-channel exits and delegation measured |
+| 0.6 | 2026-09-25 | The server's channel records survive rollbacks: a deep anchor per channel, records dropped only when their end is deep |

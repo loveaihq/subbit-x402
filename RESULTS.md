@@ -634,14 +634,113 @@ after, the provider's in one after.
 account 3 untouched; the wallets lost 2.166582 tADA, exactly the fees of the 9 transactions. tUSDM:
 consumer 1,000 → 999.973, provider 0 → 0.027, nothing left in channels, so none created or lost.
 
+## Step 11: the watcher at scale, and the token paths not yet run
+
+**Following the chain instead of polling it.** The watcher read every channel the server holds
+on every pass, two requests each. It can now follow the validator's address instead
+(`watch({ mode: "follow" })`): it reads every channel once, notes the address's latest
+transaction, and from then on asks only for the address's new transactions, one request, reading
+a transaction's outputs only when it spends a channel of this server. A spend with no continuing
+output is an exit, read from the spending transaction itself, so no second look is needed. Ten
+channels with three charged requests each, tADA, `out/x402-step11-scale/`, Blockfrost requests
+counted at `fetch` (the SDK's included):
+
+| Pass | Requests | Time |
+|---|---:|---:|
+| polling, 10 channels | 20 | 4.7 s |
+| following, the first pass (reads every channel once) | 20 | 4.9 s |
+| following, nothing new | 1 | 0.2 s |
+| following, the pass that saw a close among the 10 | 3 to find it; 33 with the settle | |
+
+Polling grows with the channels, two requests each per pass: at a 15 s interval a thousand
+channels would be over 130 requests a second, far above what a Blockfrost project allows.
+Following costs one request a pass plus two per transaction that concerns the server.
+
+| Step | Transaction | Result |
+|---|---|---|
+| requests 1 | `db104fef…`, `581ca509…`, `cd2ab0df…`, `e436826d…`, `f7ff8a11…`, `525c7f01…`, `a6a521d7…`, `a2a8b0f0…`, `9e422518…`, `edc0211a…` | ten channels, three requests each |
+| close | `cfe2d9538cfa57d4ab254dcfc28b4cf14689f3332cc10be20fbf1535411fb77c` | channel 1's consumer alone |
+| settle | `a7b1170e9bcc4e76e3095b6757e4d76ace6dd297631024657c8d26a582430a72` | the follower, on the pass that saw the close |
+| end | `75d6b6a0d029a4eb3741ee5e9100d45cbf0041d2fe131a709a839a514731d484` | channel 1's consumer |
+| claim | `49ce6b1d13c77aef4235cad937d0a0c7fe54a6c1bb279e7e3da3a8a4ca807f2d` | the other nine in one transaction: 3,639 B, 0.542567 tADA |
+| refunds | nine `Mutual`s, `dd5a3674…` the last | 1.513907 tADA back from each |
+
+The first attempt stopped at the close: the consumer's largest ADA-only UTxO was 1.877 tADA, and
+the collateral rule wanted one of at least 2.2. The ten openings had locked 17.5 tADA, and 23.9 tADA
+sits in a UTxO that also holds strangers' tokens, which the client never spends. The SDK itself
+takes up to three ADA-only UTxOs, largest first, until they reach the target, and fails when the
+return is under min-UTxO; the rule now picks the largest target that works for the inputs the SDK
+will take (at least 1 tADA, at most 5), so three UTxOs of 1.8 tADA do. The rerun took up the ten
+open channels. **Reconciliation:** consumer 35.426394 → 31.021784, provider 20.909264 → 20.138304
+tADA; the wallets lost 5.175570 tADA, exactly the fees of the 23 transactions.
+
+**`elapse` on a token channel.** Step 8's channel C again, in tUSDM, `out/x402-step11-elapse-tusdm/`:
+opened (`e115d5addd6352416e7377e171b72a68268c2f0c7a718c8cdfea5c7edc4ea14e`), 3 requests, the
+server's record and the client's deleted, the channel recovered, closed alone
+(`7c76954733dc0dfc5be3604708989fdc3dad1dec6da3196d0171c5d75e8760e4`), and elapsed
+(`abfb361f9ffe04c5e6fcb703f1c48eef3305d637ed9cb5daac1d86840805f067`) in a block 145 s after
+`elapse_at`: all 0.020 tUSDM and the 2.133450 tADA reserve back, the tokens into the consumer's one
+tUSDM output. Not yet bound to a server, the channel's exits carried the validator inline (close
+3,847 B, 0.342342 tADA; elapse 3,643 B, 0.326039). Reconciled: 0.853770 tADA lost, the three
+fees; no tUSDM created or lost.
+
+**Delegation on a token channel.** Step 9's keyless server, priced at 0.1 tUSDM,
+`out/x402-step11-delegate-tusdm/`: A opened (`3ff537afbf1426fe91bf99990fa62aeda8e616ed3549933ae54a2bf60a1068cb`),
+claimed by the facilitator (`e267d258acf3f655ded77bccc7dae6e389537eded546e18f5aefeb1d435c0e24`,
+1.0 tUSDM; `4da2d59bba71890c083be447a01da9f412ac7330d21d41db4e20bc2a40961827`, 0.5), refunded
+with its co-signature (`7e7aadd0a129c9d531029fcc62e098a570b7307ef507fbdffa3df3835e0578d5`); B
+opened (`575ffd57ac62e40f2e64e5ace1b005b846990832b347580c1cc7de6013fbf6c4`), closed by its consumer
+(`5a42e7554a125890a902e3ac5a642e2e0827b74052b7b3450613ab275b8915dd`), settled by the facilitator
+on the watcher's request (`cbdf48e67e6cd0c29048c458d14b07ad6f69c633c96f6a97549a6710c283977d`, 1.2
+tUSDM), ended (`e732fec10c0b97f9e805d308b1edc44bfb24610cf1b553b12494116023306fb5`). Every payout
+is tUSDM in an output of its own, which needs 1.176630 tADA: account 3 put up 3.529890 tADA for the
+three, besides 0.802466 in fees, and all of it stayed with `payTo`. Reconciled: the three wallets
+lost 1.905246 tADA, the 8 fees; tUSDM consumer 999.973 → 997.273, provider 0.027 → 2.727.
+
+## Step 12: a watcher that survives rollbacks
+
+Step 11 listed rollbacks as open and called the cost of one a failed settle, retried. That was
+too kind. The server's records moved with every transaction it saw, and a transaction can be
+rolled back: after a claim, a record pointed at the claim's output, and had the claim been rolled
+back the watcher would not have found the channel from there twice running and dropped the record,
+and with it the only copy of the latest voucher. A close rolled back would have left the server
+refusing the channel's vouchers for good.
+
+Now each record also keeps an anchor, a position of the channel at least 3 blocks deep, and every
+read starts there and follows the channel forward, so a transaction the chain has dropped is simply
+not found again:
+
+- A claim rolled back: the channel is found where the chain has it, what is redeemed is taken from
+  there, and the charges are claimable again.
+- A close rolled back: the channel is found open again; the watcher reports it and takes its
+  vouchers again.
+- A record goes only once the transaction that ended the channel, its settle or its consumer's
+  end, is 3 blocks deep; the manager no longer drops a record the moment its settle confirms.
+- Following, the watcher acts on a transaction only once it is 3 blocks deep.
+
+A rollback cannot be ordered up on preprod, so the rollbacks themselves are shown by chain-free
+tests (a claim and a close rolled back, a settle and an end kept until deep, a shallow transaction
+left for a later pass), and preprod shows the depth rule doing no harm in step 6's automatic
+settle, run once each way, `out/x402-step12/`:
+
+| Watcher | Close | Settle | Result |
+|---|---|---|---|
+| polling | `bd2f95e079d481dcac28137b40d90f7be96383f5052addd194f3cc3b66a53f51` | `5d2f15cfc922d2bb33e4064801ec0a2f9c7fdeb594cd42da345902fdfce665e1` | close seen 6 s after the client had it; settle in a block 56 s after the close's, 18.1 min before `elapse_at`; the record dropped 35 s after the settle, once deep |
+| following | `940f1d42674b199fea88d86181892380ceff1d002c4a26ef901a7e6f45f31d68` | `d5a03af65401abf1b3f1362d9a9255657eb9fbb232df5a219dbfc2deef7d125c` | close acted on once 3 blocks deep, 2 min 36 s after the client had it; settle 170 s after the close, 16.6 min before `elapse_at`; the record dropped 37 s after the settle |
+
+Following trades about two minutes of the close period for never acting on a transaction that may
+yet disappear; the shortest close period the binding allows, 900 s after a close that may take 300
+s to land, leaves room for it. The channels were opened by `25821f95…` and `b169cb38…` and ended by
+the consumer (`e6855813…`, `07e9edef…`). **Reconciliation:** consumer 31.021784 → 29.670002,
+provider 20.138304 → 19.645522 tADA; the wallets lost 1.844564 tADA, exactly the fees of the 8
+transactions.
+
 ## What this does not show yet
 
-- The watcher at scale: each pass reads every channel the server holds, two or three Blockfrost
-  queries each. With many channels a server would follow the chain rather than poll it.
-- Recovery in a token currency: step 8 ran in tADA. `elapse` has not run on a token channel; its
-  token handling is `end`'s, which step 7 ran.
-- Delegation in a token currency: step 9 ran in tADA. A token payout needs its own min-UTxO of ADA
-  (about 1.17 tADA), which under delegation the facilitator's wallet puts up on every claim.
+- Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a
+  client whose own transaction is rolled back re-reads its channel from the last position it
+  recorded, which may then be gone; its funds stay safe, and `recover` finds the channel again.
+- Anything on mainnet.
 
 ## Notes for the binding spec
 
@@ -714,6 +813,14 @@ consumer 1,000 → 999.973, provider 0 → 0.027, nothing left in channels, so n
 - A lost response costs nothing when the server keeps each channel's latest answer: the retry
   carries the same voucher and gets the same answer, uncharged. Only the latest, or a client
   resyncing from `subbed` gets old answers instead of the corrective 402.
+- A server with many channels should follow the validator's address, not poll each channel: one
+  request a pass against two per channel, and a close found for three.
+- What a server records about a channel must survive a rollback: keep a position that is deep
+  enough, read from it forward, and let a record go only once what ended the channel is deep too.
+  The record holds the only copy of the latest voucher.
+- Collateral: the SDK takes up to three ADA-only UTxOs; sizing the target for those it will take
+  keeps a wallet of small UTxOs usable. A token payout under delegation costs the facilitator a
+  token output's min-UTxO, 1.176630 tADA each here.
 - Delegating the provider key is custody on Subbit: the key can pay a redemption anywhere. It
   takes a key per server tied to its `payTo`, the server's authentication on every claim and
   refund (a channel settles once, and the key would otherwise settle on a consumer's say-so), and
@@ -760,6 +867,13 @@ X402_OUT=x402-step9-delegate npm run x402 -- report
 export SUBBIT_CURRENCY=tusdm X402_OUT=x402-step10-tusdm   # step 10: Moneta's tUSDM, once the wallet holds some
 npm run x402 -- wallets before && npm run x402 -- topup && npm run x402 -- autosettle
 npm run x402 -- wallets after && npm run x402 -- report
+
+X402_OUT=x402-step11-scale npm run x402 -- scale     # step 11 (tADA): polling against following, ten channels
+SUBBIT_CURRENCY=tusdm X402_OUT=x402-step11-elapse-tusdm npm run x402 -- recover-elapse
+SUBBIT_CURRENCY=tusdm X402_OUT=x402-step11-delegate-tusdm npm run x402 -- delegate
+
+X402_OUT=x402-step12 npm run x402 -- autosettle            # step 12: the watcher polling, then following
+X402_OUT=x402-step12 npm run x402 -- autosettle follow
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

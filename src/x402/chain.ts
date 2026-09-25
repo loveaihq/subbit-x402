@@ -6,6 +6,13 @@ import { Address, Client, ScriptHash, Transaction, TransactionHash, TransactionI
 import { networkIdOf, readChannel, refOf, type ChannelView } from "./cardano.ts";
 import type { CardanoNetwork } from "./types.ts";
 
+/** A transaction at the validator's address, and where it sits in the chain. */
+export interface ChainCursor {
+  hash: string;
+  height: number;
+  index: number;
+}
+
 export interface Chain {
   readonly network: CardanoNetwork;
   /** The output at `ref` if it exists and is unspent. */
@@ -28,8 +35,27 @@ export interface Chain {
   channels(scriptHash: string): Promise<ChannelView[]>;
   /** The slot of the latest block. */
   tipSlot(): Promise<bigint>;
+  /** The height of the latest block. */
+  tipHeight(): Promise<number>;
+  /** The height of the block holding a transaction; undefined while (or once) the index does not know it. */
+  txHeight(txHash: string): Promise<number | undefined>;
+  /**
+   * For a channel `followChannel` finds gone: the transaction that spent its last position without
+   * continuing it, and that transaction's height. Undefined when the channel is not gone after all,
+   * or the index cannot say yet.
+   */
+  exitOf(ref: string, scriptHash: string, tag: string): Promise<{ txHash: string; height: number } | undefined>;
   /** What a transaction's outputs at `address` hold, by unit (`lovelace`, or policy and name run together). */
   paidTo(txHash: string, address: string): Promise<Map<string, bigint>>;
+  /** The latest transaction at this script's address (without a stake credential): where following starts. */
+  scriptTip(scriptHash: string): Promise<ChainCursor | undefined>;
+  /** The transactions at that address after `after`, oldest first. */
+  scriptActivity(scriptHash: string, after?: ChainCursor): Promise<ChainCursor[]>;
+  /**
+   * What a transaction spent, and, when `wanted` holds for one of those inputs, the channels it
+   * left at the script: one query for any transaction, a second only for those that matter.
+   */
+  channelMoves(txHash: string, scriptHash: string, wanted: (ref: string) => boolean): Promise<{ spent: string[]; channels?: ChannelView[] }>;
 }
 
 interface BfOutput {
@@ -145,10 +171,85 @@ export class BlockfrostChain implements Chain {
     });
   }
 
+  async tipHeight(): Promise<number> {
+    const r = await fetch(`${this.baseUrl}/blocks/latest`, { headers: { project_id: this.projectId } });
+    if (!r.ok) throw new Error(`Blockfrost /blocks/latest: ${r.status}`);
+    return ((await r.json()) as { height: number }).height;
+  }
+
+  async txHeight(txHash: string): Promise<number | undefined> {
+    const r = await fetch(`${this.baseUrl}/txs/${txHash}`, { headers: { project_id: this.projectId } });
+    if (r.status === 404) return undefined;
+    if (!r.ok) throw new Error(`Blockfrost /txs/${txHash.slice(0, 16)}…: ${r.status}`);
+    return ((await r.json()) as { block_height: number }).block_height;
+  }
+
+  async exitOf(ref: string, scriptHash: string, tag: string): Promise<{ txHash: string; height: number } | undefined> {
+    let [hash, index] = splitRef(ref);
+    for (let hops = 0; hops < 1000; hops++) {
+      const o = (await this.txOutputs(hash))?.find((x) => x.output_index === index);
+      if (!o?.consumed_by_tx) return undefined;
+      const next = o.consumed_by_tx;
+      const at = ((await this.txOutputs(next)) ?? []).filter((x) => !x.collateral && isScriptAddress(x.address, scriptHash));
+      const candidates = at.length ? await this.provider.getUtxosByOutRef(at.map((x) => input(next, x.output_index))) : [];
+      const cont = candidates.find((u) => {
+        const ch = readChannel(u, scriptHash);
+        return !("error" in ch) && ch.datum.constants.tag === tag;
+      });
+      if (!cont) {
+        const height = await this.txHeight(next);
+        return height === undefined ? undefined : { txHash: next, height };
+      }
+      [hash, index] = splitRef(refOf(cont));
+    }
+    throw new Error(`channel ${tag.slice(0, 16)}… moved more than 1000 times from ${ref}`);
+  }
+
   async tipSlot(): Promise<bigint> {
     const r = await fetch(`${this.baseUrl}/blocks/latest`, { headers: { project_id: this.projectId } });
     if (!r.ok) throw new Error(`Blockfrost /blocks/latest: ${r.status}`);
     return BigInt(((await r.json()) as { slot: number }).slot);
+  }
+
+  async scriptTip(scriptHash: string): Promise<ChainCursor | undefined> {
+    const rows = await this.addressTxs(scriptHash, "order=desc&count=1&page=1");
+    return rows[0];
+  }
+
+  async scriptActivity(scriptHash: string, after?: ChainCursor): Promise<ChainCursor[]> {
+    const out: ChainCursor[] = [];
+    // `from` is inclusive and takes block:index; the index after the last one seen moves past it.
+    const from = after ? `&from=${after.height}:${after.index + 1}` : "";
+    for (let page = 1; ; page++) {
+      const rows = await this.addressTxs(scriptHash, `order=asc&count=100&page=${page}${from}`);
+      out.push(...rows.filter((r) => !after || r.hash !== after.hash));
+      if (rows.length < 100) return out;
+    }
+  }
+
+  async channelMoves(txHash: string, scriptHash: string, wanted: (ref: string) => boolean): Promise<{ spent: string[]; channels?: ChannelView[] }> {
+    const r = await fetch(`${this.baseUrl}/txs/${txHash}/utxos`, { headers: { project_id: this.projectId } });
+    if (!r.ok) throw new Error(`Blockfrost /txs/${txHash.slice(0, 16)}…/utxos: ${r.status}`);
+    const io = (await r.json()) as { inputs: Array<{ tx_hash: string; output_index: number; collateral?: boolean; reference?: boolean }>; outputs: BfOutput[] };
+    const spent = io.inputs.filter((i) => !i.collateral && !i.reference).map((i) => `${i.tx_hash}#${i.output_index}`);
+    if (!spent.some(wanted)) return { spent };
+    const at = io.outputs.filter((o) => !o.collateral && isScriptAddress(o.address, scriptHash));
+    const utxos = at.length ? await retryQueries("channel outputs", () => this.provider.getUtxosByOutRef(at.map((o) => input(txHash, o.output_index)))) : [];
+    return {
+      spent,
+      channels: utxos.flatMap((u) => {
+        const ch = readChannel(u, scriptHash);
+        return "error" in ch ? [] : [ch];
+      }),
+    };
+  }
+
+  private async addressTxs(scriptHash: string, query: string): Promise<ChainCursor[]> {
+    const address = Address.toBech32(new Address.Address({ networkId: networkIdOf(this.network), paymentCredential: ScriptHash.fromHex(scriptHash) }));
+    const r = await fetch(`${this.baseUrl}/addresses/${address}/transactions?${query}`, { headers: { project_id: this.projectId } });
+    if (r.status === 404) return [];
+    if (!r.ok) throw new Error(`Blockfrost /addresses/…/transactions: ${r.status}`);
+    return ((await r.json()) as Array<{ tx_hash: string; block_height: number; tx_index: number }>).map((x) => ({ hash: x.tx_hash, height: x.block_height, index: x.tx_index }));
   }
 
   async paidTo(txHash: string, address: string): Promise<Map<string, bigint>> {
@@ -198,6 +299,16 @@ export async function retryQueries<T>(what: string, fn: () => Promise<T>, attemp
       if (!query || /ScriptFailures|Script evaluation failed/.test(text) || i >= attempts) throw e;
       await new Promise((res) => setTimeout(res, 5_000 * i));
     }
+  }
+}
+
+/** Whether a bech32 address pays to this script, with any stake part. */
+function isScriptAddress(bech32: string, scriptHash: string): boolean {
+  try {
+    const cred = Address.fromBech32(bech32).paymentCredential;
+    return cred instanceof ScriptHash.ScriptHash && ScriptHash.toHex(cred) === scriptHash;
+  } catch {
+    return false;
   }
 }
 

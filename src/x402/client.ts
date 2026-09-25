@@ -690,16 +690,28 @@ export async function signedHex(sb: { toTransaction(): Promise<Transaction.Trans
 }
 
 /**
- * The SDK takes the largest ADA-only UTxO as collateral against a fixed 5 ADA target and fails
- * when what comes back is under min-UTxO, without trying another input or amount. Aim the
- * target so the return clears min-UTxO: 5 ADA when the UTxO allows it, else what it holds
- * less 1.2 ADA. Any of these still covers 150% of a fee this size many times over.
+ * The collateral to ask the SDK for. It takes ADA-only UTxOs largest first, up to three, until
+ * they reach the target, puts up exactly the target, and fails when what comes back is under
+ * min-UTxO, without trying another amount. So the target is picked for the inputs it will take:
+ * the largest one for which that many inputs leave at least 1 ADA to return, at most 5 ADA and at
+ * least 1 ADA, which covers 150% of any fee here. One UTxO of 2 ADA does it, and so do three of
+ * 0.7 ADA; the old rule wanted a single UTxO of 2.2 ADA.
  */
 export function collateralTarget(adaOnly: UTxO.UTxO[]): bigint {
-  const largest = adaOnly.reduce((m, u) => (Assets.lovelaceOf(u.assets) > m ? Assets.lovelaceOf(u.assets) : m), 0n);
-  const target = largest >= 6_200_000n ? 5_000_000n : largest - 1_200_000n;
-  if (target < 1_000_000n) throw new Error(`no ADA-only UTxO large enough for collateral (largest ${largest})`);
-  return target;
+  const RETURN = 1_000_000n; // above an ADA-only output's min-UTxO at these addresses (0.969750)
+  const CAP = 5_000_000n;
+  const FLOOR = 1_000_000n;
+  const top = adaOnly.map((u) => Assets.lovelaceOf(u.assets)).sort((x, y) => (y > x ? 1 : y < x ? -1 : 0)).slice(0, 3);
+  let best = 0n;
+  let taken = 0n;
+  for (const [k, amount] of top.entries()) {
+    const before = taken; // the SDK takes k + 1 inputs exactly when the target is above this
+    taken += amount;
+    const target = taken - RETURN < CAP ? taken - RETURN : CAP;
+    if ((k === 0 || target > before) && target > best) best = target;
+  }
+  if (best < FLOOR) throw new Error(`no ADA-only UTxOs large enough for collateral (largest three ${top.join(", ")})`);
+  return best;
 }
 
 /** Min-UTxO of an ADA-only output at `address`. */
