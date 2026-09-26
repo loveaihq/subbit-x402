@@ -229,6 +229,16 @@ UTxO folding in step 7, recovery after state loss (IOU keys derived from the wal
 the response kept for retries and provider-key delegation in step 9, Moneta's tUSDM in step 10,
 the watcher following the chain in step 11, and surviving rollbacks in step 12.
 
+In step 13, through ada-agent-wallet's MCP demo, a paid MCP tool's result is kept for its retry
+as well, when `@x402/mcp` can give it back unchanged: one text block, or structured content with
+its JSON as that block. Any other result's retry is charged again. Also in step 13, a top-up the
+wallet cannot fund falls back to what it can, then to the request's own shortfall. That can be
+less than the spec's `max(minDeposit, 10 × amount)`, which is a SHOULD. No top-up leaves the
+wallet without an ADA-only UTxO that it can put up as the refund's collateral. Two further
+changes come from step 13's first run. Before building, the client waits for Blockfrost to list
+what its own transaction in a block paid back to the wallet. And every read of the chain is tried
+again when it gets no answer.
+
 Code, in this repo:
 - `src/x402/`: shared types and checks; client scheme (`SchemeNetworkClient`); server scheme
   (`SchemeNetworkServer` with the hooks of §6, file storage); facilitator scheme

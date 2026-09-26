@@ -513,27 +513,24 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
     return r.amount === v.maxClaimableAmount && r.signature === v.signature && snapshot.chargedCumulativeAmount === r.amount ? r : undefined;
   }
 
-  /** Keeps a paid request's answer as its channel's latest: the handler's response (HTTP only) and the settlement. */
+  /**
+   * Keeps a paid request's answer as its channel's latest: the handler's response and the
+   * settlement. Over HTTP the response is the body the transport hands over; over MCP it is the
+   * tool's result, kept only in a shape `@x402/mcp` can give back unchanged (`mcpAnswer`).
+   */
   private keep(v: { channelId: string; maxClaimableAmount: string; signature: string }, ctx: SettleResultContext, enrichment?: Record<string, unknown>) {
     if (this.replayTtlMs <= 0 || !ctx.result.success) return;
-    const t = ctx.transportContext as { responseBody?: Uint8Array; responseHeaders?: Record<string, string> } | undefined;
-    if (!t?.responseBody) return;
-    const contentType = Object.entries(t.responseHeaders ?? {}).find(([k]) => k.toLowerCase() === "content-type")?.[1] ?? "application/json";
-    const bytes = Buffer.from(t.responseBody);
-    let body: unknown = bytes;
-    if (/json/i.test(contentType)) {
-      try {
-        body = JSON.parse(bytes.toString("utf8"));
-      } catch {
-        body = bytes.toString("utf8");
-      }
-    } else if (/^text\//i.test(contentType)) body = bytes.toString("utf8");
-    this.replays.delete(v.channelId); // re-inserted, so the map stays oldest first
+    const t = ctx.transportContext as { responseBody?: Uint8Array; responseHeaders?: Record<string, string>; result?: unknown } | undefined;
+    // The channel's earlier answer can no longer be served, whether or not this one can be kept;
+    // a kept one is re-inserted, so the map stays oldest first.
+    this.replays.delete(v.channelId);
+    const answer = t?.responseBody ? httpAnswer(t.responseBody, t.responseHeaders) : mcpAnswer(t?.result);
+    if (!answer) return;
     this.replays.set(v.channelId, {
       amount: v.maxClaimableAmount,
       signature: v.signature,
-      contentType,
-      body,
+      contentType: answer.contentType,
+      body: answer.body,
       result: structuredClone(ctx.result) as SettleResponse,
       ...(enrichment ? { enrichment: structuredClone(enrichment) } : {}),
       at: Date.now(),
@@ -631,6 +628,40 @@ function provisional(p: ClientPayload, charged: string): ServerChannel {
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/** An HTTP response body to keep for a replay, parsed as its content type says. */
+function httpAnswer(responseBody: Uint8Array, headers?: Record<string, string>): { contentType: string; body: unknown } {
+  const contentType = Object.entries(headers ?? {}).find(([k]) => k.toLowerCase() === "content-type")?.[1] ?? "application/json";
+  const bytes = Buffer.from(responseBody);
+  if (/json/i.test(contentType)) {
+    try {
+      return { contentType, body: JSON.parse(bytes.toString("utf8")) };
+    } catch {
+      return { contentType, body: bytes.toString("utf8") };
+    }
+  }
+  return { contentType, body: /^text\//i.test(contentType) ? bytes.toString("utf8") : bytes };
+}
+
+/**
+ * An MCP tool's result to keep for a replay, or `undefined` when a replay could not give it back
+ * unchanged. `@x402/mcp` turns a skip-handler body into a result itself: a string becomes one text
+ * block, and an object becomes structured content with its JSON as that block. So only those two
+ * shapes are kept. Anything else (several blocks, an image, an error, a `_meta` of the tool's own)
+ * is not, and its retry is charged as a new request.
+ */
+function mcpAnswer(result: unknown): { contentType: string; body: unknown } | undefined {
+  if (typeof result !== "object" || result === null) return undefined;
+  const r = result as Record<string, unknown>;
+  if (r.isError || Object.keys(r).some((k) => k !== "content" && k !== "structuredContent" && k !== "isError")) return undefined;
+  if (!Array.isArray(r.content) || r.content.length !== 1) return undefined;
+  const block = r.content[0] as Record<string, unknown>;
+  if (block?.type !== "text" || typeof block.text !== "string" || Object.keys(block).length !== 2) return undefined;
+  const s = r.structuredContent;
+  if (s === undefined) return { contentType: "text/plain", body: block.text };
+  const plain = typeof s === "object" && s !== null && !Array.isArray(s);
+  return plain && JSON.stringify(s) === block.text ? { contentType: "application/json", body: s } : undefined;
+}
 
 /** The provider signer for a seed wallet built with evolution-sdk: signs the exact bytes. */
 export function walletProviderSigner(wallet: { signTx(tx: string): Promise<TransactionWitnessSet.TransactionWitnessSet> }): ProviderSigner {

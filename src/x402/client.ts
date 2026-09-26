@@ -21,6 +21,7 @@ import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePayment
 import { Address, Assets, Client, InlineDatum, KeyHash, ScriptHash, Transaction, TransactionHash, TransactionInput, TransactionWitnessSet, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
 import { Redeemer, Step, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, subbitScript, tagFromInput, type Currency } from "../subbit.ts";
 import {
+  amountIn,
   assetOf,
   capacityOf,
   channelReserve,
@@ -28,6 +29,7 @@ import {
   currencyOf,
   msOfSlot,
   networkIdOf,
+  onlyCurrency,
   planTokens,
   refOf,
   slotAtOrAfter,
@@ -179,6 +181,11 @@ export interface ClientOptions {
   /** Shared by every client instance on one wallet: inputs their transactions just spent, and when. */
   spentInputs?: Map<string, number>;
   /**
+   * Shared the same way: outputs their transactions just paid back to the wallet. A build first
+   * waits for the wallet to list those of a transaction already in a block.
+   */
+  ownOutputs?: Map<string, OwnOutput>;
+  /**
    * How IOU keys are made. `derived` (the default): from the channel's tag and the wallet's
    * signature of `IOU_ROOT_MESSAGE`, so a client that has lost its records derives them again
    * and keeps using its channels. `random`: a fresh key per channel, kept only in the records;
@@ -190,11 +197,25 @@ export interface ClientOptions {
 /** How long spent inputs are held back from coin selection (`spentInputs` entries expire after it). */
 export const PENDING_MS = 5 * 60_000;
 
+/** An output one of the wallet's own transactions paid back to it: which transaction, and when. */
+export interface OwnOutput {
+  tx: string;
+  at: number;
+}
+
+/**
+ * How long a build waits for the wallet to list what its own transaction in a block paid back to
+ * it. Blockfrost's address index has trailed a block by about 20 s.
+ */
+export const INDEX_WAIT_MS = 60_000;
+
 export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   readonly scheme = SCHEME;
   readonly schemeHooks: SchemeClientHooks;
   /** Inputs spent recently, kept out of coin selection until the wallet's view drops them. */
   private readonly spent: Map<string, number>;
+  /** Outputs recent transactions paid back to the wallet, until the wallet's view shows them. */
+  private readonly ownOutputs: Map<string, OwnOutput>;
   /** The wallet's IOU root, asked for once. */
   private root?: Promise<Uint8Array>;
   /** This client's own top-ups, until the chain shows them: where each spent its channel from, and when. */
@@ -202,6 +223,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
 
   constructor(private readonly o: ClientOptions) {
     this.spent = o.spentInputs ?? new Map<string, number>();
+    this.ownOutputs = o.ownOutputs ?? new Map<string, OwnOutput>();
     this.schemeHooks = {
       onPaymentResponse: async (ctx) => {
         if (ctx.settleResponse) {
@@ -231,7 +253,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
           await this.o.storage.set(ch);
         }
         if (ceiling <= capacity) return { x402Version, payload: await this.voucher(ch, ceiling, req) };
-        return { x402Version, payload: await this.topUp(req, extra, ch, view, amount) };
+        return { x402Version, payload: await this.topUp(req, extra, ch, view, amount, ceiling - capacity) };
       }
       await this.o.storage.set({ ...ch, status: "closed" }); // gone from under us: open a new one
     }
@@ -262,27 +284,40 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   /**
    * A deposit on the channel that already exists: `Main([Add])` on its current position, the
    * same datum, and more of the currency; the voucher covers this request on the larger capacity.
+   *
+   * What capacity asks for is sized by the price that ran short, so it can be more than the
+   * wallet can put up (a pricier request on a channel opened for cheap ones; a wallet whose own
+   * change the chain's index does not show yet). Then the top-up is what the wallet can fund, as
+   * long as that still covers `short`, this request's own shortfall, and last `short` itself.
+   * Whatever it adds, it leaves the wallet an ADA-only UTxO it can put up as collateral: every way
+   * out of the channel, the refund first, is a script transaction.
    */
-  private async topUp(req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, amount: bigint) {
+  private async topUp(req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, amount: bigint, short: bigint) {
     const w = this.o.wallet;
     const me = await w.address();
-    const add = this.depositFor(req, extra, amount, this.maxDepositFor(req));
+    const want = this.depositFor(req, extra, amount, this.maxDepositFor(req));
     const all = await this.available();
     // ADA-only UTxOs pay the ADA and the fee, so no other token rides along into the change; a
     // token channel's tokens come from the UTxOs `planTokens` picks, folding older ones in.
     const adaOnly = all.filter((u) => Assets.hasOnlyLovelace(u.assets));
     const c = view.datum.constants.currency;
-    let tx = w.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.add()]) });
-    tx = await this.withValidator(tx, extra.referenceScript);
-    if (c.kind !== "ada") tx = withTokens(tx, me, c, planTokens(all, c, add, 0n));
-    tx = tx
-      .payToAddress({ address: view.address, assets: valueFor(c, view.amount + add, view.lovelace), datum: view.utxo.datumOption as InlineDatum.InlineDatum })
-      .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
-    const sb = await retryQueries("top-up", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
+    const fundable = c.kind === "ada" ? adaOnly.reduce((s, u) => s + Assets.lovelaceOf(u.assets), 0n) - TOP_UP_HEADROOM : tokensHeld(all, c);
+    const { built: sb, amount: add } = await firstThatBuilds(topUpAmounts(want, short, fundable), async (add) => {
+      let tx = w.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.add()]) });
+      tx = await this.withValidator(tx, extra.referenceScript);
+      if (c.kind !== "ada") tx = withTokens(tx, me, c, planTokens(all, c, add, 0n));
+      tx = tx
+        .payToAddress({ address: view.address, assets: valueFor(c, view.amount + add, view.lovelace), datum: view.utxo.datumOption as InlineDatum.InlineDatum })
+        .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
+      const built = await retryQueries("top-up", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
+      const left = adaOnlyAfter(await built.toTransaction(), adaOnly, me);
+      if (!canCollateralize(left)) throw new Error(`a top-up of ${add} would leave no ADA-only UTxOs large enough for the refund's collateral (left: ${left.join(", ") || "none"})`);
+      return built;
+    });
     const signed = await signedHex(sb);
     const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
     await this.o.authorize?.({ kind: "topUp", channel: ch, amount: ceiling, deposit: add, transaction: signed, view, requirements: req });
-    for (const i of Transaction.fromCBORHex(signed).body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
+    this.recordOwn(signed, me);
     this.topUps.set(ch.channelId, { from: view.ref, tx: txHashOf(signed), at: Date.now() });
     return {
       type: "deposit",
@@ -413,7 +448,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       ...(extra.referenceScript ? { referenceScript: extra.referenceScript } : {}),
     };
     await this.o.authorize?.({ kind: "open", channel: ch, amount, deposit, reserve, transaction: signed, requirements: req });
-    for (const r of openInputs) this.spent.set(r, Date.now());
+    this.recordOwn(signed, me);
     await this.o.storage.set(ch);
     return {
       type: "deposit",
@@ -537,6 +572,9 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const sb = await retryQueries("refund", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
     const signed = await signedHex(sb);
     await this.o.authorize?.({ kind: "refund", channel: ch, amount: charged, payout: owed > 0n ? owed : 0n, transaction: signed, view, requirements: req });
+    // The server submits it, if it is sent at all: its inputs stay available, and what it pays back
+    // is waited for only once it is in a block.
+    this.recordOwn(signed, me, { spends: false });
 
     const payload: RefundPayload = {
       type: "refund",
@@ -731,10 +769,25 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const sb = await retryQueries(what, () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
     const hex = await signedHex(sb);
     await this.o.authorize?.({ kind: what, channel: ch, transaction: hex, view });
-    for (const i of Transaction.fromCBORHex(hex).body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
+    this.recordOwn(hex, me);
     const txHash = await this.o.chain.submit(hex);
     if (!(await this.o.chain.awaitTx(txHash, 300_000))) throw new Error(`${what}: ${txHash} not in a block after 5 minutes`);
     return txHash;
+  }
+
+  /**
+   * Books a transaction of the wallet's own: its inputs are kept out of coin selection, and the
+   * outputs it pays back to the wallet are waited for, until the wallet's view shows both.
+   */
+  private recordOwn(hex: string, me: Address.Address, o: { spends: boolean } = { spends: true }) {
+    const tx = Transaction.fromCBORHex(hex);
+    const at = Date.now();
+    if (o.spends) for (const i of tx.body.inputs) this.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, at);
+    const hash = txHashOf(hex);
+    const mine = Address.toHex(me);
+    tx.body.outputs.forEach((out, i) => {
+      if (Address.toHex(out.address) === mine) this.ownOutputs.set(`${hash}#${i}`, { tx: hash, at });
+    });
   }
 
   /**
@@ -742,10 +795,35 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
    * wallet no longer lists it (the spend is indexed) or after PENDING_MS (the spend never landed).
    */
   private async available(): Promise<UTxO.UTxO[]> {
-    const all = await this.o.wallet.getWalletUtxos();
+    const all = await this.listedWithOwnOutputs();
     const listed = new Set(all.map(refOf));
     for (const [r, at] of [...this.spent]) if (!listed.has(r) || Date.now() - at > PENDING_MS) this.spent.delete(r);
     return all.filter((u) => !this.spent.has(refOf(u)));
+  }
+
+  /**
+   * The wallet's UTxOs, once they show what its own transactions paid back to it. Blockfrost lists
+   * a transaction's outputs some 20 s after its block. Built from a list without them, a top-up
+   * sees the wallet poorer than it is: it falls back further than it needs to, or finds too
+   * little left for collateral. So while an own transaction in a block has outputs not listed
+   * yet, the list is read again, for up to INDEX_WAIT_MS. One that never landed has none to wait for.
+   */
+  private async listedWithOwnOutputs(): Promise<readonly UTxO.UTxO[]> {
+    let all = await this.o.wallet.getWalletUtxos();
+    const unlisted = () => {
+      const listed = new Set(all.map(refOf));
+      for (const [r, x] of [...this.ownOutputs]) if (listed.has(r) || this.spent.has(r) || Date.now() - x.at > PENDING_MS) this.ownOutputs.delete(r);
+      return [...this.ownOutputs.values()];
+    };
+    const txs = new Set(unlisted().map((x) => x.tx));
+    if (!txs.size) return all;
+    const landed = new Set<string>();
+    for (const tx of txs) if ((await this.o.chain.txHeight(tx)) !== undefined) landed.add(tx);
+    for (const until = Date.now() + INDEX_WAIT_MS; unlisted().some((x) => landed.has(x.tx)) && Date.now() < until; ) {
+      await new Promise((r) => setTimeout(r, 3_000));
+      all = await this.o.wallet.getWalletUtxos();
+    }
+    return all;
   }
 }
 
@@ -779,6 +857,48 @@ export async function iouRootOf(wallet: Pick<SeedWallet, "address" | "signMessag
 /** A channel's IOU signer: its seed is HKDF-SHA256 of the wallet's IOU root, the network and the channel's tag. */
 export function derivedIouSigner(root: Uint8Array, network: string, tag: string) {
   return iouSignerFromSeed(new Uint8Array(hkdfSync("sha256", root, "x402 batch-settlement cardano", `iou key v1 ${network} ${tag}`, 32)));
+}
+
+/**
+ * What an ADA top-up keeps back from the wallet's ADA-only UTxOs when it guesses what the wallet
+ * can fund: the fee (a top-up's is about 0.3 ADA) and 2 ADA of change, which alone can put up the
+ * refund's collateral (`collateralTarget`).
+ */
+export const TOP_UP_HEADROOM = 2_500_000n;
+
+/** How much of a token currency the UTxOs `planTokens` would draw on hold. */
+function tokensHeld(utxos: UTxO.UTxO[], c: Currency): bigint {
+  return utxos.filter((u) => !Assets.hasOnlyLovelace(u.assets) && onlyCurrency(u.assets, c)).reduce((s, u) => s + amountIn(u.assets, c), 0n);
+}
+
+/**
+ * The top-ups to try, largest first. First what capacity asks for (`want`). Then what the wallet
+ * can fund, if that is less and still covers `short`, this request's shortfall. Last, `short`
+ * itself, the least that lets this request through.
+ */
+export function topUpAmounts(want: bigint, short: bigint, fundable: bigint): bigint[] {
+  const out = [want];
+  if (fundable < want && fundable > short) out.push(fundable);
+  if (short < want) out.push(short);
+  return out;
+}
+
+/**
+ * Builds with each amount in turn and returns the first that builds. Only a wallet short of an
+ * amount (the SDK's coin selection, `planTokens` for a token, or too little left for collateral)
+ * moves on to the next; any other failure is thrown as it is, and so is the last shortfall.
+ */
+export async function firstThatBuilds<T>(amounts: bigint[], build: (amount: bigint) => Promise<T>): Promise<{ built: T; amount: bigint }> {
+  let last: unknown;
+  for (const amount of amounts) {
+    try {
+      return { built: await build(amount), amount };
+    } catch (e) {
+      if (!/Coin selection failed|of the currency, \d+ needed|would leave no ADA-only UTxOs/.test(String((e as Error)?.message ?? e))) throw e;
+      last = e;
+    }
+  }
+  throw last;
 }
 
 /**
@@ -821,14 +941,42 @@ export async function signedHex(sb: { toTransaction(): Promise<Transaction.Trans
  * they reach the target, puts up exactly the target, and fails when what comes back is under
  * min-UTxO, without trying another amount. So the target is picked for the inputs it will take:
  * the largest one for which that many inputs leave at least 1 ADA to return, at most 5 ADA and at
- * least 1 ADA, which covers 150% of any fee here. One UTxO of 2 ADA does it, and so do three of
- * 0.7 ADA; the old rule wanted a single UTxO of 2.2 ADA.
+ * least 1 ADA, which covers 150% of any fee here. One UTxO of 2 ADA does it, and so do two of
+ * 1.5 ADA: each input after the first must bring over 1 ADA, or the SDK stops before taking it.
+ * The old rule wanted a single UTxO of 2.2 ADA.
  */
 export function collateralTarget(adaOnly: UTxO.UTxO[]): bigint {
+  return collateralFor(adaOnly.map((u) => Assets.lovelaceOf(u.assets)));
+}
+
+/** Whether ADA-only UTxOs of these amounts, in lovelace, can put up collateral at all. */
+function canCollateralize(amounts: bigint[]): boolean {
+  try {
+    collateralFor(amounts);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The ADA-only UTxOs, in lovelace, that the wallet holds once `tx` is on chain: those of
+ * `adaOnly` it does not spend, and its ADA-only outputs to `me`.
+ */
+export function adaOnlyAfter(tx: Transaction.Transaction, adaOnly: UTxO.UTxO[], me: Address.Address): bigint[] {
+  const spent = new Set(tx.body.inputs.map((i) => `${TransactionHash.toHex(i.transactionId)}#${i.index}`));
+  const mine = Address.toHex(me);
+  return [
+    ...adaOnly.filter((u) => !spent.has(refOf(u))).map((u) => Assets.lovelaceOf(u.assets)),
+    ...tx.body.outputs.filter((o) => Assets.hasOnlyLovelace(o.assets) && Address.toHex(o.address) === mine).map((o) => Assets.lovelaceOf(o.assets)),
+  ];
+}
+
+function collateralFor(amounts: bigint[]): bigint {
   const RETURN = 1_000_000n; // above an ADA-only output's min-UTxO at these addresses (0.969750)
   const CAP = 5_000_000n;
   const FLOOR = 1_000_000n;
-  const top = adaOnly.map((u) => Assets.lovelaceOf(u.assets)).sort((x, y) => (y > x ? 1 : y < x ? -1 : 0)).slice(0, 3);
+  const top = [...amounts].sort((x, y) => (y > x ? 1 : y < x ? -1 : 0)).slice(0, 3);
   let best = 0n;
   let taken = 0n;
   for (const [k, amount] of top.entries()) {

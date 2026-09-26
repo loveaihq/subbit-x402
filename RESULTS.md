@@ -735,6 +735,83 @@ the consumer (`e6855813…`, `07e9edef…`). **Reconciliation:** consumer 31.021
 provider 20.138304 → 19.645522 tADA; the wallets lost 1.844564 tADA, exactly the fees of the 8
 transactions.
 
+## Step 13: an MCP retry, and a top-up the wallet cannot fund
+
+Two changes since 0.1.1, run on 2026-09-26 through
+[ada-agent-wallet](https://github.com/loveaihq/ada-agent-wallet)'s MCP demo (`dev/mcpbatch.ts`
+against `dev/batchseller.ts`, signerd deciding and signing), on a build of this repo's working
+tree:
+
+- **A retry after a lost MCP answer.** Step 9 kept HTTP responses only. Over MCP, a retry met the
+  corrective 402 and was charged again. The server now keeps a paid tool's result as well, when
+  `@x402/mcp` can give it back unchanged: one text block, or structured content with its JSON as
+  that block.
+- **A top-up the wallet cannot fund.** A top-up is sized by the price that ran short, 100 × 0.05
+  tADA here, and it failed outright when the wallet held less. Now it falls back to what the wallet
+  can fund, keeping back 2.5 tADA for the fee and for an ADA-only UTxO that the refund can put up as
+  collateral. If that fails too, it falls back to this request's own shortfall. No top-up is built
+  that would leave no such UTxO.
+
+In the first run the buyer was the public test wallet's account 0. It held 6.140668 tADA in
+ADA-only UTxOs (3.143686, 1.498491 and 1.498491) and one UTxO with tokens. signerd sized each
+deposit for 100 requests at the price that ran short, capped by its policy at 5 tADA a deposit.
+The demo waited for Blockfrost's index before the top-up and before the refund:
+
+| Step | Transaction | Result |
+|---|---|---|
+| quote 1 | `f75d424817577569787b5b7d7f2eac58324681553bcf6e0259189cb6421e3070` | Opens the channel: 1 tADA for 100 quotes, plus the 1.732620 tADA reserve; 16.9 s. Quotes 2–100 are vouchers, about 40 ms each |
+| report 1 | `9e8eab2f97cc4030e2e7e075de8dbee8ac5832dd67c4d3c4c3fa347291b105e3` | 0.05 tADA short. The wallet lists 3.231459 tADA in ADA-only UTxOs against the 5 tADA asked, so it tops up 0.731459 (3.231459 − 2.5). Both ADA-only UTxOs are spent, and they are also its collateral; 2.248051 comes back as change. 29 s |
+| reports 2–5 | none | Vouchers on the larger channel |
+| digest | none | The seller settles 0.02 tADA and drops the answer. The call fails in transit, after signerd has signed the voucher |
+| retry | none | The same voucher (signerd logs `voucher_resigned` and spends nothing). The answer is the lost call's structured result, made before the retry was sent: the tool did not run again, and nothing was charged twice |
+| /data | none | 0.1 tADA over HTTP on the same channel: 1.37 tADA signed in all |
+| claim | `202764649be704d5bfdcfb33c502162006b88ed0dd9af1597d2598a87064e56b` | Redeems 1.37 tADA to the seller (see below) |
+| refund | `c9615b0ca271d7a03e6a51cbac75c4c0b3e9fb2ee6cd2fed6bdf2c7d9e1bdbd5` | Returns 1.861534 tADA; its collateral is the top-up's 2.248051 change |
+
+**The claim** landed, but the seller's manager reported it as failed. While following the channel
+afterwards, a read from Blockfrost threw `fetch failed`. For some minutes, connecting to Blockfrost
+took longer than the 250 ms that Node gives each address before trying the next, and IPv6 does not
+route from this machine. The manager's reads did not retry a network error, though `awaitTx` did.
+Its record kept `totalClaimed` at 0, which is harmless: what is claimable is read from the chain,
+where `subbed` was 1.37 tADA. A second pass a few minutes later failed the same way. The refund,
+through signerd, went through.
+
+**Reconciliation:** the buyer's ADA-only UTxOs went from 6.140668 to 4.109585 tADA; the UTxO with
+tokens was untouched. The seller gained 1.113686: 1.37 less its claim's fee of 0.256314. The buyer
+lost 2.031083: 1.37 plus the fees of the opening (0.176589), the top-up (0.251949) and the refund
+(0.232545). There were 107 vouchers: 100 quotes, 5 reports, the digest once, and /data. Their
+increments add up to 1.37 tADA in signerd's audit and in its ledger alike.
+
+**Both faults fixed, and run again.** The first run turned up two faults:
+
+- The manager's reads of the chain did not retry a network error.
+- The fallback and its collateral check saw only what Blockfrost lists, and Blockfrost lists a
+  transaction's change about 20 s after its block. Right after the wallet's own transaction, a
+  top-up saw less than the wallet held. It would fall back further than it needed to, or refuse
+  for leaving no collateral when the unlisted change was enough.
+
+Now every read of the chain is tried again when it gets no answer, a 429 or a 5xx: five tries,
+each pause 3 s longer than the last. The client also books what its own transactions pay back to
+the wallet. Before it builds, if one of those transactions is in a block and the wallet does not
+list what it paid back yet, the client reads the wallet again, for up to a minute.
+
+For the second run, account 1 sent the buyer 3 tADA
+(`8382b4f51144e0ec882cb865728e06f1455120762c6b8aa69fd2e8c50354215e`). The buyer then held 7.109585
+tADA in ADA-only UTxOs (3.0, 2.248051 and 1.861534). This time the demo did not wait for the index:
+
+| Step | Transaction | Result |
+|---|---|---|
+| quote 1 | `127ff298e26133b710e0a77e10a34439f33bf4fe4376c3e9848d7916af431ef8` | Opens the channel from the 3.0 and the 2.248051, with 2.338842 back as change; 17.6 s |
+| report 1 | `7273f07c58f43720cedfa1287e0e83b4f4c7b04333f9a01550ed3ae4aeb2867e` | When it was asked for, the index did not list the opening's change yet, so the wallet showed only 1.861534 tADA; the first run's client would have refused that top-up for leaving no collateral. This client tops up 1.700376 (4.200376 − 2.5) and spends the change along with the 1.861534, so it had waited for the change to be listed. 33 s |
+| reports 2–5, digest, retry, /data | none | As in the first run: the retry got the lost call's answer, and nothing was charged twice |
+| claim | `d1dcc4a9031deab73d81438adc698424560491dc75ee15c0226da64337dbc2c3` | Claimed, and recorded by the manager |
+| refund | `2905b15f64e70526ae9e657c8743b989b476bf8d5cb72112eb5ec6ee6be4a36e` | Returns 2.830451 tADA; its collateral is the top-up's 2.248049 change |
+
+**Reconciliation:** the buyer's ADA-only UTxOs went from 7.109585 to 5.078500 tADA. The seller
+gained 1.113686: 1.37 less its claim's fee of 0.256314. The buyer lost 2.031085: 1.37 plus the fees
+of the opening (0.176589), the top-up (0.251951) and the refund (0.232545). Again 107 vouchers, with
+increments of 1.37 tADA in the audit and in the ledger.
+
 ## What this does not show yet
 
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a
@@ -874,6 +951,10 @@ SUBBIT_CURRENCY=tusdm X402_OUT=x402-step11-delegate-tusdm npm run x402 -- delega
 
 X402_OUT=x402-step12 npm run x402 -- autosettle            # step 12: the watcher polling, then following
 X402_OUT=x402-step12 npm run x402 -- autosettle follow
+
+# step 13, in ada-agent-wallet on this version: dev/batchseller.ts, then signerd with the policy in
+# dev/mcpbatch.ts's header and its default BATCH_DEPOSIT_REQUESTS, then
+npm run mcpbatch
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

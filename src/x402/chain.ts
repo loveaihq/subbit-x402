@@ -66,6 +66,9 @@ interface BfOutput {
   collateral?: boolean;
 }
 
+/** How many times a read from Blockfrost is tried before its failure is the caller's. */
+const READ_ATTEMPTS = 5;
+
 export class BlockfrostChain implements Chain {
   private readonly provider;
   private params?: { at: number; coinsPerUtxoByte: bigint };
@@ -74,9 +77,30 @@ export class BlockfrostChain implements Chain {
     readonly network: CardanoNetwork,
     private readonly baseUrl: string,
     private readonly projectId: string,
+    /** The pause before a read's second try; each later one waits that much longer again. */
+    private readonly retryMs = 3_000,
   ) {
     if (network !== "cardano:preprod") throw new Error("the spike's Blockfrost chain is preprod only");
     this.provider = Client.make(preprod).withBlockfrost({ baseUrl, projectId });
+  }
+
+  /**
+   * A read from Blockfrost, tried again when it fails on the network or with a 429 or a 5xx.
+   * Connections can fail for minutes at a time (Node gives each of a host's addresses 250 ms to
+   * connect), and the read that follows a claim already on chain must not fail on that alone.
+   * Any other answer, a 404 among them, is the caller's to read.
+   */
+  private async get(path: string): Promise<Response> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const r = await fetch(`${this.baseUrl}${path}`, { headers: { project_id: this.projectId } });
+        if ((r.status !== 429 && r.status < 500) || attempt >= READ_ATTEMPTS) return r;
+        await r.body?.cancel();
+      } catch (e) {
+        if (!isNetworkError(e) || attempt >= READ_ATTEMPTS) throw e;
+      }
+      await new Promise((res) => setTimeout(res, this.retryMs * attempt));
+    }
   }
 
   async getUnspent(ref: string): Promise<UTxO.UTxO | undefined> {
@@ -84,7 +108,7 @@ export class BlockfrostChain implements Chain {
     const outs = await this.txOutputs(hash);
     const o = outs?.find((x) => x.output_index === index);
     if (!o || o.consumed_by_tx) return undefined;
-    const [u] = await this.provider.getUtxosByOutRef([input(hash, index)]);
+    const [u] = await retryQueries("an output", () => this.provider.getUtxosByOutRef([input(hash, index)]));
     return u;
   }
 
@@ -101,7 +125,7 @@ export class BlockfrostChain implements Chain {
       const o = outs?.find((x) => x.output_index === index);
       if (!o) return undefined;
       if (!o.consumed_by_tx) {
-        const [u] = await this.provider.getUtxosByOutRef([input(hash, index)]);
+        const [u] = await retryQueries("the channel", () => this.provider.getUtxosByOutRef([input(hash, index)]));
         if (!u) return undefined;
         const ch = readChannel(u, scriptHash);
         return "error" in ch || ch.datum.constants.tag !== tag ? undefined : ch;
@@ -109,7 +133,7 @@ export class BlockfrostChain implements Chain {
       // Find the continuing output of the same channel in the transaction that spent it.
       const next = o.consumed_by_tx;
       const nextOuts = (await this.txOutputs(next)) ?? [];
-      const candidates = await this.provider.getUtxosByOutRef(nextOuts.map((x) => input(next, x.output_index)));
+      const candidates = await retryQueries("the channel", () => this.provider.getUtxosByOutRef(nextOuts.map((x) => input(next, x.output_index))));
       const cont = candidates.find((u) => {
         const ch = readChannel(u, scriptHash);
         return !("error" in ch) && ch.datum.constants.tag === tag;
@@ -122,7 +146,7 @@ export class BlockfrostChain implements Chain {
 
   async coinsPerUtxoByte(): Promise<bigint> {
     if (!this.params || Date.now() - this.params.at > 600_000) {
-      const p = await this.provider.getProtocolParameters();
+      const p = await retryQueries("protocol parameters", () => this.provider.getProtocolParameters());
       this.params = { at: Date.now(), coinsPerUtxoByte: p.coinsPerUtxoByte };
     }
     return this.params.coinsPerUtxoByte;
@@ -159,7 +183,7 @@ export class BlockfrostChain implements Chain {
   }
 
   async evaluate(cborHex: string, additionalUtxos?: UTxO.UTxO[]): Promise<void> {
-    await this.provider.evaluateTx(Transaction.fromCBORHex(cborHex), additionalUtxos);
+    await retryQueries("an evaluation", () => this.provider.evaluateTx(Transaction.fromCBORHex(cborHex), additionalUtxos));
   }
 
   async channels(scriptHash: string): Promise<ChannelView[]> {
@@ -172,13 +196,13 @@ export class BlockfrostChain implements Chain {
   }
 
   async tipHeight(): Promise<number> {
-    const r = await fetch(`${this.baseUrl}/blocks/latest`, { headers: { project_id: this.projectId } });
+    const r = await this.get("/blocks/latest");
     if (!r.ok) throw new Error(`Blockfrost /blocks/latest: ${r.status}`);
     return ((await r.json()) as { height: number }).height;
   }
 
   async txHeight(txHash: string): Promise<number | undefined> {
-    const r = await fetch(`${this.baseUrl}/txs/${txHash}`, { headers: { project_id: this.projectId } });
+    const r = await this.get(`/txs/${txHash}`);
     if (r.status === 404) return undefined;
     if (!r.ok) throw new Error(`Blockfrost /txs/${txHash.slice(0, 16)}…: ${r.status}`);
     return ((await r.json()) as { block_height: number }).block_height;
@@ -191,7 +215,7 @@ export class BlockfrostChain implements Chain {
       if (!o?.consumed_by_tx) return undefined;
       const next = o.consumed_by_tx;
       const at = ((await this.txOutputs(next)) ?? []).filter((x) => !x.collateral && isScriptAddress(x.address, scriptHash));
-      const candidates = at.length ? await this.provider.getUtxosByOutRef(at.map((x) => input(next, x.output_index))) : [];
+      const candidates = at.length ? await retryQueries("the channel", () => this.provider.getUtxosByOutRef(at.map((x) => input(next, x.output_index)))) : [];
       const cont = candidates.find((u) => {
         const ch = readChannel(u, scriptHash);
         return !("error" in ch) && ch.datum.constants.tag === tag;
@@ -206,7 +230,7 @@ export class BlockfrostChain implements Chain {
   }
 
   async tipSlot(): Promise<bigint> {
-    const r = await fetch(`${this.baseUrl}/blocks/latest`, { headers: { project_id: this.projectId } });
+    const r = await this.get("/blocks/latest");
     if (!r.ok) throw new Error(`Blockfrost /blocks/latest: ${r.status}`);
     return BigInt(((await r.json()) as { slot: number }).slot);
   }
@@ -228,7 +252,7 @@ export class BlockfrostChain implements Chain {
   }
 
   async channelMoves(txHash: string, scriptHash: string, wanted: (ref: string) => boolean): Promise<{ spent: string[]; channels?: ChannelView[] }> {
-    const r = await fetch(`${this.baseUrl}/txs/${txHash}/utxos`, { headers: { project_id: this.projectId } });
+    const r = await this.get(`/txs/${txHash}/utxos`);
     if (!r.ok) throw new Error(`Blockfrost /txs/${txHash.slice(0, 16)}…/utxos: ${r.status}`);
     const io = (await r.json()) as { inputs: Array<{ tx_hash: string; output_index: number; collateral?: boolean; reference?: boolean }>; outputs: BfOutput[] };
     const spent = io.inputs.filter((i) => !i.collateral && !i.reference).map((i) => `${i.tx_hash}#${i.output_index}`);
@@ -246,7 +270,7 @@ export class BlockfrostChain implements Chain {
 
   private async addressTxs(scriptHash: string, query: string): Promise<ChainCursor[]> {
     const address = Address.toBech32(new Address.Address({ networkId: networkIdOf(this.network), paymentCredential: ScriptHash.fromHex(scriptHash) }));
-    const r = await fetch(`${this.baseUrl}/addresses/${address}/transactions?${query}`, { headers: { project_id: this.projectId } });
+    const r = await this.get(`/addresses/${address}/transactions?${query}`);
     if (r.status === 404) return [];
     if (!r.ok) throw new Error(`Blockfrost /addresses/…/transactions: ${r.status}`);
     return ((await r.json()) as Array<{ tx_hash: string; block_height: number; tx_index: number }>).map((x) => ({ hash: x.tx_hash, height: x.block_height, index: x.tx_index }));
@@ -266,7 +290,7 @@ export class BlockfrostChain implements Chain {
   /** A transaction's outputs with their spent-by field, or undefined if Blockfrost does not know it. */
   private async txOutputs(hash: string): Promise<BfOutput[] | undefined> {
     for (let attempt = 0; ; attempt++) {
-      const r = await fetch(`${this.baseUrl}/txs/${hash}/utxos`, { headers: { project_id: this.projectId } });
+      const r = await this.get(`/txs/${hash}/utxos`);
       if (r.ok) return ((await r.json()) as { outputs: BfOutput[] }).outputs;
       if (r.status !== 404) throw new Error(`Blockfrost /txs/${hash.slice(0, 16)}…/utxos: ${r.status}`);
       if (attempt >= 3) return undefined;
@@ -286,20 +310,42 @@ export class SubmitError extends Error {
 
 /**
  * Runs an SDK call again when Blockfrost fails a query (a burst limit or a 5xx; preprod runs
- * showed both), up to `attempts` times. A script failure or anything else is thrown at once:
- * retrying those would hide a real refusal.
+ * showed both) or when the request never got an answer, up to `attempts` times. A script failure
+ * or anything else is thrown at once: retrying those would hide a real refusal.
  */
-export async function retryQueries<T>(what: string, fn: () => Promise<T>, attempts = 4): Promise<T> {
+export async function retryQueries<T>(what: string, fn: () => Promise<T>, attempts = 4, pauseMs = 5_000): Promise<T> {
   for (let i = 1; ; i++) {
     try {
       return await fn();
     } catch (e) {
       const text = String((e as Error)?.message ?? e);
-      const query = /Blockfrost (getProtocolParameters|getUtxos|getUtxosByOutRef|getDelegation|getDatum)[A-Za-z]* failed|Failed to fetch protocol parameters/.test(text);
+      const query = /Blockfrost (getProtocolParameters|getUtxos|getUtxosByOutRef|getDelegation|getDatum)[A-Za-z]* failed|Failed to fetch protocol parameters/.test(text) || isNetworkError(e);
       if (!query || /ScriptFailures|Script evaluation failed/.test(text) || i >= attempts) throw e;
-      await new Promise((res) => setTimeout(res, 5_000 * i));
+      await new Promise((res) => setTimeout(res, pauseMs * i));
     }
   }
+}
+
+/** Where Effect's FiberFailure, which the SDK's calls reject with, keeps the cause they failed with. */
+const FIBER_FAILURE_CAUSE = Symbol.for("effect/Runtime/FiberFailure/Cause");
+
+/**
+ * Whether a failure never got an answer from the other end: a connection refused, reset or timed
+ * out, or a name that did not resolve. The network error sits a few levels down. Fetch throws
+ * `TypeError: fetch failed` with it as the `cause`. The SDK rejects with a FiberFailure, whose
+ * cause holds a `ProviderError`, whose `cause` is an `HttpRequestError`.
+ */
+export function isNetworkError(e: unknown): boolean {
+  let x = e;
+  for (let depth = 0; x && typeof x === "object" && depth < 8; depth++) {
+    const { _tag, code, message } = x as { _tag?: unknown; code?: unknown; message?: unknown };
+    if (_tag === "HttpRequestError") return true;
+    if (typeof code === "string" && /^(ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EPIPE|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|UND_ERR_[A-Z_]+)$/.test(code)) return true;
+    if (typeof message === "string" && /^fetch failed$|socket hang up|other side closed/.test(message)) return true;
+    const fiber = (x as Record<symbol, unknown>)[FIBER_FAILURE_CAUSE] as { _tag?: unknown; error?: unknown } | undefined;
+    x = fiber?._tag === "Fail" ? fiber.error : (x as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 /** Whether a bech32 address pays to this script, with any stake part. */

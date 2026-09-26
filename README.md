@@ -43,6 +43,7 @@ is alpha software by Kompact.io, used unmodified, and neither it nor this code h
 | 10 | Moneta's real preprod tUSDM |
 | 11 | A watcher that follows the chain instead of polling every channel |
 | 12 | A watcher that survives rollbacks |
+| 13 | A retry after a lost MCP answer, answered from the kept result; a top-up that falls back to what the wallet can fund |
 
 Each run's wallets reconcile to the lovelace against the fees of its transactions.
 
@@ -50,7 +51,7 @@ Each run's wallets reconcile to the lovelace against the fees of its transaction
 
 ```
 npm install
-npm test            # 33 chain-free tests
+npm test            # 37 chain-free tests
 npm run typecheck
 ```
 

@@ -5,12 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPrivateKey, createPublicKey, sign as edSign, verify as edVerify } from "node:crypto";
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
-import { Assets, Client, KeyHash, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
+import { Address, Assets, Client, KeyHash, TransactionHash, TxOut, preprod, type Transaction, type UTxO } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, parseDatum, datumData, type Stage } from "../src/subbit.ts";
-import { capacityOf, channelReserve, constantsOf, datumBindingError, planTokens, type ChannelView } from "../src/x402/cardano.ts";
-import type { Chain, ChainCursor } from "../src/x402/chain.ts";
+import { capacityOf, channelReserve, constantsOf, datumBindingError, planTokens, refOf, type ChannelView } from "../src/x402/cardano.ts";
+import { BlockfrostChain, isNetworkError, retryQueries, type Chain, type ChainCursor } from "../src/x402/chain.ts";
 import { ChannelManager, type WatchEvent } from "../src/x402/manager.ts";
-import { BatchSettlementCardanoClient, FileClientStorage, collateralTarget, depositWithin, derivedIouSigner, iouRootOf, serverKey, type Authorization } from "../src/x402/client.ts";
+import { BatchSettlementCardanoClient, FileClientStorage, TOP_UP_HEADROOM, adaOnlyAfter, collateralTarget, depositWithin, derivedIouSigner, firstThatBuilds, iouRootOf, serverKey, topUpAmounts, type Authorization, type OwnOutput, type SeedWallet } from "../src/x402/client.ts";
 import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x402/server.ts";
 import { Err, PayloadError, checkDelegationMac, configBindingError, delegationMac, parseClaimPayload, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
 
@@ -159,6 +159,9 @@ test("collateral: the largest target the SDK's pick of up to three ADA-only inpu
   // Three small ones: all three go in, 1 ADA comes back.
   assert.equal(collateralTarget(ada(1_877_274n, 1_800_000n, 1_700_000n, 1_000_000n)), 4_377_274n);
   assert.equal(collateralTarget(ada(1_900_000n, 1_900_000n)), 2_800_000n);
+  assert.equal(collateralTarget(ada(1_500_000n, 1_500_000n)), 2_000_000n);
+  // Each input after the first must bring over 1 ADA: three of 0.7 never leave 1 ADA to return.
+  assert.throws(() => collateralTarget(ada(700_000n, 700_000n, 700_000n)), /no ADA-only UTxOs large enough/);
   // A big one covers the cap alone; adding the small ones would not be taken anyway.
   assert.equal(collateralTarget(ada(6_000_000n, 500_000n, 500_000n)), 5_000_000n);
   assert.throws(() => collateralTarget(ada(1_500_000n)), /no ADA-only UTxOs large enough/);
@@ -397,6 +400,46 @@ test("server: a retry of the latest voucher gets the same answer, charged once; 
   assert.equal((await storage.get(TAG))!.chargedCumulativeAmount, "3000");
 });
 
+test("server: over MCP a retry gets the tool's result again when @x402/mcp can give it back unchanged", async () => {
+  const { server, storage, req } = await serverWithChannel();
+  const h = server.schemeHooks;
+  let n = 0;
+  // A paid request whose tool returned `result`, then the same voucher again, as a client sends
+  // it when the answer never reached it: what does the retry get?
+  const retry = async (result: unknown) => {
+    const amount = BigInt(++n) * 1000n;
+    const r = await paidRequest(server, req, voucher(amount));
+    assert.equal(r.stage, "settled");
+    const settled = { success: true, transaction: "", network: req.network, extra: r.extra };
+    await server.enrichSettlementResponse({ paymentPayload: r.paymentPayload, requirements: req, declaredExtensions: {}, phase: "after-handler", result: settled, transportContext: { toolName: "quote", arguments: {}, meta: {}, result } } as never);
+    const again = payloadFor(req, voucher(amount));
+    const before = (await h.onBeforeVerify!({ paymentPayload: again, requirements: req, declaredExtensions: {} } as never)) as { skip?: true; reason?: string };
+    if (!before?.skip) return { replayed: false as const, reason: before?.reason };
+    const after = (await h.onAfterVerify!({ paymentPayload: again, requirements: req, declaredExtensions: {}, result: { isValid: true, payer: config.payer } } as never)) as { skipHandler?: true; response?: { body: unknown } };
+    await h.onBeforeSettle!({ paymentPayload: again, requirements: req, declaredExtensions: {}, phase: "after-handler" } as never);
+    assert.equal(after?.skipHandler, true);
+    return { replayed: true as const, body: after?.response?.body };
+  };
+
+  // One text block: the body is its text, which @x402/mcp turns back into that block.
+  assert.deepEqual(await retry({ content: [{ type: "text", text: '{"price":"0.2380"}' }] }), { replayed: true, body: '{"price":"0.2380"}' });
+  // Structured content with its JSON as the block: the body is the object.
+  const s = { price: "0.2380", n: 2 };
+  assert.deepEqual(await retry({ content: [{ type: "text", text: JSON.stringify(s) }], structuredContent: s }), { replayed: true, body: s });
+  assert.equal((await storage.get(TAG))!.chargedCumulativeAmount, "2000", "each charged once");
+
+  // Shapes a replay would change are not kept: the retry gets the corrective 402 and pays again.
+  for (const result of [
+    { content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] },
+    { content: [{ type: "image", data: "AA==", mimeType: "image/png" }] },
+    { content: [{ type: "text", text: "{}" }], structuredContent: { other: true } },
+    { content: [{ type: "text", text: "x", annotations: { audience: ["user"] } }] },
+    { content: [{ type: "text", text: "x" }], _meta: { mine: 1 } },
+  ]) {
+    assert.deepEqual(await retry(result), { replayed: false, reason: Err.cumulativeAmountMismatch }, JSON.stringify(result));
+  }
+});
+
 test("watcher, following: after one full read a quiet pass costs one query; closes and exits come from the transactions themselves", async () => {
   const storage = new InMemoryChannelStorage();
   const A = "a1".repeat(32);
@@ -602,6 +645,155 @@ test("client: a deposit is what capacity asks, never under the floor, cut to wha
   assert.equal(depositWithin(50_000n, 10_000n, 10_000n), 10_000n);
   assert.throws(() => depositWithin(50_000n, 10_000n, 9_999n), /at least 10000/);
   assert.throws(() => depositWithin(50_000n, 10_000n, -5n), /room for \(0\)/);
+});
+
+test("client: a top-up the wallet cannot fund falls back to what it can, down to this request's shortfall", async () => {
+  // A 0.05 request on a channel opened for 0.01 ones asks for 100 x 0.05. A wallet showing 3.32
+  // can fund 0.82 of it and still pay the fee and keep the refund's collateral.
+  assert.deepEqual(topUpAmounts(5_000_000n, 50_000n, 3_320_075n - TOP_UP_HEADROOM), [5_000_000n, 820_075n, 50_000n]);
+  // Showing 2.32, as a wallet can before the chain's index shows its own change: only the shortfall.
+  assert.deepEqual(topUpAmounts(5_000_000n, 50_000n, 2_320_075n - TOP_UP_HEADROOM), [5_000_000n, 50_000n]);
+  // Enough for what capacity asks: that, and the shortfall only as a last resort.
+  assert.deepEqual(topUpAmounts(1_000_000n, 50_000n, 9_000_000n), [1_000_000n, 50_000n]);
+  // What the wallet can fund does not cover the request: no point trying it.
+  assert.deepEqual(topUpAmounts(5_000_000n, 50_000n, 30_000n), [5_000_000n, 50_000n]);
+  assert.deepEqual(topUpAmounts(1_000n, 1_000n, 0n), [1_000n]);
+
+  const short = (amount: bigint) => new Error(`Coin selection failed for lovelace: ${amount}`);
+  const tried: bigint[] = [];
+  const got = await firstThatBuilds([5_000_000n, 820_075n, 50_000n], async (a) => {
+    tried.push(a);
+    if (a > 1_000_000n) throw short(a);
+    return `tx for ${a}`;
+  });
+  assert.deepEqual(got, { built: "tx for 820075", amount: 820_075n });
+  assert.deepEqual(tried, [5_000_000n, 820_075n]);
+  // A token the wallet holds too little of moves on the same way, and so does a top-up that would
+  // leave nothing to put up as the refund's collateral.
+  assert.equal((await firstThatBuilds([10n, 7n], async (a) => (a > 7n ? Promise.reject(new Error("the wallet holds 7 of the currency, 10 needed")) : "ok"))).amount, 7n);
+  const noCollateral = (a: bigint) => new Error(`a top-up of ${a} would leave no ADA-only UTxOs large enough for the refund's collateral (left: 1230000, 900000)`);
+  assert.equal((await firstThatBuilds([820_075n, 50_000n], async (a) => (a > 50_000n ? Promise.reject(noCollateral(a)) : "ok"))).amount, 50_000n);
+
+  // What is left once a top-up is on chain: the wallet's UTxOs it did not spend and its change to
+  // itself, not the channel's output nor the tokens going back.
+  const me = Address.fromBech32("addr_test1qqqt0pru382hy9vjlsxv3ye02z50sfvt8xunscg5pgden77z73dpdfng2ctw2ekqplqgrljelz7h4dneac27nn3qx3rqqpavzj");
+  const id = (n: number) => TransactionHash.fromHex(n.toString(16).padStart(64, "0"));
+  const utxo = (n: number, lovelace: bigint) => ({ transactionId: id(n), index: 0n, assets: Assets.fromLovelace(lovelace) }) as unknown as UTxO.UTxO;
+  const topUp = (spends: number[], change: bigint) =>
+    ({
+      body: {
+        inputs: spends.map((n) => ({ transactionId: id(n), index: 0n })),
+        outputs: [
+          { address: channelAddress(0), assets: Assets.fromLovelace(5_000_000n) },
+          { address: me, assets: Assets.fromHexStrings("085c41bd155d0562653d61a847bc00b0dae291f323ed43b347419c19", "0014df10735553444d", 5n, 1_200_000n) },
+          { address: me, assets: Assets.fromLovelace(change) },
+        ],
+      },
+    }) as unknown as Transaction.Transaction;
+  const wallet = [utxo(1, 2_320_075n), utxo(2, 900_000n)];
+  // Spending the 2.32 for 0.82 leaves change of about 1.23, which with the 0.9 cannot put up
+  // collateral: that top-up is refused. The shortfall's leaves about 2.0, which can.
+  assert.deepEqual(adaOnlyAfter(topUp([1], 1_230_000n), wallet, me), [900_000n, 1_230_000n]);
+  assert.throws(() => collateralTarget(adaOnlyAfter(topUp([1], 1_230_000n), wallet, me).map((x) => ({ assets: Assets.fromLovelace(x) }) as unknown as UTxO.UTxO)), /large enough for collateral/);
+  assert.equal(collateralTarget(adaOnlyAfter(topUp([1], 2_000_000n), wallet, me).map((x) => ({ assets: Assets.fromLovelace(x) }) as unknown as UTxO.UTxO)), 1_000_000n);
+  assert.deepEqual(adaOnlyAfter(topUp([1, 2], 2_000_000n), wallet, me), [2_000_000n]);
+  // Anything else is not a shortfall: thrown at once, with no smaller top-up tried.
+  let calls = 0;
+  await assert.rejects(
+    firstThatBuilds([5_000_000n, 50_000n], async () => {
+      calls++;
+      throw new Error("Blockfrost getUtxos failed: 500");
+    }),
+    /getUtxos failed/,
+  );
+  assert.equal(calls, 1);
+  // Short of even the shortfall: the last shortfall is what the caller sees.
+  await assert.rejects(firstThatBuilds([5_000_000n, 50_000n], async (a) => Promise.reject(short(a))), /lovelace: 50000$/);
+});
+
+test("chain: a read that fails on the network, or with a 429 or a 5xx, is tried again; any other answer is the caller's", async () => {
+  // Node's fetch when every address of the host timed out, as preprod produced it. And what the SDK
+  // (0.5.14) rejects with: Effect's FiberFailure, the SDK's errors inside its cause.
+  const fetchFailed = new TypeError("fetch failed", { cause: Object.assign(new AggregateError([], ""), { code: "ETIMEDOUT" }) });
+  const sdkFailure = (operation: string, cause: unknown) =>
+    Object.assign(new Error(`Blockfrost ${operation} failed`), {
+      name: "(FiberFailure) ProviderError",
+      [Symbol.for("effect/Runtime/FiberFailure/Cause")]: { _tag: "Fail", error: { _tag: "ProviderError", message: `Blockfrost ${operation} failed`, cause } },
+    });
+  const noAnswer = sdkFailure("evaluateTx", { _tag: "HttpRequestError", message: "POST https://x/utils/txs/evaluate/utxos failed", cause: fetchFailed });
+  const scriptFailure = sdkFailure("evaluateTx", { _tag: "HttpResponseError", status: 400, message: "non 2xx status code : ScriptFailures" });
+  assert.equal(isNetworkError(fetchFailed), true);
+  assert.equal(isNetworkError(noAnswer), true);
+  assert.equal(isNetworkError(new Error("Blockfrost /txs/ab…: 400")), false);
+  assert.equal(isNetworkError(scriptFailure), false);
+
+  const real = globalThis.fetch;
+  let answers: Array<() => Response> = [];
+  let calls = 0;
+  globalThis.fetch = (async () => answers[calls++]!()) as typeof fetch;
+  try {
+    const chain = new BlockfrostChain("cardano:preprod", "https://blockfrost.invalid/api/v0", "key", 1);
+    answers = [
+      () => {
+        throw fetchFailed;
+      },
+      () => new Response("", { status: 503 }),
+      () => new Response(JSON.stringify({ block_height: 42 }), { status: 200 }),
+    ];
+    assert.equal(await chain.txHeight("ab".repeat(32)), 42);
+    assert.equal(calls, 3);
+    // A 404 is an answer: the transaction is not in a block yet.
+    [calls, answers] = [0, [() => new Response("", { status: 404 })]];
+    assert.equal(await chain.txHeight("ab".repeat(32)), undefined);
+    assert.equal(calls, 1);
+    // Failing every time: the last failure is the caller's, after five tries.
+    calls = 0;
+    answers = Array.from({ length: 5 }, () => () => {
+      throw fetchFailed;
+    });
+    await assert.rejects(chain.txHeight("ab".repeat(32)), /fetch failed/);
+    assert.equal(calls, 5);
+  } finally {
+    globalThis.fetch = real;
+  }
+
+  // The SDK's calls: an evaluation that got no answer is tried again, a script failure is not.
+  let tries = 0;
+  assert.equal(await retryQueries("an evaluation", async () => (++tries < 3 ? Promise.reject(noAnswer) : "ok"), 4, 1), "ok");
+  assert.equal(tries, 3);
+  tries = 0;
+  await assert.rejects(
+    retryQueries("an evaluation", async () => {
+      tries++;
+      throw scriptFailure;
+    }, 4, 1),
+    /evaluateTx failed/,
+  );
+  assert.equal(tries, 1);
+});
+
+test("client: a build waits for the wallet to list what its own transaction in a block paid back to it", async () => {
+  const landed = "ab".repeat(32);
+  const neverLanded = "cd".repeat(32);
+  const utxo = (tx: string, index: bigint, lovelace: bigint) => ({ transactionId: TransactionHash.fromHex(tx), index, assets: Assets.fromLovelace(lovelace) }) as unknown as UTxO.UTxO;
+  const old = utxo("ef".repeat(32), 0n, 1_498_491n);
+  const change = utxo(landed, 1n, 1_732_968n);
+  // Blockfrost lists the opening's change from the second look on.
+  let lists = 0;
+  const wallet = { getWalletUtxos: async () => (++lists < 2 ? [old] : [old, change]) } as unknown as SeedWallet;
+  const chain = { txHeight: async (tx: string) => (tx === landed ? 5_221_695 : undefined) } as unknown as Chain;
+  const client = new BatchSettlementCardanoClient({ wallet, storage: new FileClientStorage(mkdtempSync(join(tmpdir(), "x402-own-"))), chain });
+  const inside = client as unknown as { ownOutputs: Map<string, OwnOutput>; available(): Promise<UTxO.UTxO[]> };
+  inside.ownOutputs.set(`${landed}#1`, { tx: landed, at: Date.now() });
+  inside.ownOutputs.set(`${neverLanded}#1`, { tx: neverLanded, at: Date.now() });
+
+  assert.deepEqual((await inside.available()).map(refOf), [refOf(old), refOf(change)]);
+  assert.equal(lists, 2, "read again until the change is listed");
+  assert.deepEqual([...inside.ownOutputs.keys()], [`${neverLanded}#1`], "listed now, so no longer waited for; the other stays until it lands or expires");
+  // A transaction not in a block has nothing to wait for.
+  lists = 0;
+  await inside.available();
+  assert.equal(lists, 1);
 });
 
 test("client: right after its own top-up, it waits for the chain's index instead of topping up again", async () => {

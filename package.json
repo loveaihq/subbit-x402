@@ -1,6 +1,6 @@
 {
   "name": "subbit-x402",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "x402 batch-settlement on Cardano over Subbit.xyz payment channels: binding spec draft and reference implementation, preprod only",
   "type": "module",
   "license": "Apache-2.0",
