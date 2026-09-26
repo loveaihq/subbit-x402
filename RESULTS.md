@@ -840,6 +840,12 @@ gained 1.112102: 1.37 less its claim's fee of 0.257898. The buyer lost 2.034845:
 of the opening (0.176589), the top-up (0.255711) and the refund (0.232545). Again 107 vouchers, with
 increments of 1.37 tADA in the audit and in the ledger.
 
+**Openings, after 0.1.3.** An opening is now held to the top-ups' rule: it is refused if it would
+leave the wallet no ADA-only UTxO to put up as the refund's collateral. This was checked against the
+buyer's UTxOs after the fourth run, 4.388648 and 2.244289 tADA, with builds only and nothing
+submitted. An opening for 1 tADA of capacity built from the 4.388648 alone and left the 2.244289.
+One for 3.5 tADA, a 5.232620 deposit, would have spent both and left 1.223728, and was refused.
+
 ## What this does not show yet
 
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a

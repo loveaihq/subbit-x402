@@ -310,8 +310,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
         .payToAddress({ address: view.address, assets: valueFor(c, view.amount + add, view.lovelace), datum: view.utxo.datumOption as InlineDatum.InlineDatum })
         .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
       const built = await retryQueries("top-up", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
-      const left = adaOnlyAfter(await built.toTransaction(), adaOnly, me);
-      if (!canCollateralize(left)) throw new Error(`a top-up of ${add} would leave no ADA-only UTxOs large enough for the refund's collateral (left: ${left.join(", ") || "none"})`);
+      await assertLeavesCollateral(built, adaOnly, me, `a top-up of ${add}`);
       return built;
     });
     const signed = await signedHex(sb);
@@ -376,7 +375,11 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     throw new Error(`channel ${ch.channelId.slice(0, 16)}… is still opening (${ch.openTx}); retry shortly`);
   }
 
-  /** A new channel whose opening transaction is the deposit, with the first request's IOU. */
+  /**
+   * A new channel whose opening transaction is the deposit, with the first request's IOU. Refused,
+   * as a top-up is, when it would leave the wallet no ADA-only UTxO to put up as the refund's
+   * collateral.
+   */
   private async openChannel(req: PaymentRequirements, extra: BatchExtra, amount: bigint) {
     const w = this.o.wallet;
     const me = await w.address();
@@ -424,6 +427,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       datum: inlineDatum(constants, { kind: "opened", subbed: 0n }),
     });
     const sb = await retryQueries("open", () => tx.build({ changeAddress: me, availableUtxos: adaOnly }));
+    await assertLeavesCollateral(sb, adaOnly, me, `an opening of ${deposit}`);
     const signed = await signedHex(sb);
     const built = Transaction.fromCBORHex(signed);
     const openInputs = built.body.inputs.map((i) => `${TransactionHash.toHex(i.transactionId)}#${i.index}`);
@@ -950,6 +954,16 @@ export async function signedHex(sb: { toTransaction(): Promise<Transaction.Trans
  */
 export function collateralTarget(adaOnly: UTxO.UTxO[]): bigint {
   return collateralFor(adaOnly.map((u) => Assets.lovelaceOf(u.assets)));
+}
+
+/**
+ * Refuses a transaction of the wallet's own that would leave it no ADA-only UTxOs it can put up as
+ * collateral. Every way out of a channel is a script transaction, the refund first, so such a wallet
+ * could not take its funds back until it was paid more. `what` names the transaction in the error.
+ */
+export async function assertLeavesCollateral(built: { toTransaction(): Promise<Transaction.Transaction> }, adaOnly: UTxO.UTxO[], me: Address.Address, what: string): Promise<void> {
+  const left = adaOnlyAfter(await built.toTransaction(), adaOnly, me);
+  if (!canCollateralize(left)) throw new Error(`${what} would leave no ADA-only UTxOs large enough for the refund's collateral (left: ${left.join(", ") || "none"})`);
 }
 
 /** Whether ADA-only UTxOs of these amounts, in lovelace, can put up collateral at all. */

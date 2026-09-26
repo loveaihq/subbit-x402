@@ -10,7 +10,7 @@ import { SUBBIT_HASH, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, n
 import { capacityOf, channelReserve, constantsOf, datumBindingError, planTokens, refOf, type ChannelView } from "../src/x402/cardano.ts";
 import { BlockfrostChain, isNetworkError, retryQueries, type Chain, type ChainCursor } from "../src/x402/chain.ts";
 import { ChannelManager, type WatchEvent } from "../src/x402/manager.ts";
-import { BatchSettlementCardanoClient, FileClientStorage, TOP_UP_HEADROOM, adaOnlyAfter, collateralTarget, depositWithin, derivedIouSigner, firstThatBuilds, iouRootOf, serverKey, topUpAmounts, type Authorization, type OwnOutput, type SeedWallet } from "../src/x402/client.ts";
+import { BatchSettlementCardanoClient, FileClientStorage, TOP_UP_HEADROOM, adaOnlyAfter, assertLeavesCollateral, collateralTarget, depositWithin, derivedIouSigner, firstThatBuilds, iouRootOf, serverKey, topUpAmounts, type Authorization, type OwnOutput, type SeedWallet } from "../src/x402/client.ts";
 import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x402/server.ts";
 import { Err, PayloadError, checkDelegationMac, configBindingError, delegationMac, parseClaimPayload, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
 
@@ -701,6 +701,10 @@ test("client: a top-up the wallet cannot fund falls back to what it can, down to
   assert.throws(() => collateralTarget(adaOnlyAfter(topUp([1], 1_230_000n), wallet, me).map((x) => ({ assets: Assets.fromLovelace(x) }) as unknown as UTxO.UTxO)), /large enough for collateral/);
   assert.equal(collateralTarget(adaOnlyAfter(topUp([1], 2_000_000n), wallet, me).map((x) => ({ assets: Assets.fromLovelace(x) }) as unknown as UTxO.UTxO)), 1_000_000n);
   assert.deepEqual(adaOnlyAfter(topUp([1, 2], 2_000_000n), wallet, me), [2_000_000n]);
+  // The same check stands in front of an opening: refused with what it would leave, or let through.
+  const built = (spends: number[], change: bigint) => ({ toTransaction: async () => topUp(spends, change) });
+  await assert.rejects(assertLeavesCollateral(built([1], 1_230_000n), wallet, me, "an opening of 2732620"), /an opening of 2732620 would leave no ADA-only UTxOs large enough for the refund's collateral \(left: 900000, 1230000\)/);
+  await assertLeavesCollateral(built([1], 2_000_000n), wallet, me, "an opening of 2732620");
   // Anything else is not a shortfall: thrown at once, with no smaller top-up tried.
   let calls = 0;
   await assert.rejects(

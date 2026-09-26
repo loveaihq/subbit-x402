@@ -239,7 +239,8 @@ changes come from step 13's first run. Before building, the client waits for Blo
 what its own transaction in a block paid back to the wallet. And every read of the chain is tried
 again when it gets no answer. A wallet holding the amount but not its fee and a change output
 besides is short too: the SDK finds no valid change instead of failing coin selection. 0.1.2 missed
-that, and 0.1.3 does not.
+that, and 0.1.3 does not. After 0.1.3, an opening is held to the same rule as a top-up: it is
+refused if it would leave the wallet no ADA-only UTxO to put up as the refund's collateral.
 
 Code, in this repo:
 - `src/x402/`: shared types and checks; client scheme (`SchemeNetworkClient`); server scheme
