@@ -237,7 +237,9 @@ less than the spec's `max(minDeposit, 10 × amount)`, which is a SHOULD. No top-
 wallet without an ADA-only UTxO that it can put up as the refund's collateral. Two further
 changes come from step 13's first run. Before building, the client waits for Blockfrost to list
 what its own transaction in a block paid back to the wallet. And every read of the chain is tried
-again when it gets no answer.
+again when it gets no answer. A wallet holding the amount but not its fee and a change output
+besides is short too: the SDK finds no valid change instead of failing coin selection. 0.1.2 missed
+that, and 0.1.3 does not.
 
 Code, in this repo:
 - `src/x402/`: shared types and checks; client scheme (`SchemeNetworkClient`); server scheme

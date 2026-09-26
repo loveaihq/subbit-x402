@@ -812,6 +812,34 @@ gained 1.113686: 1.37 less its claim's fee of 0.256314. The buyer lost 2.031085:
 of the opening (0.176589), the top-up (0.251951) and the refund (0.232545). Again 107 vouchers, with
 increments of 1.37 tADA in the audit and in the ledger.
 
+**A third fault, in 0.1.2 as published.** The third run used 0.1.2 from npm, for ada-agent-wallet,
+and the first report's top-up failed outright. With the opening in, the wallet listed 5.169291 tADA
+in ADA-only UTxOs, a little more than the 5 tADA asked. The SDK words that case differently.
+Holding less than the amount fails coin selection. Holding the amount but not its fee and a change
+output besides finds no valid change. The fallback knew only the first, so it never tried what the
+wallet could fund (2.669291). The seller claimed what the 100 quotes had signed
+(`03ef37f86cabff6a1f330cc47d7881df562bf943d69c19ca393ea583f4d284bd`) and the channel was refunded
+(`72b9de6fded56dba19167dab488c4177ae178eefecbc76ecc8d2107be69b7b67`). 0.1.3 counts no valid change
+as a shortfall too.
+
+For the fourth run, account 1 sent the buyer 2 tADA
+(`414133d63d8e38cfa9b80e9874775b09ec4338c2b29321bf6dd8ec2870b8c142`), so that the opening would
+leave the wallet in the same place. The buyer held 8.667782 tADA in ADA-only UTxOs (2.921242,
+2.248049, 2.0 and 1.498491). The run used this repo's 0.1.3 as packed (shasum `2a7bd0c1…`):
+
+| Step | Transaction | Result |
+|---|---|---|
+| quote 1 | `1d0cb8cc7239acc4348e1eed27813afc87bad7aff847059912a09a0848fcfc70` | Opens the channel from the 2.921242 and the 2.248049, with 2.260082 back as change; 23.5 s |
+| report 1 | `d417da2a52c9ad0b268e8f9071b767314f65d67e955eadcf0db2b95b2975147f` | With the opening in, the wallet holds 5.758573 tADA: more than the 5 asked, but not enough for the fee and a change output as well. The index did not list the opening's change yet. The client waited for it, found no valid change for 5 tADA, and topped up 3.258573 (5.758573 − 2.5). The top-up spent all three ADA-only UTxOs, which were also its collateral, and 2.244289 came back as change. 53 s |
+| reports 2–5, digest, retry, /data | none | As before |
+| claim | `b834de67b70001469571fde9edbacec185c5aa72cbe5ab91bc3e2476ebb7e343` | Claimed, and recorded by the manager |
+| refund | `a1010bac7f399d548dfe379c5149599deb2682102433228c6d59f4b348a162fa` | Returns 4.388648 tADA; its collateral is the top-up's 2.244289 change |
+
+**Reconciliation:** the buyer's ADA-only UTxOs went from 8.667782 to 6.632937 tADA. The seller
+gained 1.112102: 1.37 less its claim's fee of 0.257898. The buyer lost 2.034845: 1.37 plus the fees
+of the opening (0.176589), the top-up (0.255711) and the refund (0.232545). Again 107 vouchers, with
+increments of 1.37 tADA in the audit and in the ledger.
+
 ## What this does not show yet
 
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a

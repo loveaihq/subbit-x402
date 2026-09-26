@@ -885,8 +885,11 @@ export function topUpAmounts(want: bigint, short: bigint, fundable: bigint): big
 
 /**
  * Builds with each amount in turn and returns the first that builds. Only a wallet short of an
- * amount (the SDK's coin selection, `planTokens` for a token, or too little left for collateral)
- * moves on to the next; any other failure is thrown as it is, and so is the last shortfall.
+ * amount moves on to the next. The SDK reports a shortfall two ways: as a failed coin selection
+ * when the wallet holds less than the amount, and as no valid change when it holds the amount but
+ * not the fee and a change output besides. `planTokens` reports one for a token, and the top-up
+ * reports too little left for collateral. Any other failure is thrown as it is, and so is the
+ * last shortfall.
  */
 export async function firstThatBuilds<T>(amounts: bigint[], build: (amount: bigint) => Promise<T>): Promise<{ built: T; amount: bigint }> {
   let last: unknown;
@@ -894,7 +897,7 @@ export async function firstThatBuilds<T>(amounts: bigint[], build: (amount: bigi
     try {
       return { built: await build(amount), amount };
     } catch (e) {
-      if (!/Coin selection failed|of the currency, \d+ needed|would leave no ADA-only UTxOs/.test(String((e as Error)?.message ?? e))) throw e;
+      if (!/Coin selection failed|Cannot create valid change|of the currency, \d+ needed|would leave no ADA-only UTxOs/.test(String((e as Error)?.message ?? e))) throw e;
       last = e;
     }
   }

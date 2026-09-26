@@ -671,6 +671,10 @@ test("client: a top-up the wallet cannot fund falls back to what it can, down to
   // A token the wallet holds too little of moves on the same way, and so does a top-up that would
   // leave nothing to put up as the refund's collateral.
   assert.equal((await firstThatBuilds([10n, 7n], async (a) => (a > 7n ? Promise.reject(new Error("the wallet holds 7 of the currency, 10 needed")) : "ok"))).amount, 7n);
+  // Holding the amount but not the fee and a change output besides, as 5.169291 tADA against a
+  // top-up of 5 did on preprod: the SDK's other way of saying the wallet is short.
+  const noChange = new Error("Cannot create valid change: Insufficient funds to cover payment, fees, and minimum UTxO requirements. Available: 169291 lovelace. Required: At least 969750 lovelace for change output");
+  assert.equal((await firstThatBuilds([5_000_000n, 2_669_291n], async (a) => (a > 2_669_291n ? Promise.reject(noChange) : "ok"))).amount, 2_669_291n);
   const noCollateral = (a: bigint) => new Error(`a top-up of ${a} would leave no ADA-only UTxOs large enough for the refund's collateral (left: 1230000, 900000)`);
   assert.equal((await firstThatBuilds([820_075n, 50_000n], async (a) => (a > 50_000n ? Promise.reject(noCollateral(a)) : "ok"))).amount, 50_000n);
 
