@@ -44,6 +44,7 @@ is alpha software by Kompact.io, used unmodified, and neither it nor this code h
 | 11 | A watcher that follows the chain instead of polling every channel |
 | 12 | A watcher that survives rollbacks |
 | 13 | A retry after a lost MCP answer, answered from the kept result; a top-up that falls back to what the wallet can fund |
+| 14 | Buyer and seller through Koios, with no Blockfrost key |
 
 Each run's wallets reconcile to the lovelace against the fees of its transactions.
 
@@ -51,17 +52,18 @@ Each run's wallets reconcile to the lovelace against the fees of its transaction
 
 ```
 npm install
-npm test            # 37 chain-free tests
+npm test            # 42 chain-free tests
 npm run typecheck
 ```
 
 As a dependency, `npm i subbit-x402` (built, from npm) or a GitHub commit (which builds itself on
 install); it exports `subbit-x402/subbit` and `subbit-x402/x402/<module>` (`client`, `server`,
-`facilitator`, `manager`, `chain`, `cardano`, `txcheck`, `types`, `claimtx`). It takes the SDK's
+`facilitator`, `manager`, `chain`, `koios`, `cardano`, `txcheck`, `types`, `claimtx`). It takes the SDK's
 objects, a wallet among them, so use the `@evolution-sdk/evolution` version it pins (0.5.14).
 [ada-agent-wallet](https://github.com/loveaihq/ada-agent-wallet) uses the client that way: its
 signing daemon runs `BatchSettlementCardanoClient` with an `authorize` hook that puts every
-voucher and deposit through its spend policy.
+voucher and deposit through its spend policy. The chain is read through `BlockfrostChain`
+(`chain`), with a Blockfrost key, or `KoiosChain` (`koios`), which needs none.
 
 The preprod runs take `WALLET_MNEMONIC`, a preprod test wallet (these used the public
 all-`abandon` test mnemonic, accounts 0 to 3, which anyone can spend from: keep nothing of value

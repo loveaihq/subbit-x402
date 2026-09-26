@@ -59,6 +59,8 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
   readonly caipFamily = "cardano:*";
   /** Transactions already broadcast, so a retried `/settle` waits on the same one. */
   private readonly submitted = new Set<string>();
+  /** What the check of a deposit or refund still `settlement_pending` found, by its payload. */
+  private readonly pending = new Map<string, Verified>();
   /** Delegated keys by the `payTo` they serve, and the inputs each one's claims just spent. */
   private readonly delegates = new Map<string, { d: Delegate; spent: Map<string, number> }>();
 
@@ -100,12 +102,20 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
       if (raw?.type === "claim") return await this.settleClaim(paymentPayload, requirements);
       if (raw?.type === "voucher") return failed(Err.payloadType, "vouchers are settled by the resource server, not on chain");
 
-      const v = await this.check(paymentPayload, requirements);
+      // A retry after settlement_pending: its transaction was checked before it went out, and may
+      // since have landed and moved the channel on, which a second check would refuse it for. The
+      // same payload keeps what the first check found, and the settle only waits again.
+      const same = JSON.stringify(paymentPayload.payload);
+      const v = this.pending.get(same) ?? (await this.check(paymentPayload, requirements));
       if (!v.ok) return failed(v.reason, v.message, "", v.payer);
       const p = parseClientPayload(paymentPayload.payload);
-      if (p.type === "deposit") return await this.settleDeposit(p, requirements, v.payer);
-      if (p.type === "refund") return await this.settleRefund(p, paymentPayload.payload, requirements, v.payer, v.channel!);
-      return failed(Err.payloadType, "unsupported payload");
+      let out: SettleResponse;
+      if (p.type === "deposit") out = await this.settleDeposit(p, requirements, v.payer);
+      else if (p.type === "refund") out = await this.settleRefund(p, paymentPayload.payload, requirements, v.payer, v.channel!);
+      else return failed(Err.payloadType, "unsupported payload");
+      if (out.errorReason === SETTLEMENT_PENDING) this.pending.set(same, v);
+      else this.pending.delete(same);
+      return out;
     } catch (e) {
       if (e instanceof PayloadError || e instanceof TxCheckError) return failed(e.reason, e.message);
       return failed(Err.transactionFailed, (e as Error).message);

@@ -309,7 +309,7 @@ export class SubmitError extends Error {
 }
 
 /**
- * Runs an SDK call again when Blockfrost fails a query (a burst limit or a 5xx; preprod runs
+ * Runs an SDK call again when Blockfrost or Koios fails a query (a burst limit or a 5xx; preprod runs
  * showed both) or when the request never got an answer, up to `attempts` times. A script failure
  * or anything else is thrown at once: retrying those would hide a real refusal.
  */
@@ -319,7 +319,7 @@ export async function retryQueries<T>(what: string, fn: () => Promise<T>, attemp
       return await fn();
     } catch (e) {
       const text = String((e as Error)?.message ?? e);
-      const query = /Blockfrost (getProtocolParameters|getUtxos|getUtxosByOutRef|getDelegation|getDatum)[A-Za-z]* failed|Failed to fetch protocol parameters/.test(text) || isNetworkError(e);
+      const query = /(Blockfrost|Koios) (getProtocolParameters|getUtxos|getUtxosByOutRef|getDelegation|getDatum)[A-Za-z]* failed|Failed to fetch protocol parameters/.test(text) || isNetworkError(e);
       if (!query || /ScriptFailures|Script evaluation failed/.test(text) || i >= attempts) throw e;
       await new Promise((res) => setTimeout(res, pauseMs * i));
     }
@@ -349,7 +349,7 @@ export function isNetworkError(e: unknown): boolean {
 }
 
 /** Whether a bech32 address pays to this script, with any stake part. */
-function isScriptAddress(bech32: string, scriptHash: string): boolean {
+export function isScriptAddress(bech32: string, scriptHash: string): boolean {
   try {
     const cred = Address.fromBech32(bech32).paymentCredential;
     return cred instanceof ScriptHash.ScriptHash && ScriptHash.toHex(cred) === scriptHash;
@@ -364,4 +364,4 @@ export function splitRef(ref: string): [string, number] {
   return [m[1]!, Number(m[2])];
 }
 
-const input = (hash: string, index: number) => new TransactionInput.TransactionInput({ transactionId: TransactionHash.fromHex(hash), index: BigInt(index) });
+export const input = (hash: string, index: number) => new TransactionInput.TransactionInput({ transactionId: TransactionHash.fromHex(hash), index: BigInt(index) });

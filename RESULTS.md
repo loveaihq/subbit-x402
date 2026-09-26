@@ -846,6 +846,62 @@ buyer's UTxOs after the fourth run, 4.388648 and 2.244289 tADA, with builds only
 submitted. An opening for 1 tADA of capacity built from the 4.388648 alone and left the 2.244289.
 One for 3.5 tADA, a 5.232620 deposit, would have spent both and left 1.223728, and was refused.
 
+## Step 14: through Koios, with no Blockfrost key
+
+`KoiosChain` (`src/x402/koios.ts`) reads and writes the chain through Koios, which needs no key.
+Koios answers what the channel code asks much as Blockfrost does, with three differences:
+
+- It says that an output was spent, not which transaction spent it. The spender is found among the
+  transactions at the output's address from its block on, by their inputs.
+- It shows its mempool: an output spent there is marked spent, and a transaction there is known
+  without a block. The channel code works from the chain as it stands, so only what is in a block
+  counts.
+- Its preprod index has trailed the chain by over two minutes.
+
+Before any transaction, the same 15 questions went to both chains, about step 13's fourth run and
+others, and got the same answers. They included:
+
+- an output's spender;
+- a channel followed to its end, and its exit;
+- the script's latest transaction, and its activity since a cursor;
+- what a claim paid;
+- the reference script;
+- the channels open at the script.
+
+A second pass added an open channel followed from its opening, read through the SDK's Koios
+provider.
+
+Then, through ada-agent-wallet's MCP demo as in step 13, the seller and signerd ran on Koios alone,
+with the demo's own checks on Blockfrost.
+
+**The first run failed** at the first report's top-up, and found a fault that is not Koios'. The
+top-up (`22c41b3afb051e639475a7426f0aa313b46212c3dcc2affa9f96db1ad37866c2`) reached a block 69 s
+after it was sent, but 2 min 10 s later Koios had still not indexed that block. The facilitator's
+120 s wait ran out, and it answered `settlement_pending`. The core's retry then failed outright:
+"the top-up does not spend the channel at its current position". The facilitator had checked the
+payload again, found the channel moved on by the transaction itself, and refused it. That could
+happen on either chain, whenever a transaction lands between `settlement_pending` and the retry.
+
+Now the facilitator keeps what the first check found for the same payload until it settles, and
+the retry only waits again. KoiosChain counts only what is in a block. The channel was claimed
+(`c72239c99eba830a6c06404024545133781b771b6af1302d1cc96f82341de6e7`) and refunded
+(`01e404eed5f2208aed12233df543b60fa52435b8f0e9606ef5944aa6ef7c1cd7`).
+
+**The second run passed.** The buyer held 6.083392 tADA in ADA-only UTxOs (3.835343 and 2.248049):
+
+| Step | Transaction | Result |
+|---|---|---|
+| quote 1 | `8c8e48074ed32eec8ce09be8900a2c216526158053cd24478b0842fcf490dd90` | Opens the channel in 52.6 s; Koios' index is slower than Blockfrost's (17–33 s in step 13). Quotes 2–100 are vouchers, median 42 ms |
+| report 1 | `f6302be78c4ca1e874ed6f70df31c0076174df6cef6c733ed49e7541f0b6cb19` | The wallet holds 3.174183 tADA ADA-only against the 5 asked, so it tops up 0.674183, what it can. The validator was evaluated through Koios' Ogmios endpoint. 42 s |
+| digest, retry | none | The lost call's answer, and no second charge |
+| claim | `40248f9e123373a4a68d4dd66ecf68282d00e5c06a28e3cdca956e14b36904a2` | The seller's manager builds, evaluates and submits it through Koios |
+| refund | `afddfdf79b773782d6a8fa79c221a75ab7c9d57194cee7223c8f5096cc194ed4` | Returns 1.804258 tADA; its collateral is the top-up's 2.251810 change |
+
+**Reconciliation:** the buyer's ADA-only UTxOs went from 6.083392 to 4.056068 tADA. The buyer lost
+2.027324: 1.37 plus the fees of the opening (0.176589), the top-up (0.248190) and the refund
+(0.232545). The seller gained 1.112102: 1.37 less its claim's fee of 0.257898. There were 107
+vouchers, with increments of 1.37 tADA in signerd's audit and in its ledger alike.
+
 ## What this does not show yet
 
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a

@@ -12,6 +12,7 @@ import { BlockfrostChain, isNetworkError, retryQueries, type Chain, type ChainCu
 import { ChannelManager, type WatchEvent } from "../src/x402/manager.ts";
 import { BatchSettlementCardanoClient, FileClientStorage, TOP_UP_HEADROOM, adaOnlyAfter, assertLeavesCollateral, collateralTarget, depositWithin, derivedIouSigner, firstThatBuilds, iouRootOf, serverKey, topUpAmounts, type Authorization, type OwnOutput, type SeedWallet } from "../src/x402/client.ts";
 import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x402/server.ts";
+import { BatchSettlementCardanoFacilitator } from "../src/x402/facilitator.ts";
 import { Err, PayloadError, checkDelegationMac, configBindingError, delegationMac, parseClaimPayload, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
 
 const PAY_TO = "addr_test1qrxchm0g4la6hqfd9wq6vuuldx7l20az52t7lvgpgujr8pvwmpzru5kuf4mpmvtaf0hlsjtz7t4r2h7tj9v3c02dhljq0wqkef";
@@ -438,6 +439,29 @@ test("server: over MCP a retry gets the tool's result again when @x402/mcp can g
   ]) {
     assert.deepEqual(await retry(result), { replayed: false, reason: Err.cumulativeAmountMismatch }, JSON.stringify(result));
   }
+});
+
+test("facilitator: a retry after settlement_pending only waits again, though its transaction has moved the channel on", async () => {
+  const f = new BatchSettlementCardanoFacilitator({} as Chain, { scriptHash: SUBBIT_HASH });
+  const inside = f as unknown as { check: () => Promise<unknown>; settleDeposit: () => Promise<unknown> };
+  let checks = 0;
+  // The first check passes. By the retry the top-up has landed, and a second check would refuse it.
+  inside.check = async () => (++checks === 1 ? { ok: true, payer: config.payer, extra: {} } : { ok: false, reason: Err.depositTransaction, message: "the top-up does not spend the channel at its current position" });
+  const tx = "cc".repeat(32);
+  const outcomes = [
+    { success: false, errorReason: "settlement_pending", transaction: tx, network: baseReq.network },
+    { success: true, transaction: tx, network: baseReq.network },
+  ];
+  inside.settleDeposit = async () => outcomes.shift();
+  const payload = { x402Version: 2, accepted: baseReq, payload: { type: "deposit", channelConfig: config, voucher: voucher(2000n), deposit: { amount: "10000", transaction: "AAAA" } } } as unknown as PaymentPayload;
+  assert.equal((await f.settle(payload, baseReq)).errorReason, "settlement_pending");
+  assert.equal((await f.settle(payload, baseReq)).success, true);
+  assert.equal(checks, 1, "the retry kept the first check");
+  // Anything else is checked as before: a payload that differs, or the same one once it has settled.
+  const other = { ...payload, payload: { ...(payload.payload as object), voucher: voucher(3000n) } } as PaymentPayload;
+  assert.equal((await f.settle(other, baseReq)).success, false);
+  assert.equal((await f.settle(payload, baseReq)).success, false);
+  assert.equal(checks, 3);
 });
 
 test("watcher, following: after one full read a quiet pass costs one query; closes and exits come from the transactions themselves", async () => {
