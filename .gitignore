@@ -4,3 +4,5 @@ out/
 *.log
 .env*
 keys/
+vendor/subbit/aiken/build/
+vendor/subbit/aiken/plutus.json

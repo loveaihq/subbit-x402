@@ -572,13 +572,20 @@ non-terminal `settlement_pending`.
   from being redeemable against any channel but its own.
 - **Derived IOU keys** are as secret as the wallet's signature of the root message; a client MUST
   NOT sign that message for any other party.
+- **The validator** is Subbit's, alpha and unaudited. The reference implementation carries its
+  source, which compiles to exactly the hash this binding names, and 73 tests of it. They found
+  one defect, of liveness only. A `Main` transaction that needs two different signers fails when
+  the later step's signer sorts first. This binding's transactions each need one signer: the
+  provider for claims, the consumer for its own steps. A refund is `Mutual`, so none of them
+  meets the defect.
 
 
 ## Reference implementation
 
 [loveaihq/subbit-x402](https://github.com/loveaihq/subbit-x402): `src/x402/` implements the client, resource-server and
 facilitator schemes for `@x402/core` 2.27.0 and the server's channel manager, on
-`@evolution-sdk/evolution` 0.5.14 and Blockfrost or Koios, with 42 chain-free tests.
+`@evolution-sdk/evolution` 0.5.14 and Blockfrost or Koios, with 43 chain-free tests, and 73 Aiken
+tests of the validator at the hash above.
 [`RESULTS.md`](https://github.com/loveaihq/subbit-x402/blob/main/RESULTS.md) records every preprod transaction: steps 1–3 exercise the validator,
 step 4 the ADA binding end to end, step 5 a token binding, step 6 top-ups and the automatic
 settle after a consumer's close, step 7 a client that folds its token UTxOs, step 8 recovery
@@ -586,7 +593,8 @@ after state loss, step 9 retries answered from the kept response and a server wh
 the facilitator holds, step 10 the binding in Moneta's preprod tUSDM, step 11 the watcher
 following the chain, and `elapse` and delegation on token channels, step 12 a watcher that
 survives rollbacks, step 13 retries after a lost answer over MCP and top-ups that fall back to
-what the wallet can fund, and step 14 the whole of it through Koios.
+what the wallet can fund, and step 14 the whole of it through Koios. Step 15, with no chain,
+tests the validator itself.
 
 ## Version history
 

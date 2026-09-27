@@ -14,6 +14,7 @@ one for Cardano, on Subbit's channel validator.
 
 **Status: a research spike, preprod only.** Nothing here has run on mainnet. The Subbit validator
 is alpha software by Kompact.io, used unmodified, and neither it nor this code has been audited.
+Its source is here too, with tests of our own at the exact hash this code uses (step 15).
 
 ## What is here
 
@@ -25,7 +26,7 @@ is alpha software by Kompact.io, used unmodified, and neither it nor this code h
 | `spike/` | the preprod runs (`run.ts`, `lifecycle.ts`, `refscript.ts`, `mint.ts`, `x402/e2e.ts`) |
 | [`RESULTS.md`](RESULTS.md) | every run, every transaction hash, and each run's reconciliation of the wallets |
 | [`DESIGN.md`](DESIGN.md) | the design and its decisions |
-| `vendor/subbit/` | Subbit's Aiken blueprint, unmodified ([provenance](vendor/subbit/PROVENANCE.md)) |
+| `vendor/subbit/` | Subbit's Aiken blueprint and its source, unmodified, with our tests of the validator in `aiken/lib/mark/` ([provenance](vendor/subbit/PROVENANCE.md)) |
 
 ## What ran on preprod
 
@@ -48,12 +49,25 @@ is alpha software by Kompact.io, used unmodified, and neither it nor this code h
 
 Each run's wallets reconcile to the lovelace against the fees of its transactions.
 
+**Step 15, the validator itself (no chain).** Subbit's Aiken source at the blueprint's commit
+compiles to the same 16 validators with Aiken 1.1.23 and 1.1.24. It has 73 tests of our own:
+- every test case in Subbit's own plan (its benchmarks aside);
+- the mutual spends that plan left as TODO;
+- batches and the continuing output;
+- the design properties this binding relies on;
+- byte-for-byte agreement with this package's encodings.
+
+They found one defect. A batch that needs two different signers fails when the later step's
+signer sorts first. It fails closed, and this binding never builds such a batch, because each of
+its transactions has one signer.
+
 ## Running it
 
 ```
 npm install
-npm test            # 42 chain-free tests
+npm test            # 43 chain-free tests
 npm run typecheck
+npm run validator   # the validator's Aiken tests; needs aiken 1.1.23 or later
 ```
 
 As a dependency, `npm i subbit-x402` (built, from npm) or a GitHub commit (which builds itself on
@@ -72,5 +86,6 @@ the end of [`RESULTS.md`](RESULTS.md#reproduce).
 
 ## Licence
 
-Apache-2.0. `vendor/subbit/plutus.json` is Kompact.io's, Apache-2.0 as declared in its
-repository. Written with AI assistance (Claude); the commits say so.
+Apache-2.0. `vendor/subbit/plutus.json` and `vendor/subbit/aiken/`, all but `lib/mark/`, are
+Kompact.io's, Apache-2.0 as declared in its repository. Written with AI assistance (Claude); the
+commits say so.

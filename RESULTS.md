@@ -902,6 +902,80 @@ the retry only waits again. KoiosChain counts only what is in a block. The chann
 (0.232545). The seller gained 1.112102: 1.37 less its claim's fee of 0.257898. There were 107
 vouchers, with increments of 1.37 tADA in signerd's audit and in its ledger alike.
 
+## Step 15: the validator's own tests
+
+Every step above ran against Subbit's validator as a blueprint, `vendor/subbit/plutus.json`. This
+step tests the validator itself, in Aiken, with no chain.
+
+**The source.**
+- `vendor/subbit/aiken/` is Subbit's `aiken/` at the blueprint's commit, `66648db`: 24 files,
+  each checked against that commit's tree.
+- It compiles to the vendored blueprint exactly: all 16 validators, hash and compiled code
+  alike, spend hash `62ce4309…`. That holds with Aiken 1.1.23 and 1.1.24, and with the tests
+  in place, so the tests exercise the code this binding runs.
+- Subbit's `lib/subbit/tbs_tests.ak` is empty. The only test at that commit is one of a list
+  helper.
+
+**The tests.** They are ours, in `lib/mark/`, after Subbit's own plan
+(`docs/design/l1-tests.md`). A property test marked `fail` passes only if every generated case
+fails. The runner runs the validator for every channel input with its own redeemer, as the
+ledger does.
+
+| Module | Tests | What |
+|---|---:|---|
+| `steps` | 31 | Each step alone, fuzzed where it should pass. Also the plan's failures: `add_less`, `sub_too_much`, `sub_bad_id`, `sub_bad_sig`, `close_bad_data`, `close_bad_expire` and `expire_too_soon` (the step is now `elapse`); each step without its signer; each in the wrong stage; a take the new `subbed` does not record; a close or elapse without the bound it needs |
+| `outputs` | 9 | The continuing output keeps the address and delegation, an inline datum naming this validator with the same six constants, no reference script, and nothing but the currency |
+| `batch` | 17 | The spec's batch of three subs and a settle, and one to four subs. Every channel input needs a step; `Main` comes first; two channels cannot share an output; outputs follow input order; a datum naming another hash can neither shield a channel nor join a batch. Plus the defect below |
+| `mutual` | 5 | The plan's "TODO": both must sign, the spend may rewrite the channel, and no other channel may come along |
+| `design` | 5 | Properties by design that this binding relies on, pinned so a change upstream shows |
+| `conformance` | 6 | `src/subbit.ts` and the validator agree. The IOU body the client signs is `iou.ak`'s message at all 16 amounts, across every CBOR integer width, and each signature verifies for its own amount and tag only. The client's datums and redeemers decode to the validator's values |
+
+**Run.** `aiken check --max-success 1000 --seed 66648` passes all 74, ours plus the list
+helper's, in 46,028 checks. It takes 75 s on Aiken 1.1.24 and 130 s on 1.1.23.
+
+**Checking the failures.** In a copy with every `fail` removed, each negative test failed at the
+check it is about. For example:
+- `sub_too_much` at `subbed_out <= owed`;
+- `close_bad_expire` at `upper_bound <= elapse_at - close_period`;
+- `sub_bad_id` at `iou.verify`;
+- `output_keeps_the_constants` at `constants_ == constants`.
+
+The first such pass found a flaw in the tests. Amounts could be 0, which makes an ADA output an
+empty value, and some cases failed on that instead. Amounts now start at 1.
+
+**The defect.**
+- **Where.** `spend/main.ak` gathers each step's signer with `xlist.ordered_insert`. Its doc says
+  it inserts "into the correct place". On an item that sorts before one already gathered, it
+  fails with `Impossible`.
+- **Why that is a bug.** The spec says of batches that "there is no restriction on which steps
+  appears", and each step needs only its own signer. So a batch that needs two different signers
+  fails whenever the later step's signer sorts first, with every signature present. Steps follow
+  input order, so the builder cannot choose.
+- **The tests.**
+  - `bug_batch_fails_when_signers_descend`: a provider's sub on the first channel and a
+    consumer's add on the second.
+  - `bug_two_consumers_in_descending_order`: two consumers adding, for any pair of keys.
+  - `bug_ordered_insert_refuses_a_smaller_item`.
+  - The same batches in ascending order pass.
+- **The fix** is one line: `Greater -> [item, x, ..xs]`, where `xs` is the tail.
+  `fix_gathers_any_signers` checks it.
+- **What it risks.** It fails closed, so no funds are at risk. It is a liveness limit on batches
+  with mixed signers.
+- **This binding never meets it.** A claim has one signer, the provider key its builder holds.
+  Each consumer step has one, the consumer. A refund is `Mutual`, which gathers no signers.
+
+**Design properties** that the `design` tests pin, each with what makes it safe here:
+- **A UTxO at the validator whose datum names another hash is anyone's.** `Main([])` spends it
+  with no signature. Only whoever made it can lose, and the facilitator refuses such an opening
+  (`datumBindingError`).
+- **An IOU is for an (IOU key, tag) pair, not a channel.** Two channels with the same pair honour
+  it twice. The client derives an IOU key per tag, and a tag hashes an input its opening spends.
+- **A token channel's ADA is not counted.** A sub on any IOU, even one for 0, can take it down to
+  the ledger minimum. The client deposits exactly the reserve, so this is the 0.09 tADA margin
+  measured in step 5.
+- **A settle has no deadline.** It works after `elapse_at`, until the consumer elapses.
+- **A provider may put funds back in a sub,** and `subbed` falls by as much.
+
 ## What this does not show yet
 
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a
@@ -1045,6 +1119,10 @@ X402_OUT=x402-step12 npm run x402 -- autosettle follow
 # step 13, in ada-agent-wallet on this version: dev/batchseller.ts, then signerd with the policy in
 # dev/mcpbatch.ts's header and its default BATCH_DEPOSIT_REQUESTS, then
 npm run mcpbatch
+
+# step 15, no chain: the validator's own tests (aiken 1.1.23 or later)
+aiken check --max-success 1000 --seed 66648 vendor/subbit/aiken
+aiken build vendor/subbit/aiken   # then compare its plutus.json with vendor/subbit/plutus.json
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

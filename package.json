@@ -31,7 +31,8 @@
   },
   "files": [
     "dist",
-    "vendor/subbit"
+    "vendor/subbit/plutus.json",
+    "vendor/subbit/PROVENANCE.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -42,6 +43,7 @@
     "x402": "tsx spike/x402/e2e.ts",
     "mint": "tsx spike/mint.ts",
     "test": "node --test --import tsx test/*.test.ts",
+    "validator": "aiken check vendor/subbit/aiken",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "engines": {
