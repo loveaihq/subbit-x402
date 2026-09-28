@@ -41,6 +41,7 @@ import {
   type ChannelView,
 } from "./cardano.ts";
 import { retryQueries, type Chain } from "./chain.ts";
+import { offerIn, offerProblem, offerUtxo, type FeeSponsorOffer } from "./sponsor.ts";
 import {
   Err,
   LOVELACE,
@@ -95,6 +96,8 @@ export interface ClientChannel {
   recoveredAt?: number;
   /** Found by `recover` with an IOU key this wallet cannot derive: it can only be closed, then ended or elapsed. */
   exitOnly?: boolean;
+  /** `seller`: the server's fee-sponsor offer paid the reserve, which goes back to it at the refund (SPONSORSHIP.md). */
+  reserveFrom?: "seller";
 }
 
 /** Where a client keeps its channels. */
@@ -149,13 +152,26 @@ export type Authorization =
       amount: bigint;
       /** What the channel output holds of its currency: an ADA channel's reserve included. */
       deposit: bigint;
-      /** The ADA the channel keeps for min-UTxO: inside `deposit` for ADA, beside the tokens otherwise. */
+      /** The ADA the channel keeps for min-UTxO: inside `deposit` for ADA, beside the tokens otherwise. 0 when the seller pays it. */
       reserve: bigint;
       transaction: string;
       requirements: PaymentRequirements;
+      /** The seller's fee-sponsor offer pays the fee and the reserve: the wallet's ADA only passes through. */
+      sponsored?: true;
     }
-  | { kind: "topUp"; channel: ClientChannel; amount: bigint; deposit: bigint; transaction: string; view: ChannelView; requirements: PaymentRequirements }
-  | { kind: "refund"; channel: ClientChannel; amount: bigint; /** Paid to `payTo`: charged and not yet redeemed. */ payout: bigint; transaction: string; view: ChannelView; requirements: PaymentRequirements }
+  | { kind: "topUp"; channel: ClientChannel; amount: bigint; deposit: bigint; transaction: string; view: ChannelView; requirements: PaymentRequirements; sponsored?: true }
+  | {
+      kind: "refund";
+      channel: ClientChannel;
+      amount: bigint;
+      /** Paid to `payTo`: charged and not yet redeemed. */
+      payout: bigint;
+      transaction: string;
+      view: ChannelView;
+      requirements: PaymentRequirements;
+      /** The seller's offer is the collateral, and the channel's ADA, the seller's reserve, goes back to `payTo`. */
+      sponsored?: true;
+    }
   | { kind: "close" | "end" | "elapse"; channel: ClientChannel; transaction: string; view: ChannelView };
 
 export interface ClientOptions {
@@ -231,6 +247,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
           return;
         }
         if (ctx.paymentRequired && (await this.applyCorrective(ctx.paymentRequired))) return { recovered: true as const };
+        await this.refusedBeforeSettlement(ctx.paymentPayload);
       },
     };
   }
@@ -293,6 +310,8 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
    * out of the channel, the refund first, is a script transaction.
    */
   private async topUp(req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, amount: bigint, short: bigint) {
+    const offer = this.usableOffer(req);
+    if (offer) return this.topUpSponsored(req, extra, ch, view, amount, short, offer);
     const w = this.o.wallet;
     const me = await w.address();
     const want = this.depositFor(req, extra, amount, this.maxDepositFor(req));
@@ -381,6 +400,8 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
    * collateral.
    */
   private async openChannel(req: PaymentRequirements, extra: BatchExtra, amount: bigint) {
+    const offer = this.usableOffer(req);
+    if (offer) return this.openSponsored(req, extra, amount, offer);
     const w = this.o.wallet;
     const me = await w.address();
     const payer = keyHash(me);
@@ -564,6 +585,9 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     }
     const [channelUtxo] = await w.getUtxosByOutRef([new TransactionInput.TransactionInput({ transactionId: TransactionHash.fromHex(view.ref.split("#")[0]!), index: BigInt(view.ref.split("#")[1]!) })]);
     if (!channelUtxo) throw new Error("channel output not readable");
+    const offer = ch.reserveFrom === "seller" ? this.usableOffer(req) : undefined;
+    if (ch.reserveFrom === "seller" && !offer) throw new Error("this channel's reserve is the seller's: its refund needs the seller's fee-sponsor offer, and this 402 has none");
+    if (offer) return this.refundSponsored(pr, req, extra, ch, view, channelUtxo, charged, offer);
     let tx = w
       .newTx()
       .collectFrom({ inputs: [channelUtxo], redeemer: Redeemer.mutual() })
@@ -587,6 +611,200 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       transaction: toBase64(signed),
     };
     return { x402Version: 2, accepted: req, payload: payload as unknown as Record<string, unknown>, ...(pr.resource ? { resource: pr.resource } : {}) };
+  }
+
+  // ---- fee sponsorship (SPONSORSHIP.md) -------------------------------------------------
+
+  /** The 402's fee-sponsor offer, when it is one this client can build with: a token price, not expired. */
+  private usableOffer(req: PaymentRequirements): FeeSponsorOffer | undefined {
+    if (req.asset === LOVELACE) return undefined;
+    try {
+      const o = offerIn(req.extra);
+      return o && !offerProblem(o, req.network, Date.now()) ? o : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The validity bound of a sponsored transaction: the request's window, and never past the offer. */
+  private sponsoredTtl(req: PaymentRequirements, offer: FeeSponsorOffer): bigint {
+    return BigInt(Math.min(Date.now() + req.maxTimeoutSeconds * 1000, Number(offer.expiresAt)));
+  }
+
+  /**
+   * An opening whose reserve and fee the seller's offer pays. The wallet's tokens come from the
+   * UTxOs `planTokens` picks, and every lovelace they carry goes back to the wallet with the
+   * remaining tokens; what is left of the offer after the reserve and the fee goes to `payTo`.
+   */
+  private async openSponsored(req: PaymentRequirements, extra: BatchExtra, amount: bigint, offer: FeeSponsorOffer) {
+    const w = this.o.wallet;
+    const me = await w.address();
+    const payer = keyHash(me);
+    const cur = currencyOf(req.asset);
+    if (cur.kind === "ada") throw new Error("only token channels are sponsored");
+    const tokens = this.depositFor(req, extra, amount, this.maxDepositFor(req));
+    const all = await this.available();
+    const plan = planTokens(all, cur, tokens, 0n);
+    const seed = plan.inputs[0];
+    if (!seed) throw new Error(`no UTxO holding ${req.asset} to open a channel from`);
+    const tag = tagFromInput(new TransactionInput.TransactionInput({ transactionId: seed.transactionId, index: seed.index }));
+    const random = this.o.iouKeys === "random";
+    const signer = random ? newIouSigner() : derivedIouSigner(await this.iouRoot(), req.network, tag);
+    const config: ChannelConfig = { payer, payerAuthorizer: signer.publicKey, receiver: req.payTo, receiverAuthorizer: extra.receiverAuthorizer, token: req.asset, withdrawDelay: extra.withdrawDelay };
+    const constants = constantsOf(config, tag);
+    const address = channelAddress(networkIdOf(req.network));
+    if (ScriptHash.toHex(address.paymentCredential as ScriptHash.ScriptHash) !== extra.scriptHash) throw new Error("server asks for a validator this client does not have");
+    const reserve = channelReserve(address, constants, (await w.getProtocolParameters()).coinsPerUtxoByte);
+    const own = plan.inputs.reduce((sum, u) => sum + Assets.lovelaceOf(u.assets), 0n);
+    const back = plan.rest > 0n ? Assets.fromHexStrings(cur.policy, cur.name, plan.rest, own) : Assets.fromLovelace(own);
+    const tx = w
+      .newTx()
+      .collectFrom({ inputs: [...plan.inputs, offerUtxo(offer)] })
+      .payToAddress({ address: me, assets: back })
+      .payToAddress({ address, assets: valueFor(cur, tokens, reserve), datum: inlineDatum(constants, { kind: "opened", subbed: 0n }) })
+      .setValidity({ to: this.sponsoredTtl(req, offer) });
+    const sb = await retryQueries("sponsored open", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [] }));
+    const built = await sb.toTransaction();
+    if (built.body.fee > BigInt(offer.maxFee)) throw new Error(`the opening's fee ${built.body.fee} exceeds the offer's maxFee ${offer.maxFee}`);
+    const mine = built.body.outputs.filter((o) => Address.toBech32(o.address) === Address.toBech32(me));
+    if (mine.length !== 1 || Assets.lovelaceOf(mine[0]!.assets) !== own) throw new Error("the sponsored opening does not return exactly the wallet's own lovelace");
+    const signed = await signedHex(sb);
+    const openInputs = built.body.inputs.map((i) => `${TransactionHash.toHex(i.transactionId)}#${i.index}`);
+    const openIndex = built.body.outputs.findIndex((o) => o.address.paymentCredential instanceof ScriptHash.ScriptHash && ScriptHash.toHex(o.address.paymentCredential) === extra.scriptHash);
+    const ch: ClientChannel = {
+      channelId: tag,
+      serverKey: serverKey(req, extra),
+      channelConfig: config,
+      ...(random ? { iouPrivateKeyPem: signer.privateKey.export({ type: "pkcs8", format: "pem" }).toString() } : {}),
+      iouKey: random ? "random" : "derived",
+      deposit: tokens.toString(),
+      balance: tokens.toString(),
+      chargedCumulativeAmount: "0",
+      status: "pending",
+      openTx: txHashOf(signed),
+      openIndex,
+      openInputs,
+      openedAt: Date.now(),
+      network: req.network,
+      scriptHash: extra.scriptHash,
+      ...(extra.referenceScript ? { referenceScript: extra.referenceScript } : {}),
+      reserveFrom: "seller",
+    };
+    await this.o.authorize?.({ kind: "open", channel: ch, amount, deposit: tokens, reserve: 0n, transaction: signed, requirements: req, sponsored: true });
+    this.recordOwn(signed, me);
+    await this.o.storage.set(ch);
+    return {
+      type: "deposit",
+      channelConfig: config,
+      voucher: { channelId: tag, maxClaimableAmount: amount.toString(), signature: signer.sign(tag, amount) },
+      deposit: { amount: tokens.toString(), transaction: toBase64(signed) },
+    };
+  }
+
+  /**
+   * A top-up whose fee the seller's offer pays, the offer also standing as the collateral: the
+   * channel's ADA does not change, the wallet's tokens join it, the wallet's lovelace goes back to
+   * it, and the rest of the offer, and the collateral's return, go to `payTo`.
+   */
+  private async topUpSponsored(req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, amount: bigint, short: bigint, offer: FeeSponsorOffer) {
+    const w = this.o.wallet;
+    const me = await w.address();
+    const c = view.datum.constants.currency;
+    if (c.kind === "ada") throw new Error("only token channels are sponsored");
+    const want = this.depositFor(req, extra, amount, this.maxDepositFor(req));
+    const all = await this.available();
+    const sponsorUtxo = offerUtxo(offer);
+    const { built: sb, amount: add } = await firstThatBuilds(topUpAmounts(want, short, tokensHeld(all, c)), async (add) => {
+      const plan = planTokens(all, c, add, 0n);
+      const own = plan.inputs.reduce((sum, u) => sum + Assets.lovelaceOf(u.assets), 0n);
+      let tx = w.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.add()]) });
+      tx = await this.withValidator(tx, extra.referenceScript);
+      tx = tx
+        .collectFrom({ inputs: [...plan.inputs, sponsorUtxo] })
+        .payToAddress({ address: me, assets: plan.rest > 0n ? Assets.fromHexStrings(c.policy, c.name, plan.rest, own) : Assets.fromLovelace(own) })
+        .payToAddress({ address: view.address, assets: valueFor(c, view.amount + add, view.lovelace), datum: view.utxo.datumOption as InlineDatum.InlineDatum })
+        .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) })
+        .setValidity({ to: this.sponsoredTtl(req, offer) });
+      return retryQueries("sponsored top-up", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [sponsorUtxo], setCollateral: SPONSORED_COLLATERAL }));
+    });
+    const fee = (await sb.toTransaction()).body.fee;
+    if (fee > BigInt(offer.maxFee)) throw new Error(`the top-up's fee ${fee} exceeds the offer's maxFee ${offer.maxFee}`);
+    const signed = await signedHex(sb);
+    const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
+    await this.o.authorize?.({ kind: "topUp", channel: ch, amount: ceiling, deposit: add, transaction: signed, view, requirements: req, sponsored: true });
+    this.recordOwn(signed, me);
+    this.topUps.set(ch.channelId, { from: view.ref, tx: txHashOf(signed), at: Date.now() });
+    return {
+      type: "deposit",
+      channelConfig: ch.channelConfig,
+      voucher: { channelId: ch.channelId, maxClaimableAmount: ceiling.toString(), signature: await this.signVoucher(ch, ceiling), channelRef: view.ref },
+      deposit: { amount: add.toString(), transaction: toBase64(signed) },
+    };
+  }
+
+  /**
+   * The refund of a channel whose reserve is the seller's: the offer is the collateral and nothing
+   * of it is spent; the refunded tokens join one of the wallet's own UTxOs, whose lovelace covers
+   * them; the channel's ADA, less the fee, goes back to `payTo`.
+   */
+  private async refundSponsored(pr: PaymentRequired, req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, channelUtxo: UTxO.UTxO, charged: bigint, offer: FeeSponsorOffer): Promise<PaymentPayload> {
+    const w = this.o.wallet;
+    const me = await w.address();
+    const cur = view.datum.constants.currency;
+    if (cur.kind === "ada") throw new Error("only token channels are sponsored");
+    const owed = charged - subbedOf(view.datum.stage);
+    if (owed > 0n) throw new Error(`owed ${owed} tokens; the server must claim them before a refund`);
+    // The wallet's own UTxO the tokens come home to: the one holding the most of them, else the richest.
+    const own = (await this.available()).filter((u) => onlyCurrency(u.assets, cur)).sort((a, b) => {
+      const d = amountIn(b.assets, cur) - amountIn(a.assets, cur);
+      return d !== 0n ? (d > 0n ? 1 : -1) : Assets.lovelaceOf(b.assets) > Assets.lovelaceOf(a.assets) ? 1 : -1;
+    })[0];
+    if (!own) throw new Error("the wallet holds no UTxO of its own for the refunded tokens to join");
+    const home = valueFor(cur, amountIn(own.assets, cur) + view.amount, Assets.lovelaceOf(own.assets));
+    let tx = w
+      .newTx()
+      .collectFrom({ inputs: [channelUtxo], redeemer: Redeemer.mutual() })
+      .collectFrom({ inputs: [own] })
+      .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) })
+      .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.receiverAuthorizer) });
+    const ref = extra.referenceScript ? await this.o.chain.getUnspent(extra.referenceScript) : undefined;
+    tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
+    tx = tx.payToAddress({ address: me, assets: home }).setValidity({ to: this.sponsoredTtl(req, offer) });
+    const sb = await retryQueries("sponsored refund", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [offerUtxo(offer)], setCollateral: SPONSORED_COLLATERAL }));
+    const built = await sb.toTransaction();
+    if (built.body.inputs.some((i) => `${TransactionHash.toHex(i.transactionId)}#${Number(i.index)}` === offer.input)) throw new Error("the builder spent the offer instead of holding it as collateral");
+    const signed = await signedHex(sb);
+    await this.o.authorize?.({ kind: "refund", channel: ch, amount: charged, payout: 0n, transaction: signed, view, requirements: req, sponsored: true });
+    this.recordOwn(signed, me, { spends: false });
+    const payload: RefundPayload = {
+      type: "refund",
+      channelConfig: ch.channelConfig,
+      voucher: { channelId: ch.channelId, maxClaimableAmount: charged.toString(), signature: await this.signVoucher(ch, charged), channelRef: view.ref },
+      transaction: toBase64(signed),
+    };
+    return { x402Version: 2, accepted: req, payload: payload as unknown as Record<string, unknown>, ...(pr.resource ? { resource: pr.resource } : {}) };
+  }
+
+  /**
+   * A deposit the server refused before settlement was never broadcast: its inputs are the
+   * wallet's again, and an opening that was pending on it has failed.
+   */
+  private async refusedBeforeSettlement(payload: PaymentPayload) {
+    let p;
+    try {
+      p = parseClientPayload(payload.payload);
+    } catch {
+      return;
+    }
+    if (p.type !== "deposit") return;
+    const hex = Buffer.from(p.deposit.transaction, "base64").toString("hex");
+    const tx = Transaction.fromCBORHex(hex);
+    for (const i of tx.body.inputs) this.spent.delete(`${TransactionHash.toHex(i.transactionId)}#${i.index}`);
+    const hash = txHashOf(hex);
+    for (const [r, x] of [...this.ownOutputs]) if (x.tx === hash) this.ownOutputs.delete(r);
+    const ch = await this.o.storage.get(p.voucher.channelId);
+    if (ch?.status === "pending" && ch.openTx === hash) await this.o.storage.set({ ...ch, status: "failed" });
+    if (this.topUps.get(p.voucher.channelId)?.tx === hash) this.topUps.delete(p.voucher.channelId);
   }
 
   // ---- the consumer's own exit (outside x402) -----------------------------------------
@@ -869,6 +1087,13 @@ export function derivedIouSigner(root: Uint8Array, network: string, tag: string)
  * refund's collateral (`collateralTarget`).
  */
 export const TOP_UP_HEADROOM = 2_500_000n;
+
+/**
+ * Total collateral a sponsored top-up or refund puts up from the seller's offer: at least 150% of
+ * any fee here, and within the seller's 2 ADA bound. Forfeit only if a script fails, which the
+ * evaluator rules out before broadcast.
+ */
+export const SPONSORED_COLLATERAL = 1_000_000n;
 
 /** How much of a token currency the UTxOs `planTokens` would draw on hold. */
 function tokensHeld(utxos: UTxO.UTxO[], c: Currency): bigint {

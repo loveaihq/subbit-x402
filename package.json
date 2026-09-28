@@ -41,6 +41,7 @@
     "lifecycle": "tsx spike/lifecycle.ts",
     "refscript": "tsx spike/refscript.ts",
     "x402": "tsx spike/x402/e2e.ts",
+    "sponsored": "tsx spike/x402/sponsored.ts",
     "mint": "tsx spike/mint.ts",
     "test": "node --test --import tsx test/*.test.ts",
     "validator": "aiken check vendor/subbit/aiken",

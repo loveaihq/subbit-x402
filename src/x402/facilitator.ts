@@ -7,12 +7,13 @@
 // so this is custody, not an authorisation: the server trusts the facilitator with its revenue.
 import { TransactionWitnessSet } from "@evolution-sdk/evolution";
 import type { PaymentPayload, PaymentRequirements, SchemeNetworkFacilitator, SettleResponse, VerifyResponse } from "@x402/core/types";
-import { Address, Data, Transaction, TransactionHash } from "@evolution-sdk/evolution";
+import { Address, Data, KeyHash, Transaction, TransactionHash } from "@evolution-sdk/evolution";
 import { capacityOf, channelStateOf, datumBindingError, readChannel, txHashOf, verifyVoucherSignature, type ChannelView } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
 import { buildClaimTx, compareRefs, type ClaimLine } from "./claimtx.ts";
 import type { SeedWallet } from "./client.ts";
 import { channelOutputIndex, checkDeposit, checkInputWitnesses, checkMutual, checkTopUp, decodeTx, sortedInputRefs, spendRedeemers, TxCheckError } from "./txcheck.ts";
+import { CAPABILITY_KEY, feeFloor, offerIn, offerKeyHash, sizeWith, witnessKeyHashesOf, type FeeSponsorOffer } from "./sponsor.ts";
 import {
   Err,
   PayloadError,
@@ -74,8 +75,9 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     }
   }
 
+  /** It merges a fee sponsor's witnesses at settlement (SPONSORSHIP.md); it pays nothing itself. */
   getExtra(): Record<string, unknown> | undefined {
-    return undefined;
+    return { [CAPABILITY_KEY]: true };
   }
 
   /** The provider keys it holds for servers, if any. Each server is told its own out of band. */
@@ -106,6 +108,12 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
       // since have landed and moved the channel on, which a second check would refuse it for. The
       // same payload keeps what the first check found, and the settle only waits again.
       const same = JSON.stringify(paymentPayload.payload);
+      // A fee sponsor's witnesses join the transaction first, so the check sees what goes out.
+      const merged = this.withSponsorWitnesses(paymentPayload, requirements);
+      if ("error" in merged) return failed(Err.depositTransaction, merged.error);
+      const missing = this.sponsorWitnessMissing(merged.payload, requirements);
+      if (missing) return failed(Err.depositTransaction, missing);
+      paymentPayload = merged.payload;
       const v = this.pending.get(same) ?? (await this.check(paymentPayload, requirements));
       if (!v.ok) return failed(v.reason, v.message, "", v.payer);
       const p = parseClientPayload(paymentPayload.payload);
@@ -169,7 +177,9 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
       if (!u) return bad(Err.depositTransaction, `input ${ref} is spent or unknown`, payer);
       resolved.push(u.address);
     }
-    checkInputWitnesses(t.tx, hex, resolved, Err.depositTransaction);
+    const lacking = await this.sponsorStillToSign(hex, req, "input");
+    if (typeof lacking === "object") return bad(Err.depositTransaction, lacking.error, payer);
+    checkInputWitnesses(t.tx, hex, resolved, Err.depositTransaction, lacking);
     try {
       await this.chain.evaluate(hex);
     } catch (e) {
@@ -189,14 +199,17 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     const cpb = await this.chain.coinsPerUtxoByte();
     const hex = fromBase64(p.deposit.transaction);
     const d = checkDeposit(hex, req.network, p.channelConfig, p.voucher.channelId, extra.scriptHash, BigInt(p.deposit.amount), cpb);
-    // Every input must exist and be unspent, and every key-locked one signed for.
+    // Every input must exist and be unspent, and every key-locked one signed for, but for a fee
+    // sponsor's, which the seller signs at settlement.
     const resolved = [];
     for (const ref of d.inputRefs) {
       const u = await this.chain.getUnspent(ref);
       if (!u) return bad(Err.depositTransaction, `input ${ref} is spent or unknown`, p.channelConfig.payer);
       resolved.push(u.address);
     }
-    checkInputWitnesses(d.tx, hex, resolved, Err.depositTransaction);
+    const lacking = await this.sponsorStillToSign(hex, req, "input");
+    if (typeof lacking === "object") return bad(Err.depositTransaction, lacking.error, p.channelConfig.payer);
+    checkInputWitnesses(d.tx, hex, resolved, Err.depositTransaction, lacking);
     const ceiling = BigInt(p.voucher.maxClaimableAmount);
     if (ceiling > d.capacity) return bad(Err.cumulativeExceedsBalance, `voucher ${ceiling} exceeds capacity ${d.capacity}`, p.channelConfig.payer);
     if (ceiling <= 0n) return bad(Err.cumulativeBelowClaimed, "a deposit voucher must charge something", p.channelConfig.payer);
@@ -243,9 +256,19 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     const ch = v.channel!;
     const subbed = ch.datum.stage.kind === "opened" ? ch.datum.stage.subbed : 0n;
     const owed = BigInt(p.voucher.maxClaimableAmount) - subbed;
-    const hex = p.providerWitness ? Transaction.addVKeyWitnessesHex(fromBase64(p.transaction), p.providerWitness) : fromBase64(p.transaction);
+    let hex = p.providerWitness ? Transaction.addVKeyWitnessesHex(fromBase64(p.transaction), p.providerWitness) : fromBase64(p.transaction);
+    if (p.sponsorWitnesses) hex = Transaction.addVKeyWitnessesHex(hex, p.sponsorWitnesses);
     const collateral = await this.resolveCollateral(hex);
-    checkMutual(hex, req.network, extra.scriptHash, ch.ref, p.channelConfig.payer, p.channelConfig.receiverAuthorizer, req.payTo, ch.datum.constants.currency, owed, collateral);
+    const others = new Map<string, Address.Address>();
+    for (const ref of sortedInputRefs(decodeTx(hex, Err.refundTransaction))) {
+      if (ref === ch.ref) continue;
+      const u = await this.chain.getUnspent(ref);
+      if (!u) return bad(Err.refundTransaction, `input ${ref} is spent or unknown`, p.channelConfig.payer);
+      others.set(ref, u.address);
+    }
+    checkMutual(hex, req.network, extra.scriptHash, ch.ref, p.channelConfig.payer, p.channelConfig.receiverAuthorizer, req.payTo, ch.datum.constants.currency, owed, collateral, true, others);
+    const lacking = await this.sponsorStillToSign(hex, req, "collateral");
+    if (typeof lacking === "object") return bad(Err.refundTransaction, lacking.error, p.channelConfig.payer);
     return v;
   }
 
@@ -259,6 +282,83 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
       out.push(u.address);
     }
     return out;
+  }
+
+  // ---- fee sponsorship (SPONSORSHIP.md) ---------------------------------------------
+
+  /** The offer in the requirements and its key, when the transaction uses it in `role`. */
+  private sponsorOf(hex: string, req: PaymentRequirements, role: "input" | "collateral"): { offer: FeeSponsorOffer; keyHash: string } | undefined {
+    let offer: FeeSponsorOffer | undefined;
+    let keyHash: string | undefined;
+    try {
+      offer = offerIn(req.extra);
+      keyHash = offer ? offerKeyHash(offer, req.network) : undefined;
+    } catch {
+      return undefined;
+    }
+    if (!offer || !keyHash) return undefined;
+    const b = decodeTx(hex, Err.depositTransaction).body;
+    const refs = (role === "input" ? b.inputs : (b.collateralInputs ?? [])).map((i) => `${TransactionHash.toHex(i.transactionId)}#${Number(i.index)}`);
+    return refs.includes(offer.input) ? { offer, keyHash } : undefined;
+  }
+
+  /**
+   * At verify, a transaction that uses the fee-sponsor offer may still lack the seller's witness,
+   * which the seller adds at settlement: returns that key, to be let off `checkInputWitnesses`,
+   * once the fee covers the size the transaction will have with it (F1). An error when it does not.
+   */
+  private async sponsorStillToSign(hex: string, req: PaymentRequirements, role: "input" | "collateral"): Promise<string | undefined | { error: string }> {
+    const s = this.sponsorOf(hex, req, role);
+    if (!s || witnessKeyHashesOf(hex).includes(s.keyHash)) return undefined;
+    const fee = decodeTx(hex, Err.depositTransaction).body.fee;
+    const floor = feeFloor(sizeWith(hex, 1), await this.chain.feeParameters());
+    if (fee < floor) return { error: `fee ${fee} is below the size floor ${floor} once the fee sponsor has signed` };
+    return s.keyHash;
+  }
+
+  /** The payload with a deposit's `sponsorWitnesses` merged into its transaction (F2); a refund merges at settlement. */
+  private withSponsorWitnesses(pp: PaymentPayload, req: PaymentRequirements): { payload: PaymentPayload } | { error: string } {
+    const raw = pp.payload as Record<string, unknown>;
+    const w = raw.sponsorWitnesses;
+    if (w === undefined) return { payload: pp };
+    if (typeof w !== "string" || !/^[0-9a-f]+$/i.test(w)) return { error: "sponsorWitnesses is not CBOR hex" };
+    let keyHash: string | undefined;
+    try {
+      const offer = offerIn(req.extra);
+      keyHash = offer ? offerKeyHash(offer, req.network) : undefined;
+    } catch (e) {
+      return { error: (e as Error).message };
+    }
+    if (!keyHash) return { error: "sponsorWitnesses given for requirements without a usable offer" };
+    let keys: string[];
+    try {
+      keys = (TransactionWitnessSet.fromCBORHex(w).vkeyWitnesses ?? []).map((x) => KeyHash.toHex(KeyHash.fromVKey(x.vkey)).toLowerCase());
+    } catch (e) {
+      return { error: `sponsorWitnesses do not decode: ${(e as Error).message}` };
+    }
+    if (!keys.length || keys.some((k) => k !== keyHash)) return { error: "sponsorWitnesses must hold witnesses for the offer's key only" };
+    if (raw.type !== "deposit") return { payload: pp };
+    const d = raw.deposit as { amount: string; transaction: string };
+    const { sponsorWitnesses: _merged, ...rest } = raw;
+    return { payload: { ...pp, payload: { ...rest, deposit: { ...d, transaction: Buffer.from(Transaction.addVKeyWitnessesHex(fromBase64(d.transaction), w), "hex").toString("base64") } } } };
+  }
+
+  /** F3: a transaction that uses the offer and still lacks the seller's witness is not broadcast. */
+  private sponsorWitnessMissing(pp: PaymentPayload, req: PaymentRequirements): string | undefined {
+    const raw = pp.payload as Record<string, unknown>;
+    let hex: string;
+    let role: "input" | "collateral";
+    if (raw.type === "deposit") {
+      hex = fromBase64((raw.deposit as { transaction: string }).transaction);
+      role = "input";
+    } else if (raw.type === "refund") {
+      hex = fromBase64(raw.transaction as string);
+      if (typeof raw.sponsorWitnesses === "string") hex = Transaction.addVKeyWitnessesHex(hex, raw.sponsorWitnesses);
+      role = "collateral";
+    } else return undefined;
+    const s = this.sponsorOf(hex, req, role);
+    if (!s || witnessKeyHashesOf(hex).includes(s.keyHash)) return undefined;
+    return `the transaction uses the offered ${s.offer.input} without the seller's witness`;
   }
 
   // ---- settlement ---------------------------------------------------------------
@@ -309,7 +409,8 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
       }
       witness = TransactionWitnessSet.toCBORHex(await held.d.wallet.signTx(fromBase64(p.transaction)));
     }
-    const hex = Transaction.addVKeyWitnessesHex(fromBase64(p.transaction), witness);
+    let hex = Transaction.addVKeyWitnessesHex(fromBase64(p.transaction), witness);
+    if (p.sponsorWitnesses) hex = Transaction.addVKeyWitnessesHex(hex, p.sponsorWitnesses);
     const { txHash, confirmed } = await this.broadcast(hex);
     if (!confirmed) return { success: false, errorReason: SETTLEMENT_PENDING, transaction: txHash, network: req.network, payer };
     const subbed = ch.datum.stage.kind === "opened" ? ch.datum.stage.subbed : 0n;

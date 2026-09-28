@@ -23,10 +23,24 @@ import type {
   SupportedKind,
   VerifyResponse,
 } from "@x402/core/types";
-import { Transaction, TransactionHash, TransactionWitnessSet, type Address } from "@evolution-sdk/evolution";
-import { currencyOf, verifyVoucherSignature } from "./cardano.ts";
+import { decodePaymentSignatureHeader } from "@x402/core/http";
+import { Assets, InlineDatum, KeyHash, Transaction, TransactionHash, TransactionWitnessSet, type Address } from "@evolution-sdk/evolution";
+import { parseDatum } from "../subbit.ts";
+import { channelReserve, currencyOf, isChannelOutput, msOfSlot, txHashOf, verifyVoucherSignature } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
-import { checkMutual, decodeTx } from "./txcheck.ts";
+import {
+  CAPABILITY_KEY,
+  OFFER_KEY,
+  WITNESS_KEY,
+  checkSponsoredOpen,
+  checkSponsoredRefund,
+  checkSponsoredTopUp,
+  offerIn,
+  type FeeSponsorOffer,
+  type SponsorPool,
+  type SponsorResult,
+} from "./sponsor.ts";
+import { checkMutual, decodeTx, sortedInputRefs } from "./txcheck.ts";
 import {
   Err,
   LOVELACE,
@@ -65,6 +79,8 @@ export interface ServerChannel {
   onchainSyncedAt?: number;
   lastRequestTimestamp: number;
   pendingRequest?: { pendingId: string; signedMaxClaimable: string; expiresAt: number };
+  /** `seller`: the channel's reserve came from this server's fee-sponsor offer, and goes back to it at the refund. */
+  reserveFrom?: "seller";
 }
 
 export interface ChannelUpdateResult {
@@ -170,6 +186,20 @@ export interface ServerConfig {
   chain: Chain;
   /** Decimals of the token assets the server prices in, for `$`-free settlement overrides. */
   assetDecimals?: Record<string, number>;
+  /** Sponsors the fees and reserve of token channels from the seller's own ADA (SPONSORSHIP.md). */
+  sponsor?: SponsorConfig;
+}
+
+export interface SponsorConfig {
+  /** The sponsor key's UTxOs; its key must not be the provider key. */
+  pool: SponsorPool;
+  /** Most total collateral a sponsored top-up or refund may put up. Default 2 ADA. */
+  maxCollateral?: bigint;
+  /** The longest an offer runs, capped by the accept's `maxTimeoutSeconds`, which is the default. */
+  offerTtlSeconds?: number;
+  /** Re-read the sponsor address at most this often while serving 402s. Default 20 s. */
+  refreshMs?: number;
+  log?: (line: string) => void;
 }
 
 interface RequestContext {
@@ -180,6 +210,8 @@ interface RequestContext {
   reservationCommitted?: boolean;
   /** This request repeats the channel's latest voucher: it gets that request's answer again. */
   replay?: Replay;
+  /** The deposit or refund uses the fee-sponsor offer, bound to this transaction. */
+  sponsor?: { offer: FeeSponsorOffer; txHash: string; opening: boolean };
 }
 
 /** A channel's latest paid request: its voucher, the handler's response, and the settlement answered. */
@@ -216,6 +248,9 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   /** Each channel's latest paid request, by channel id, oldest first. */
   private readonly replays = new Map<string, Replay>();
   private readonly replayTtlMs: number;
+  /** The facilitator merges fee-sponsor witnesses, so offers may go out. */
+  private sponsorCapable = false;
+  private lastPoolRefresh = 0;
 
   constructor(private readonly config: ServerConfig) {
     this.withdrawDelay = config.withdrawDelay ?? MIN_WITHDRAW_DELAY;
@@ -231,9 +266,11 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
         await this.clearPending(ctx.paymentPayload);
       },
       onSettleFailure: async (ctx) => {
+        this.releaseSponsor(ctx.paymentPayload, (ctx.error as { response?: { errorReason?: string } } | undefined)?.response?.errorReason);
         await this.clearPending(ctx.paymentPayload);
       },
       onVerifiedPaymentCanceled: async (ctx) => {
+        this.releaseSponsor(ctx.paymentPayload);
         await this.clearPending(ctx.paymentPayload);
       },
     };
@@ -253,7 +290,8 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
     return asset === LOVELACE ? 6 : this.config.assetDecimals?.[asset];
   }
 
-  async enhancePaymentRequirements(req: PaymentRequirements, _kind: SupportedKind, _ext: string[]): Promise<PaymentRequirements> {
+  async enhancePaymentRequirements(req: PaymentRequirements, kind: SupportedKind, _ext: string[]): Promise<PaymentRequirements> {
+    if (this.config.sponsor && (kind.extra as Record<string, unknown> | undefined)?.[CAPABILITY_KEY] === true) this.sponsorCapable = true;
     const amount = BigInt(req.amount);
     const hinted = typeof req.extra?.minDeposit === "string" && /^\d+$/.test(req.extra.minDeposit) ? BigInt(req.extra.minDeposit) : amount * 10n;
     return {
@@ -368,6 +406,10 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
       return { abort: true as const, reason: Err.cumulativeAmountMismatch, message: "voucher does not follow the server's count" };
     }
     if (upd.status === "updated" && upd.channel) this.merge(payload, { reservationCommitted: true, channelSnapshot: upd.channel });
+    if (p.type === "deposit") {
+      const refused = await this.bindSponsoredDeposit(payload, req, p.deposit.transaction, !p.voucher.channelRef);
+      if (refused) return refused;
+    }
     if (isRefund && upd.status === "updated") {
       return { skipHandler: true as const, response: { contentType: "application/json", body: { message: "Refund acknowledged", channelId: p.voucher.channelId } } };
     }
@@ -422,9 +464,20 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
     return { skip: true as const, result };
   }
 
-  /** Refunds only: check the client's `Mutual` against the server's own record, then co-sign it. */
+  /**
+   * A sponsored deposit gets the seller's witness for its offer. A refund is checked against the
+   * server's own record and co-signed; when its collateral is the offer, the seller checks it as
+   * the collateral's owner too and adds that witness (SPONSORSHIP.md).
+   */
   enrichSettlementPayload = async (ctx: SettleContext): Promise<Record<string, unknown> | void> => {
     const p = parseClientPayload(ctx.paymentPayload.payload);
+    if (p.type === "deposit") {
+      const sp = this.contexts.get(ctx.paymentPayload)?.sponsor ?? this.sponsoredDeposit(ctx.paymentPayload, ctx.requirements);
+      if (!sp) return;
+      const witness = this.config.sponsor!.pool.witnessFor(sp.offer, sp.txHash);
+      if (!witness) throw new Error(`fee sponsor: ${sp.txHash} spends ${sp.offer.input} but is not the transaction bound to it`);
+      return { [WITNESS_KEY]: witness };
+    }
     if (p.type !== "refund") return;
     const ch = await this.storage.get(p.voucher.channelId);
     if (!ch) throw new Error(Err.missingChannel);
@@ -439,12 +492,21 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
       if (!u) throw new Error(`${Err.refundTransaction}: collateral is spent or unknown`);
       collateral.push(u.address);
     }
+    const others = new Map<string, Address.Address>();
+    for (const ref of sortedInputRefs(decodeTx(hex, Err.refundTransaction))) {
+      if (ref === ch.channelRef) continue;
+      const u = await this.config.chain.getUnspent(ref);
+      if (!u) throw new Error(`${Err.refundTransaction}: input ${ref} is spent or unknown`);
+      others.set(ref, u.address);
+    }
     const owed = BigInt(ch.chargedCumulativeAmount) - BigInt(ch.totalClaimed);
-    checkMutual(hex, ctx.requirements.network, this.config.scriptHash, ch.channelRef, ch.channelConfig.payer, this.config.receiverAuthorizer, this.config.payTo, currencyOf(ch.channelConfig.token), owed, collateral);
+    checkMutual(hex, ctx.requirements.network, this.config.scriptHash, ch.channelRef, ch.channelConfig.payer, this.config.receiverAuthorizer, this.config.payTo, currencyOf(ch.channelConfig.token), owed, collateral, true, others);
+    const sponsorWitness = await this.signSponsoredRefund(ctx, hex, ch);
     this.merge(ctx.paymentPayload, { channelSnapshot: ch });
-    if (this.config.signAsProvider) return { providerWitness: await this.config.signAsProvider(hex) };
+    const extra = sponsorWitness ? { [WITNESS_KEY]: sponsorWitness } : {};
+    if (this.config.signAsProvider) return { providerWitness: await this.config.signAsProvider(hex), ...extra };
     // The facilitator holds the key: it signs this refund, having seen the server vouch for it.
-    if (this.config.delegationSecret) return { delegationMac: delegationMac(this.config.delegationSecret, this.config.payTo, ctx.paymentPayload.payload) };
+    if (this.config.delegationSecret) return { delegationMac: delegationMac(this.config.delegationSecret, this.config.payTo, ctx.paymentPayload.payload), ...extra };
     throw new Error("this server holds no provider key and has no delegation");
   };
 
@@ -452,6 +514,13 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
     if (!result.success || this.contexts.get(payload)?.replay) return;
     const p = parseClientPayload(payload.payload);
     const pendingId = this.contexts.get(payload)?.pendingId;
+    const sponsored = this.contexts.get(payload)?.sponsor;
+    if (sponsored) {
+      // A deposit spent the sponsor UTxO. A refund only held it as collateral: it is free again.
+      if (p.type === "refund") this.config.sponsor!.pool.release(sponsored.offer.input, sponsored.txHash, true);
+      else this.config.sponsor!.pool.retire(sponsored.offer.input);
+      this.sponsorLog(`settled ${sponsored.txHash.slice(0, 16)}… using ${sponsored.offer.input.slice(0, 16)}…#${sponsored.offer.input.split("#")[1]}`);
+    }
     if (p.type === "refund") {
       await this.storage.updateChannel(p.voucher.channelId, (current) => (current && current.pendingRequest?.pendingId === pendingId ? undefined : current));
       return;
@@ -470,6 +539,7 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
         onchainSyncedAt: Date.now(),
         lastRequestTimestamp: Date.now(),
         pendingRequest: undefined,
+        ...(sponsored?.opening ? { reserveFrom: "seller" as const } : {}),
       };
     });
     if (upd.status !== "updated" || !upd.channel) throw new Error(Err.channelBusy);
@@ -538,8 +608,14 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
     while (this.replays.size > MAX_REPLAYS) this.replays.delete(this.replays.keys().next().value!);
   }
 
-  /** On `cumulative_amount_mismatch`, tell the client where the server's count stands and what it last signed. */
+  /**
+   * Each token accept gets a fee-sponsor offer when the server sponsors and its facilitator can
+   * merge the seller's witness; a paid request that echoes an offer this pool made gets it back
+   * verbatim, so it matches whether or not it spends it. On `cumulative_amount_mismatch`, the
+   * accept also says where the server's count stands and what it last signed.
+   */
   enrichPaymentRequiredResponse = async (ctx: SchemePaymentRequiredContext): Promise<PaymentRequirements[] | void> => {
+    await this.offerSponsorship(ctx);
     if (ctx.error !== Err.cumulativeAmountMismatch || !ctx.paymentPayload) return;
     let p: ClientPayload;
     try {
@@ -557,6 +633,174 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
       voucherState: { signedMaxClaimable: ch.signedMaxClaimable, signature: ch.signature },
     };
   };
+
+  // ---- fee sponsorship (SPONSORSHIP.md) -----------------------------------------------
+
+  private async offerSponsorship(ctx: SchemePaymentRequiredContext): Promise<void> {
+    const sp = this.config.sponsor;
+    if (!sp || !this.sponsorCapable) return;
+    const paid = (ctx.paymentPayload as PaymentPayload | undefined) ?? paidPayloadOf(ctx.transportContext);
+    for (const accept of ctx.requirements) {
+      if (accept.scheme !== SCHEME || accept.asset === LOVELACE || Object.prototype.hasOwnProperty.call(accept.extra ?? {}, OFFER_KEY)) continue;
+      await this.refreshPool();
+      const reused = this.reusedOffer(paid, accept);
+      const offer = reused ?? (await sp.pool.offer(Math.min(sp.offerTtlSeconds ?? accept.maxTimeoutSeconds, accept.maxTimeoutSeconds) * 1000));
+      if (offer) accept.extra = { ...accept.extra, areFeesSponsored: true, [OFFER_KEY]: offer };
+    }
+  }
+
+  private reusedOffer(paid: PaymentPayload | undefined, accept: PaymentRequirements): FeeSponsorOffer | undefined {
+    const a = paid?.accepted;
+    if (!a || a.scheme !== accept.scheme || a.network !== accept.network || a.payTo !== accept.payTo || a.amount !== accept.amount || a.asset !== accept.asset || a.maxTimeoutSeconds !== accept.maxTimeoutSeconds) return undefined;
+    try {
+      const o = offerIn(a.extra);
+      return o && this.config.sponsor!.pool.known(o) ? o : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Re-reads the pool now and then; a failed read keeps what it last read and is tried again next 402. */
+  private async refreshPool(): Promise<void> {
+    const sp = this.config.sponsor!;
+    if (Date.now() - this.lastPoolRefresh < (sp.refreshMs ?? 20_000)) return;
+    try {
+      await sp.pool.refresh();
+      this.lastPoolRefresh = Date.now();
+    } catch (e) {
+      this.sponsorLog(`pool refresh failed, serving from what it last read: ${(e as Error).message}`);
+    }
+  }
+
+  /** The offer and transaction when this deposit spends the requirements' offer. */
+  private sponsoredDeposit(payload: Payload, req: PaymentRequirements): { offer: FeeSponsorOffer; txHash: string; opening: boolean } | undefined {
+    if (!this.config.sponsor) return undefined;
+    try {
+      const p = parseClientPayload(payload.payload);
+      if (p.type !== "deposit") return undefined;
+      const offer = offerIn(req.extra);
+      if (!offer) return undefined;
+      const hex = fromBase64(p.deposit.transaction);
+      const spends = decodeTx(hex, Err.depositTransaction).body.inputs.some((i) => `${TransactionHash.toHex(i.transactionId)}#${Number(i.index)}` === offer.input);
+      return spends ? { offer, txHash: txHashOf(hex), opening: !p.voucher.channelRef } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * A deposit that spends the offer: the seller's rules for an opening or a top-up, then the
+   * binding and the seller's witness, before the handler runs. A refusal aborts the request.
+   */
+  private async bindSponsoredDeposit(payload: Payload, req: PaymentRequirements, txB64: string, opening: boolean) {
+    const found = this.sponsoredDeposit(payload, req);
+    if (!found) return undefined;
+    const sp = this.config.sponsor!;
+    const hex = fromBase64(txB64);
+    const me = await sp.pool.identity();
+    if (found.offer.address !== me.address) return { abort: true as const, reason: "fee_sponsor_invalid", message: "the offer is not this seller's" };
+    const base = {
+      txHex: hex,
+      offer: found.offer,
+      network: req.network,
+      payTo: this.config.payTo,
+      sponsorKeyHash: me.keyHash,
+      ownerOf: (ref: string) => this.ownerOf(ref),
+      fees: await this.config.chain.feeParameters(),
+      missingWitnesses: 1,
+      ...(sp.maxCollateral !== undefined ? { maxCollateral: sp.maxCollateral } : {}),
+    };
+    let r: SponsorResult;
+    if (opening) {
+      const tx = decodeTx(hex, Err.depositTransaction);
+      const out = tx.body.outputs.find((o) => isChannelOutput(o.address, this.config.scriptHash));
+      if (!out || !(out.datumOption instanceof InlineDatum.InlineDatum)) return { abort: true as const, reason: "fee_sponsor_S4", message: "no channel output" };
+      const reserve = channelReserve(out.address, parseDatum(out.datumOption.data).constants, await this.config.chain.coinsPerUtxoByte());
+      r = await checkSponsoredOpen({ ...base, scriptHash: this.config.scriptHash, reserve });
+    } else {
+      r = await checkSponsoredTopUp(base);
+    }
+    if (!r.ok) {
+      this.sponsorLog(`refused ${r.rule}: ${r.detail}`);
+      return { abort: true as const, reason: `fee_sponsor_${r.rule}`, message: r.detail };
+    }
+    const ttl = decodeTx(hex, Err.depositTransaction).body.ttl!;
+    if (!sp.pool.bind(found.offer, r.txHash, Number(msOfSlot(req.network, ttl)))) {
+      return { abort: true as const, reason: "fee_sponsor_taken", message: "the offered UTxO is bound to another transaction; pay again with a fresh offer" };
+    }
+    try {
+      await sp.pool.sign(found.offer, r.txHash, hex);
+    } catch (e) {
+      sp.pool.release(found.offer.input, r.txHash);
+      return { abort: true as const, reason: "fee_sponsor_S9", message: (e as Error).message };
+    }
+    this.merge(payload, { sponsor: found });
+    this.sponsorLog(`bound ${found.offer.input.slice(0, 16)}…#${found.offer.input.split("#")[1]} to ${opening ? "opening" : "top-up"} ${r.txHash.slice(0, 16)}…, fee ${r.fee}`);
+    return undefined;
+  }
+
+  /** A refund whose collateral is the offer: the seller's refund rules, binding, and witness. */
+  private async signSponsoredRefund(ctx: SettleContext, hex: string, ch: ServerChannel): Promise<string | undefined> {
+    const sp = this.config.sponsor;
+    if (!sp) return undefined;
+    let offer: FeeSponsorOffer | undefined;
+    try {
+      offer = offerIn(ctx.requirements.extra as Record<string, unknown>);
+    } catch {
+      return undefined;
+    }
+    const tx = decodeTx(hex, Err.refundTransaction);
+    if (!offer || !(tx.body.collateralInputs ?? []).some((c) => `${TransactionHash.toHex(c.transactionId)}#${Number(c.index)}` === offer!.input)) return undefined;
+    const me = await sp.pool.identity();
+    if (offer.address !== me.address) throw new Error("fee_sponsor_invalid: the offer is not this seller's");
+    const channel = await this.config.chain.getUnspent(ch.channelRef);
+    if (!channel) throw new Error(`${Err.refundTransaction}: the channel is spent or unknown`);
+    const r = await checkSponsoredRefund({
+      txHex: hex,
+      offer,
+      network: ctx.requirements.network,
+      payTo: this.config.payTo,
+      sponsorKeyHash: me.keyHash,
+      ownerOf: (ref: string) => this.ownerOf(ref),
+      fees: await this.config.chain.feeParameters(),
+      // The provider's witness and the seller's are both still to come.
+      missingWitnesses: 2,
+      ...(sp.maxCollateral !== undefined ? { maxCollateral: sp.maxCollateral } : {}),
+      channelRef: ch.channelRef,
+      channelLovelace: Assets.lovelaceOf(channel.assets),
+      consumerKeyHash: ch.channelConfig.payer,
+      reserveFromSeller: ch.reserveFrom === "seller",
+      evaluate: () => this.config.chain.evaluate(hex),
+    });
+    if (!r.ok) {
+      this.sponsorLog(`refused refund ${r.rule}: ${r.detail}`);
+      throw new Error(`fee_sponsor_${r.rule}: ${r.detail}`);
+    }
+    if (!sp.pool.bind(offer, r.txHash, Number(msOfSlot(ctx.requirements.network, tx.body.ttl!)))) throw new Error("fee_sponsor_taken: the offered UTxO is bound to another transaction");
+    const witness = await sp.pool.sign(offer, r.txHash, hex);
+    sp.pool.witnessFor(offer, r.txHash);
+    this.merge(ctx.paymentPayload, { sponsor: { offer, txHash: r.txHash, opening: false } });
+    this.sponsorLog(`bound ${offer.input.slice(0, 16)}…#${offer.input.split("#")[1]} as collateral of refund ${r.txHash.slice(0, 16)}…${ch.reserveFrom === "seller" ? ", reserve back to payTo" : ""}`);
+    return witness;
+  }
+
+  private async ownerOf(ref: string): Promise<{ exists: boolean; paymentKeyHash?: string }> {
+    const u = await this.config.chain.getUnspent(ref);
+    if (!u) return { exists: false };
+    const pay = u.address.paymentCredential;
+    return { exists: true, ...(pay instanceof KeyHash.KeyHash ? { paymentKeyHash: KeyHash.toHex(pay).toLowerCase() } : {}) };
+  }
+
+  /** A cancelled or failed request lets go of its binding when nothing it signed can land. */
+  private releaseSponsor(payload: Payload, errorReason?: string) {
+    const s = this.contexts.get(payload)?.sponsor;
+    if (!s || !this.config.sponsor) return;
+    this.config.sponsor.pool.release(s.offer.input, s.txHash, errorReason !== undefined && errorReason !== "settlement_pending");
+  }
+
+  private sponsorLog(line: string) {
+    this.config.sponsor?.log?.(`[sponsor] ${line}`);
+  }
 
   // ---- helpers -------------------------------------------------------------
 
@@ -661,6 +905,25 @@ function mcpAnswer(result: unknown): { contentType: string; body: unknown } | un
   if (s === undefined) return { contentType: "text/plain", body: block.text };
   const plain = typeof s === "object" && s !== null && !Array.isArray(s);
   return plain && JSON.stringify(s) === block.text ? { contentType: "application/json", body: s } : undefined;
+}
+
+/**
+ * The paid payload behind a 402 being built for a paid request: core passes it in the transport
+ * context only as `request.paymentHeader`, and only when the framework set it, so the adapter's
+ * `PAYMENT-SIGNATURE` header and MCP's `_meta` are read too.
+ */
+function paidPayloadOf(transportContext: unknown): PaymentPayload | undefined {
+  const t = transportContext as { request?: { paymentHeader?: unknown; adapter?: { getHeader?(n: string): string | undefined } }; meta?: Record<string, unknown> } | undefined;
+  const header = typeof t?.request?.paymentHeader === "string" ? t.request.paymentHeader : (t?.request?.adapter?.getHeader?.("payment-signature") ?? t?.request?.adapter?.getHeader?.("PAYMENT-SIGNATURE"));
+  if (header) {
+    try {
+      return decodePaymentSignatureHeader(header);
+    } catch {
+      return undefined;
+    }
+  }
+  const meta = t?.meta?.["x402/payment"];
+  return typeof meta === "object" && meta !== null && "accepted" in meta ? (meta as PaymentPayload) : undefined;
 }
 
 /** The provider signer for a seed wallet built with evolution-sdk: signs the exact bytes. */

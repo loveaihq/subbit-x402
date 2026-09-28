@@ -90,6 +90,8 @@ export interface DepositPayload {
   voucher: Voucher;
   /** `amount` is the channel's currency amount; `transaction` is base64 CBOR, fully signed. */
   deposit: { amount: string; transaction: string };
+  /** Added by the server before `/settle` when the deposit spends its fee-sponsor offer: its witness set, CBOR hex. */
+  sponsorWitnesses?: string;
 }
 
 export interface VoucherPayload {
@@ -109,6 +111,8 @@ export interface RefundPayload {
   providerWitness?: string;
   /** Added instead by a server whose provider key the facilitator holds: see `delegationMac`. */
   delegationMac?: string;
+  /** Added by the server before `/settle` when the refund's collateral is its fee-sponsor offer. */
+  sponsorWitnesses?: string;
 }
 
 export interface ClaimPayload {
@@ -217,7 +221,14 @@ export function parseClientPayload(v: unknown): ClientPayload {
       const d = p.deposit as Record<string, unknown>;
       need(str(d.amount, uint) && d.amount !== "0", "deposit.amount");
       need(str(d.transaction, base64), "deposit.transaction");
-      return { type: "deposit", channelConfig, voucher, deposit: { amount: d.amount as string, transaction: d.transaction as string } };
+      need(p.sponsorWitnesses === undefined || (typeof p.sponsorWitnesses === "string" && /^[0-9a-f]+$/.test(p.sponsorWitnesses)), "deposit.sponsorWitnesses");
+      return {
+        type: "deposit",
+        channelConfig,
+        voucher,
+        deposit: { amount: d.amount as string, transaction: d.transaction as string },
+        ...(p.sponsorWitnesses !== undefined ? { sponsorWitnesses: p.sponsorWitnesses as string } : {}),
+      };
     }
     case "voucher":
       return { type: "voucher", channelConfig, voucher };
@@ -225,6 +236,7 @@ export function parseClientPayload(v: unknown): ClientPayload {
       need(str(p.transaction, base64), "refund.transaction");
       need(p.providerWitness === undefined || (typeof p.providerWitness === "string" && /^[0-9a-f]+$/.test(p.providerWitness)), "refund.providerWitness");
       need(p.delegationMac === undefined || str(p.delegationMac, hex32), "refund.delegationMac");
+      need(p.sponsorWitnesses === undefined || (typeof p.sponsorWitnesses === "string" && /^[0-9a-f]+$/.test(p.sponsorWitnesses)), "refund.sponsorWitnesses");
       return {
         type: "refund",
         channelConfig,
@@ -232,6 +244,7 @@ export function parseClientPayload(v: unknown): ClientPayload {
         transaction: p.transaction as string,
         ...(p.providerWitness !== undefined ? { providerWitness: p.providerWitness as string } : {}),
         ...(p.delegationMac !== undefined ? { delegationMac: p.delegationMac as string } : {}),
+        ...(p.sponsorWitnesses !== undefined ? { sponsorWitnesses: p.sponsorWitnesses as string } : {}),
       };
     default:
       throw new PayloadError(Err.payloadType, `unknown payload type ${String(p.type)}`);

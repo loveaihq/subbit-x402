@@ -23,9 +23,10 @@ Its source is here too, with tests of our own at the exact hash this code uses (
 | [`specs/scheme_batch_settlement_cardano.md`](specs/scheme_batch_settlement_cardano.md) | the binding, in x402's spec format (draft v0.6) |
 | `src/x402/` | client, resource-server and facilitator schemes for `@x402/core` 2.27, and the server's channel manager: batched claims, a watcher that settles channels their consumers close |
 | `src/subbit.ts` | Subbit's datum, redeemers and IOU encoding |
-| `spike/` | the preprod runs (`run.ts`, `lifecycle.ts`, `refscript.ts`, `mint.ts`, `x402/e2e.ts`) |
+| `spike/` | the preprod runs (`run.ts`, `lifecycle.ts`, `refscript.ts`, `mint.ts`, `x402/e2e.ts`, `x402/sponsored.ts`) |
 | [`RESULTS.md`](RESULTS.md) | every run, every transaction hash, and each run's reconciliation of the wallets |
 | [`DESIGN.md`](DESIGN.md) | the design and its decisions |
+| [`SPONSORSHIP.md`](SPONSORSHIP.md) | seller-sponsored channels: the seller's offer pays a token channel's fees and reserve |
 | `vendor/subbit/` | Subbit's Aiken blueprint and its source, unmodified, with our tests of the validator in `aiken/lib/mark/` ([provenance](vendor/subbit/PROVENANCE.md)) |
 
 ## What ran on preprod
@@ -46,6 +47,7 @@ Its source is here too, with tests of our own at the exact hash this code uses (
 | 12 | A watcher that survives rollbacks |
 | 13 | A retry after a lost MCP answer, answered from the kept result; a top-up that falls back to what the wallet can fund |
 | 14 | Buyer and seller through Koios, with no Blockfrost key |
+| 16 | Seller-sponsored channels: a buyer holding only tUSDM opens, tops up and is refunded without ADA of its own ([SPONSORSHIP.md](SPONSORSHIP.md)) |
 
 Each run's wallets reconcile to the lovelace against the fees of its transactions.
 
@@ -65,7 +67,7 @@ its transactions has one signer.
 
 ```
 npm install
-npm test            # 43 chain-free tests
+npm test            # 53 chain-free tests
 npm run typecheck
 npm run validator   # the validator's Aiken tests; needs aiken 1.1.23 or later
 ```

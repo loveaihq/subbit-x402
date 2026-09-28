@@ -26,6 +26,8 @@ export interface Chain {
    */
   followChannel(ref: string, scriptHash: string, tag: string): Promise<ChannelView | undefined>;
   coinsPerUtxoByte(): Promise<bigint>;
+  /** The fee floor's parameters: `minFeeA` lovelace per byte plus `minFeeB`. */
+  feeParameters(): Promise<{ minFeeA: bigint; minFeeB: bigint }>;
   /** Submits the transaction's exact bytes; returns its id. */
   submit(cborHex: string): Promise<string>;
   awaitTx(txHash: string, timeoutMs: number): Promise<boolean>;
@@ -71,7 +73,7 @@ const READ_ATTEMPTS = 5;
 
 export class BlockfrostChain implements Chain {
   private readonly provider;
-  private params?: { at: number; coinsPerUtxoByte: bigint };
+  private params?: { at: number; coinsPerUtxoByte: bigint; minFeeA: bigint; minFeeB: bigint };
 
   constructor(
     readonly network: CardanoNetwork,
@@ -147,9 +149,14 @@ export class BlockfrostChain implements Chain {
   async coinsPerUtxoByte(): Promise<bigint> {
     if (!this.params || Date.now() - this.params.at > 600_000) {
       const p = await retryQueries("protocol parameters", () => this.provider.getProtocolParameters());
-      this.params = { at: Date.now(), coinsPerUtxoByte: p.coinsPerUtxoByte };
+      this.params = { at: Date.now(), coinsPerUtxoByte: p.coinsPerUtxoByte, minFeeA: BigInt(p.minFeeA), minFeeB: BigInt(p.minFeeB) };
     }
     return this.params.coinsPerUtxoByte;
+  }
+
+  async feeParameters(): Promise<{ minFeeA: bigint; minFeeB: bigint }> {
+    await this.coinsPerUtxoByte();
+    return { minFeeA: this.params!.minFeeA, minFeeB: this.params!.minFeeB };
   }
 
   async submit(cborHex: string): Promise<string> {

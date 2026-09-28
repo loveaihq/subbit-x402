@@ -976,6 +976,96 @@ empty value, and some cases failed on that instead. Amounts now start at 1.
 - **A settle has no deadline.** It works after `elapse_at`, until the consumer elapses.
 - **A provider may put funds back in a sub,** and `subbed` falls by as much.
 
+## Step 16: seller-sponsored channels
+
+A buyer that holds only tUSDM, one UTxO with the min-ada that came with it, runs a channel's whole
+cooperative life without ADA of its own: open, 25 paid requests, two top-ups, the server's claim,
+and the refund. The seller's fee-sponsor offer pays every fee and the channel's reserve
+([SPONSORSHIP.md](SPONSORSHIP.md)). `npm run sponsored -- fund | run | finish | negatives | report`,
+state in `out/x402-step16/`, 2026-09-28.
+
+**Setup.**
+- Buyer, account 8: 50 tUSDM and exactly its min-ada, 1.176630 tADA, funded in
+  `7004a1acb2464a5d0c69cf89cc3af3ceaec0ba413b68f69e7272d550ce7b5e0c`. Account 0 could not fund it
+  at first: the change carrying the tokens strangers sent to its public address needed 3.59 tADA
+  and it had 3.11, so the seller lent it 5 tADA first, in `66d0e3d4…`.
+- Sponsor key, account 9 (not the provider key): 4 × 4 tADA from the seller, in
+  `ea8a345375124a37fdbb71184105b62b69f46286602ca13953bb7a186ee0b5ee`.
+- Price 0.1 tUSDM, 1 tUSDM a deposit, so ten requests a deposit; the validator from the reference
+  script of step 3.
+
+**The run.**
+
+| Step | Transaction | Block | Size | Fee (tADA) | Paid by | Request to 200 |
+|---|---|---|---|---|---|---|
+| open, request 1 | `2a0b3f607a5721c1d2caaaeea52fc1a19c91b74a0d70c1f5a5a60b687538f10f` | 5226283 | 790 B | 0.190185 | seller's offer `ea8a…#0` | 45.2 s |
+| top-up, request 11 | `5bc953bad75e01d659cb3d046cea512ffa8a86b15e709ea814940f5978775e04` | 5226285 | 1,077 B | 0.266182 | seller's offer `ea8a…#1` | 45.4 s |
+| top-up, request 21 | `7053cd32e53e0d8e570851c743765a3ed545f21a08c4566b977f2de72b94e78e` | 5226287 | 1,077 B | 0.266182 | seller's offer `ea8a…#3` | 26.8 s |
+| claim | `19ff54abb13cf52ee0ba3008e67c5003abab8bed30043835667c5da60d7d26a7` | 5226289 | 1,045 B | 0.269074 | provider, as always | — |
+| refund | `5377770374c1f04caf4bd236152ee37e25d392dcc69032b65e414893c914549a` | 5226291 | 855 B | 0.244491 | the channel's ADA, the seller's | 42.4 s |
+
+The other 22 requests were vouchers, answered with no chain in a few milliseconds. The refund's
+collateral was the seller's offer `ea8a…#2`, and it was not spent.
+
+**Reconciliation, per address, over those five transactions:**
+
+| Address | tADA | tUSDM |
+|---|---|---|
+| buyer | **±0** | −2.5 |
+| sponsor key | −12.000000 | 0 |
+| channel script | 0 | 0 |
+| seller `payTo` | +10.763886 | +2.5 |
+
+- The buyer paid 25 × 0.1 tUSDM and nothing else. It ended with its 1.176630 tADA, in one UTxO,
+  as it began.
+- The sponsor key spent three of its UTxOs, one per opening or top-up. The fourth, the refund's
+  collateral, is still there.
+- Across `payTo` and the sponsor key the seller is −1.236114 tADA: the opening, the two top-ups and
+  the refund, 0.967040, plus its own claim, 0.269074. **The seller's net ADA is minus the fees it
+  paid, to the lovelace.** The reserve it put into the channel came back to `payTo` at the refund.
+
+**Build-only negatives,** openings crafted from the buyer's real UTxO and a real offer, signed by
+the buyer, sent through the stack as paid requests:
+
+| Case | HTTP | Facilitator | Seller | Landed |
+|---|---|---|---|---|
+| 0.1 tADA more in the channel than its reserve | 402 `fee_sponsor_S4` | valid | S4: 2,233,450 held, reserve 2,133,450 | no |
+| 0.1 tADA of the sponsor's to the buyer | 402 `fee_sponsor_S4` | valid | S4: the rest would go elsewhere | no |
+| a fee of 0.51 tADA over `maxFee` 0.5 | 402 `fee_sponsor_S5` | valid | S5 | no |
+| a well-formed opening sent straight to `/settle`, no seller witness | — | refused: uses the offer without the seller's witness | — | no |
+
+The facilitator finds the first three valid: how much of its own ADA the seller risks is the
+seller's rule, and it refuses them before signing. Top-up and refund negatives are covered by the
+chain-free tests only (below).
+
+**Found on the way.**
+- **The ledger takes one UTxO as both an input and the collateral.** Both top-ups spent the offer
+  and put it up as collateral in the same transaction, and landed. The SDK does this itself: its
+  collateral candidates are all available UTxOs, inputs included.
+- **The SDK sends a collateral return to the change address.** A sponsored top-up or refund builds
+  with `changeAddress: payTo`, so the return of the seller's collateral goes back to the seller.
+  A refund of a channel whose reserve is the buyer's would need its change at the buyer and the
+  return at the seller, which the SDK cannot split. So only channels the seller funded are
+  refunded with the seller's collateral; a channel the buyer funded kept an ADA-only UTxO for its
+  collateral at the opening (step 13), as before.
+- **The SDK puts up exactly `setCollateral`.** `collateralTarget` would have put up 3 tADA of a
+  4 tADA offer; sponsored transactions ask for 1 tADA, and the seller refuses more than 2.
+- **The seed wallet signs collateral only when told.** `signTx(tx, { utxos })` signs for inputs
+  and collateral found in `utxos`, and for required signers; the pool hands it the one bound UTxO.
+- **A refused opening was left pending.** Its record blocked the next attempt ("still opening;
+  retry shortly") until an input was spent elsewhere. The client now marks it failed, and gives
+  its inputs back, when the server refuses a deposit before settlement, which means it was never
+  broadcast.
+- **A voucher must match its 402 even after its offer is taken.** Every 402 carries an offer,
+  vouchers included; the pool answers a paid request with the offer it echoes whether or not
+  another buyer has bound it since, and binding alone is exclusive.
+- The first run's claim landed, then a log line died serialising its `bigint`s before the refund.
+  `finish` resumed from there.
+
+**Tests.** 53 chain-free, 10 of them new (`test/sponsor.test.ts`): the seller's rules for an
+opening, a top-up and a refund, each with its refusals, on offline transactions signed for real;
+`checkMutual` letting the consumer's own inputs through and nothing else; and the pool.
+
 ## What this does not show yet
 
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a
@@ -1123,6 +1213,9 @@ npm run mcpbatch
 # step 15, no chain: the validator's own tests (aiken 1.1.23 or later)
 aiken check --max-success 1000 --seed 66648 vendor/subbit/aiken
 aiken build vendor/subbit/aiken   # then compare its plutus.json with vendor/subbit/plutus.json
+
+# step 16: seller-sponsored channels; the buyer is account 8, the sponsor key account 9
+npm run sponsored -- fund && npm run sponsored -- run && npm run sponsored -- negatives && npm run sponsored -- report
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

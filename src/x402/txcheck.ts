@@ -151,9 +151,10 @@ export function checkDeposit(
 /**
  * Every vkey witness must be a valid signature over the transaction's id, and every key-locked
  * input the caller resolved must carry its key's witness. The node checks both; checking first
- * means a facilitator does not broadcast what cannot land.
+ * means a facilitator does not broadcast what cannot land. `mayLack` is a key whose witness is
+ * still to come: a fee sponsor's, which the seller adds at settlement (SPONSORSHIP.md).
  */
-export function checkInputWitnesses(tx: Transaction.Transaction, cborHex: string, inputAddresses: Address.Address[], reason: string) {
+export function checkInputWitnesses(tx: Transaction.Transaction, cborHex: string, inputAddresses: Address.Address[], reason: string, mayLack?: string) {
   const id = Buffer.from(txHashOf(cborHex), "hex");
   for (const w of tx.witnessSet.vkeyWitnesses ?? []) {
     const key = createPublicKey({ key: Buffer.concat([SPKI_ED25519, Buffer.from(VKey.toHex(w.vkey), "hex")]), format: "der", type: "spki" });
@@ -162,7 +163,7 @@ export function checkInputWitnesses(tx: Transaction.Transaction, cborHex: string
   const have = witnessKeyHashes(tx);
   for (const a of inputAddresses) {
     const pay = a.paymentCredential;
-    if (pay instanceof KeyHash.KeyHash && !have.has(KeyHash.toHex(pay))) fail(reason, "an input's key has not signed the transaction");
+    if (pay instanceof KeyHash.KeyHash && !have.has(KeyHash.toHex(pay)) && KeyHash.toHex(pay) !== mayLack) fail(reason, "an input's key has not signed the transaction");
   }
 }
 
@@ -242,10 +243,11 @@ export interface MutualCheck {
 
 /**
  * The only shape of refund the provider co-signs: the transaction spends the channel at
- * `channelRef` and nothing else locked by the channel script or by the provider's key; the
- * channel's redeemer is `Mutual`; the required signers are exactly consumer and provider;
- * no certificates, withdrawals, minting or governance; and `payTo` receives at least
- * `minPayout` in ADA-only outputs. The consumer's signature must already be on it.
+ * `channelRef` and, besides it, only key-locked inputs of the consumer's own (a sponsored refund
+ * folds the refunded tokens into one of them, SPONSORSHIP.md); the channel's redeemer is `Mutual`;
+ * the required signers are exactly consumer and provider; no certificates, withdrawals, minting or
+ * governance; and `payTo` receives at least `minPayout` in ADA-only outputs. The consumer's
+ * signature must already be on it.
  */
 export function checkMutual(
   cborHex: string,
@@ -261,6 +263,8 @@ export function checkMutual(
   /** Resolved addresses of the collateral inputs; none may be locked by the provider's key. */
   collateralAddresses: Address.Address[],
   consumerMustHaveSigned = true,
+  /** Resolved addresses of the inputs besides the channel, by `txHash#index`; each must be the consumer's. */
+  otherInputs: Map<string, Address.Address> = new Map(),
 ): MutualCheck {
   const R = Err.refundTransaction;
   const tx = decodeTx(cborHex, R);
@@ -269,7 +273,13 @@ export function checkMutual(
   checkNoExtras(tx, R);
 
   const inputs = sortedInputRefs(tx);
-  if (inputs.length !== 1 || inputs[0] !== channelRef) fail(R, "a refund must spend the channel and nothing else");
+  if (!inputs.includes(channelRef)) fail(R, "a refund must spend the channel");
+  for (const ref of inputs) {
+    if (ref === channelRef) continue;
+    const a = otherInputs.get(ref);
+    const pay = a?.paymentCredential;
+    if (!(pay instanceof KeyHash.KeyHash) || KeyHash.toHex(pay) !== consumer) fail(R, "besides the channel, a refund may spend only the consumer's own key-locked inputs");
+  }
   const collateral = tx.body.collateralInputs ?? [];
   if (collateral.some((c) => refOfInput(c) === channelRef)) fail(R, "the channel cannot be collateral");
   if (collateralAddresses.length !== collateral.length) fail(R, "every collateral input must be resolved");
@@ -277,8 +287,9 @@ export function checkMutual(
     const pay = a.paymentCredential;
     if (!(pay instanceof KeyHash.KeyHash) || KeyHash.toHex(pay) === provider) fail(R, "collateral must be the consumer's own key-locked ADA");
   }
-  const redeemer = spendRedeemers(tx).get(0);
-  if (redeemer === undefined || Data.toCBORHex(redeemer) !== Data.toCBORHex(Data.constr(2n, []))) fail(R, "the channel must be spent with Mutual");
+  const redeemers = spendRedeemers(tx);
+  const redeemer = redeemers.get(inputs.indexOf(channelRef));
+  if (redeemers.size !== 1 || redeemer === undefined || Data.toCBORHex(redeemer) !== Data.toCBORHex(Data.constr(2n, []))) fail(R, "the channel must be spent with Mutual, and nothing else redeemed");
 
   const signers = (tx.body.requiredSigners ?? []).map((k) => KeyHash.toHex(k)).sort();
   if (signers.length !== 2 || !signers.includes(consumer) || !signers.includes(provider)) fail(R, "required signers must be exactly consumer and provider");

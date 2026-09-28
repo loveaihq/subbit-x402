@@ -242,6 +242,11 @@ besides is short too: the SDK finds no valid change instead of failing coin sele
 that, and 0.1.3 does not. After 0.1.3, an opening is held to the same rule as a top-up: it is
 refused if it would leave the wallet no ADA-only UTxO to put up as the refund's collateral.
 
+Step 16 lets the seller sponsor a token channel: its fee-sponsor offer pays the opening's fee and
+the channel's reserve, a top-up's fee (standing as collateral too), and a refund's collateral.
+A buyer holding only a stablecoin then needs no ADA until it exits alone. The design is in
+[SPONSORSHIP.md](SPONSORSHIP.md), the run in RESULTS.md step 16.
+
 Step 14 adds a chain reader for Koios, which needs no key. It counts only what is in a block, as
 Blockfrost does, since Koios also shows its mempool. It also found a fault in the facilitator on
 either chain: a retry after `settlement_pending` was checked again, and refused if its transaction
