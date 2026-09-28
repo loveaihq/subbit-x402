@@ -7,8 +7,8 @@ import { createPrivateKey, createPublicKey, sign as edSign, verify as edVerify }
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import { Address, Assets, Client, KeyHash, TransactionHash, TxOut, preprod, type Transaction, type UTxO } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, parseDatum, datumData, type Stage } from "../src/subbit.ts";
-import { capacityOf, channelReserve, constantsOf, datumBindingError, planTokens, refOf, type ChannelView } from "../src/x402/cardano.ts";
-import { BlockfrostChain, isNetworkError, retryQueries, type Chain, type ChainCursor } from "../src/x402/chain.ts";
+import { capacityOf, channelReserve, constantsOf, currencyOf, datumBindingError, planTokens, refOf, valueFor, type ChannelView } from "../src/x402/cardano.ts";
+import { BlockfrostChain, causeChain, isNetworkError, retryQueries, type Chain, type ChainCursor } from "../src/x402/chain.ts";
 import { ChannelManager, type WatchEvent } from "../src/x402/manager.ts";
 import { BatchSettlementCardanoClient, FileClientStorage, TOP_UP_HEADROOM, adaOnlyAfter, assertLeavesCollateral, collateralTarget, depositWithin, derivedIouSigner, firstThatBuilds, iouRootOf, serverKey, topUpAmounts, type Authorization, type OwnOutput, type SeedWallet } from "../src/x402/client.ts";
 import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x402/server.ts";
@@ -267,6 +267,53 @@ test("recover: this wallet's channels come back, usable when their IOU key deriv
   assert.ok(iouVerifierOf(views[0]!)(a, 9000n, p.voucher.signature));
   assert.equal((await storage.get(a))!.serverKey !== "", true);
   assert.equal((await storage.get(b))!.serverKey, "");
+});
+
+test("recover: a token channel whose opening took none of this wallet's ADA comes back with its reserve the seller's", async () => {
+  const wallet = testWallet();
+  const meAddress = await wallet.address();
+  const me = KeyHash.toHex(meAddress.paymentCredential as KeyHash.KeyHash);
+  const mine = Address.toBech32(meAddress);
+  const root = await iouRootOf(wallet);
+  const address = channelAddress(0);
+  const script = Address.toBech32(address);
+  const tusdm = { ...config, token: "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d" };
+  const view = (tag: string, i: number) =>
+    ({
+      ref: `${"ef".repeat(32)}#${i}`,
+      address,
+      lovelace: 2_133_450n,
+      amount: 1_000_000n,
+      datum: { ownHash: SUBBIT_HASH, constants: { ...constantsOf({ ...tusdm, payer: me, payerAuthorizer: derivedIouSigner(root, "cardano:preprod", tag).publicKey }, tag), consumer: me }, stage: { kind: "opened", subbed: 0n } },
+    }) as unknown as ChannelView;
+  const [onOffer, onOwn] = ["a1", "b2"].map((x) => x.repeat(32)) as [string, string];
+  const views = [view(onOffer, 0), view(onOwn, 1)];
+  const openings: Record<string, unknown> = {
+    // The wallet's lovelace back to it in full, and the reserve from an input of someone else's.
+    [onOffer]: { txHash: "01".repeat(32), inputs: [{ address: mine, lovelace: 1_176_630n }, { address: PAY_TO, lovelace: 4_000_000n }], outputs: [{ address: mine, lovelace: 1_176_630n }, { address: script, lovelace: 2_133_450n }, { address: PAY_TO, lovelace: 1_676_365n }] },
+    // The wallet paid the reserve and the fee.
+    [onOwn]: { txHash: "02".repeat(32), inputs: [{ address: mine, lovelace: 10_000_000n }], outputs: [{ address: mine, lovelace: 7_676_365n }, { address: script, lovelace: 2_133_450n }] },
+  };
+  const walked: string[] = [];
+  const chain = {
+    network: "cardano:preprod",
+    channels: async () => views,
+    followChannel: async (ref: string) => views.find((v) => v.ref === ref),
+    coinsPerUtxoByte: async () => 4310n,
+    openingOf: async (_ref: string, _script: string, tag: string) => (walked.push(tag), openings[tag]),
+  } as unknown as Chain;
+  const client = new BatchSettlementCardanoClient({ wallet, storage: new FileClientStorage(mkdtempSync(join(tmpdir(), "recover-"))), chain });
+  const found = await client.recover("cardano:preprod", SUBBIT_HASH);
+  assert.deepEqual(found.map((c) => [c.channelId.slice(0, 2), c.reserveFrom ?? "the wallet's"]), [["a1", "seller"], ["b2", "the wallet's"]]);
+  assert.deepEqual(walked, [onOffer, onOwn]);
+});
+
+test("a token channel claimed in full keeps only its ADA: no output holds none of a token", () => {
+  const c = currencyOf("e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9.0014df10745553444d");
+  const empty = valueFor(c, 0n, 2_133_450n);
+  assert.equal(Assets.hasOnlyLovelace(empty), true);
+  assert.equal(Assets.lovelaceOf(empty), 2_133_450n);
+  assert.equal(Assets.getByUnit(valueFor(c, 5n, 2_133_450n), "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c90014df10745553444d"), 5n);
 });
 
 const iouVerifierOf = (v: ChannelView) => (tag: string, amount: bigint, sig: string) => {
@@ -802,6 +849,31 @@ test("chain: a read that fails on the network, or with a 429 or a 5xx, is tried 
     /evaluateTx failed/,
   );
   assert.equal(tries, 1);
+
+  // As a build throws them, wrapped by the transaction builder: an evaluator that had not caught up
+  // with the block before is tried again; a validator's refusal, parsed or named, is not.
+  const built = (cause: unknown, failures: unknown[] = []) =>
+    Object.assign(new Error("Script evaluation failed: Provider evaluation failed: Blockfrost evaluateTx failed"), {
+      _tag: "TransactionBuilderError",
+      cause: { _tag: "EvaluationError", message: "Script evaluation failed", failures, cause },
+    });
+  const behind = built({ _tag: "ProviderError", message: "Blockfrost evaluateTx failed", cause: { _tag: "HttpResponseError", status: 400, message: 'non 2xx status code : {"UnknownInputs":["ab…#0"]}' } });
+  tries = 0;
+  assert.equal(await retryQueries("a top-up", async () => (++tries < 2 ? Promise.reject(behind) : "ok"), 4, 1), "ok");
+  assert.equal(tries, 2);
+  for (const refused of [built({ _tag: "ProviderError", message: "Blockfrost evaluateTx failed" }, [{ purpose: "spend", index: 0 }]), built(scriptFailure)]) {
+    tries = 0;
+    await assert.rejects(
+      retryQueries("a top-up", async () => {
+        tries++;
+        throw refused;
+      }, 4, 1),
+      /Script evaluation failed/,
+    );
+    assert.equal(tries, 1);
+  }
+  // What the builder's message leaves out is in the chain, for a log.
+  assert.match(causeChain(behind).join(" | "), /EvaluationError Script evaluation failed \| ProviderError Blockfrost evaluateTx failed \| HttpResponseError 400 .*UnknownInputs/);
 });
 
 test("client: a build waits for the wallet to list what its own transaction in a block paid back to it", async () => {

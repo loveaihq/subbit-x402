@@ -110,6 +110,18 @@ export function offerOnChainProblem(offer: FeeSponsorOffer, onChain: UTxO.UTxO |
   return undefined;
 }
 
+/**
+ * Why a refund of a channel whose reserve is the seller's does not pay that reserve back to
+ * `payTo`, less the fee, or undefined when it does. It holds however the refund is paid for:
+ * with the seller's offer as its collateral, or without one.
+ */
+export function reserveNotReturned(txHex: string, payTo: string, channelLovelace: bigint): string | undefined {
+  const b = Transaction.fromCBORHex(txHex).body;
+  const toPayTo = b.outputs.filter((o) => Address.toBech32(o.address) === payTo).reduce((s, o) => s + Assets.lovelaceOf(o.assets), 0n);
+  if (toPayTo + b.fee >= channelLovelace) return undefined;
+  return `the channel's ${channelLovelace} lovelace is the seller's reserve, and the refund pays payTo ${toPayTo} of it, with a fee of ${b.fee}`;
+}
+
 // ---- fees and witnesses ----------------------------------------------------------
 
 export interface FeeParameters {

@@ -7,7 +7,7 @@ import { Address, Assets, KeyHash, Transaction, TransactionHash } from "@evoluti
 import { Redeemer, Step, inlineDatum, subbitScript, type Stage } from "../subbit.ts";
 import { FOLD, refOf, valueFor, type ChannelView } from "./cardano.ts";
 import { retryQueries, type Chain } from "./chain.ts";
-import { collateralTarget, signedHex, type SeedWallet } from "./client.ts";
+import { WITH_OUR_UTXOS, collateralTarget, signedHex, type SeedWallet } from "./client.ts";
 
 export interface ClaimBuilder {
   /** Holds the provider key; pays the fee and puts up the collateral. */
@@ -97,7 +97,7 @@ export async function buildClaimTx(b: ClaimBuilder, batch: ClaimLine[]): Promise
   const availableUtxos = unspent.filter((u) => Assets.hasOnlyLovelace(u.assets));
   const change = b.payout === "delegated" ? await b.wallet.address() : payTo;
   const signed = tx.addSigner({ keyHash: KeyHash.fromHex(b.providerKeyHash) });
-  const sb = await retryQueries("claim", () => signed.build({ changeAddress: change, availableUtxos, setCollateral: collateralTarget(availableUtxos) }));
+  const sb = await retryQueries("claim", () => signed.build({ changeAddress: change, availableUtxos, setCollateral: collateralTarget(availableUtxos), ...WITH_OUR_UTXOS }));
   const hex = await signedHex(sb);
   for (const i of Transaction.fromCBORHex(hex).body.inputs) b.spent.set(`${TransactionHash.toHex(i.transactionId)}#${i.index}`, Date.now());
   return { hex, rows };

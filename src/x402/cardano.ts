@@ -95,8 +95,9 @@ export const sdkUnitOf = (c: Currency) => (c.kind === "ada" ? "lovelace" : c.pol
 export const amountIn = (assets: Assets.Assets, c: Currency) => (c.kind === "ada" ? Assets.lovelaceOf(assets) : Assets.getByUnit(assets, sdkUnitOf(c)));
 
 /** A channel value: `amount` of the currency, and for a token channel `lovelace` of ADA beside it. */
+// An output cannot hold none of a token: a token channel claimed in full keeps only its ADA.
 export const valueFor = (c: Currency, amount: bigint, lovelace: bigint) =>
-  c.kind === "ada" ? Assets.fromLovelace(amount) : Assets.fromHexStrings(c.policy, c.name, amount, lovelace);
+  c.kind === "ada" ? Assets.fromLovelace(amount) : amount === 0n ? Assets.fromLovelace(lovelace) : Assets.fromHexStrings(c.policy, c.name, amount, lovelace);
 
 /** Whether a value holds ADA and at most the currency, as every channel output must. */
 export const onlyCurrency = (assets: Assets.Assets, c: Currency) => Assets.getUnits(assets).every((u) => u === "lovelace" || u === sdkUnitOf(c));

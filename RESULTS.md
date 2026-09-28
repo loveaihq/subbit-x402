@@ -1101,6 +1101,56 @@ took the one the first run left.
 - Tests: 55 chain-free, 2 of them new: the buyer's check of an offer against what the chain holds,
   and the client refusing an offer of its own UTxO before it builds.
 
+## Step 16 with 0.2.2: a buyer that lost its records, and three fixes
+
+2026-09-28, `STEP16_RECOVER=1`: after the claim, the buyer's channel records are deleted, it finds
+the channel again with `recover`, and the refund runs on the record that comes back.
+
+**The runs.**
+
+| Run | Transaction | Block | Fee (tADA) |
+|---|---|---|---|
+| `x402-step16-0.2.2`: open | `56490ff655f7057c6f35a53b94464bc1f1a1d78534bf48a8c0b64ac8ce70ccbf` | 5228479 | 0.190185 |
+| top-up, request 11 | `3017609975bd7c2a88f3434eb09ad08fdea8bec5c716de65978b1f38f9acc5d1` | 5228482 | 0.266182 |
+| claim of all 2 tUSDM, the channel's every token | `8310613b0ff17d5a3a06feb7ab7366fbbc02dd493b03af04ee396e32df5c6dd7` | 5228497 | 0.266235 |
+| refund, on the recovered record | `ec6ac324042b5f0cfe3acc1cb6fdd95784231d94912ea6d43807d6ecb30d3022` | 5228502 | 0.244902 |
+| `x402-step16-0.2.2b`: open | `b47ccb521892c97419b96a5257051dabdbd5100b93fba18e7890d9476dc0e726` | 5228513 | 0.190185 |
+| top-up, request 11 | `d793c02ce32703ea0e096ea650446ee7031de9a9e06257fa13480222b645f4e1` | 5228515 | 0.266180 |
+| top-up, request 21 | `6a5187fdd1d45ad57e6fb6b14b5e193e909cf1008c037fd47195ac0e5c96a42b` | 5228516 | 0.266180 |
+| claim | `bc0cf3c2a3e61c8b6fc2b04200de39c643fc4625e10c3e1d0dc955d06a0f81b9` | 5228517 | 0.269076 |
+| refund, on the recovered record | `e180e831b67e8db28c6f10d2e72c6fb33a14744bb958edbf94745bf81a344f48` | 5228520 | 0.244902 |
+
+- In both, `recover` found the channel with its reserve the seller's, and the refund was
+  sponsored, the offer its collateral and not spent.
+- The buyer's tADA was ±0 in both, to the lovelace. The seller's net ADA, across `payTo` and the
+  sponsor key, was −0.967504 and −1.236523: the fees of each run.
+
+**What the runs found, and what 0.2.2 changes.**
+- **A top-up right after another failed evaluation.** A second top-up built a second or two after
+  the first had settled failed, twice: in ada-agent-wallet's run, and in the first 0.2.2 run
+  before the evaluator change below. The message was "Script evaluation failed: Provider
+  evaluation failed: Blockfrost evaluateTx failed". Resumed later, the same step passed.
+  evolution-sdk 0.5.14 no longer hands a provider's evaluator the UTxOs the builder found, and
+  Blockfrost then resolves them from its own view of the chain, which can trail the block before.
+  0.2.2 passes them (`passAdditionalUtxos`) in every build that runs a script, as 0.5.13 did.
+  All six evaluations made with it on preprod passed: the second run's two top-ups, claim and
+  refund, and the first run's claim and refund. That run's second top-up came 8 s after the
+  first, not the second or two of the failures. So these runs show the change works, not that
+  the race is gone. `retryQueries` now also tries an evaluation again, a few seconds apart, when it failed
+  for any reason but a validator's refusal. `causeChain` gives what the SDK's message leaves out.
+- **A channel claimed in full could not be claimed.** The first run's buyer had used the
+  channel's whole capacity, 2 tUSDM of 2, when its second top-up failed. The claim's continuing
+  output then held none of the token, and the SDK refuses an output with a zero quantity. It now
+  holds the channel's ADA alone (`valueFor`), and the validator took it (`8310613b…`).
+- **`recover` now knows whose the reserve is** (SPONSORSHIP.md, "A buyer that lost its
+  records"). It walks a token channel back to its opening (`Chain.openingOf`, both chain
+  readers). In the runs above, the walk went back through a claim and one or two top-ups.
+- **The seller holds any refund to its reserve** (SPONSORSHIP.md section 3). Before 0.2.2 a
+  refund that did not use the offer was not checked for it. A buyer refunding without the offer
+  now has to pay the reserve back as well. A chain-free test covers it; no run refunded that way.
+- Tests: 58 chain-free. Four are new: `reserveNotReturned`, `recover` on a sponsored and on an
+  unsponsored token channel, a value with no tokens, and more cases for the retry.
+
 ## What this does not show yet
 
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a
@@ -1253,6 +1303,8 @@ aiken build vendor/subbit/aiken   # then compare its plutus.json with vendor/sub
 npm run sponsored -- fund && npm run sponsored -- run && npm run sponsored -- negatives && npm run sponsored -- report
 # again, with its own state (fund tops the sponsor up to four offers)
 STEP16_OUT=x402-step16-0.2.1 npm run sponsored -- fund && STEP16_OUT=x402-step16-0.2.1 npm run sponsored -- run
+# 0.2.2: the buyer loses its records after the claim and recovers the channel before the refund
+STEP16_OUT=x402-step16-0.2.2b npm run sponsored -- fund && STEP16_OUT=x402-step16-0.2.2b STEP16_RECOVER=1 npm run sponsored -- run
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

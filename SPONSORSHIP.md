@@ -73,6 +73,9 @@ Per step, where the sponsor's ADA may go:
   `payTo` or the sponsor address, total collateral ≤ 2 ADA, and the seller runs the evaluator
   before signing. For a channel whose reserve is the seller's, also `payTo` ADA + fee ≥ the
   channel's ADA, and every input besides the channel is the consumer's own.
+- **Any refund of a channel whose reserve is the seller's** (0.2.2): `payTo` ADA + fee ≥ the
+  channel's ADA, also when the refund does not use the offer and the buyer puts up collateral of
+  its own. Before 0.2.2 only a sponsored refund was held to it.
 
 S9 for a top-up or a refund checks the size part of the fee: with the seller's witnesses merged,
 the fee still covers `minFeeA × size + minFeeB`. What the scripts' execution adds is the builder's
@@ -94,6 +97,14 @@ It then builds with the UTxO the chain returned. A top-up's or a refund's collat
 UTxO and nothing else. When an offer fails these checks, an opening or a top-up goes ahead as if
 none had been made. A refund of a channel whose reserve is the seller's fails, with the reason.
 0.2.0's client checked none of this (RESULTS.md, "Step 16, after the release").
+
+### A buyer that lost its records
+
+`recover` finds a wallet's channels on chain, but a record's `reserveFrom` goes with the record.
+From 0.2.2, `recover` walks each token channel back to the transaction that opened it
+(`Chain.openingOf`). A channel whose opening took none of the wallet's ADA, and spent an input of
+someone else's, was opened on an offer: its reserve is the seller's, and its refund is sponsored
+as it would have been. Nothing the seller answers is taken for it.
 
 The facilitator's existing checks still apply: the channel output and datum (open), the `Add`
 shape and evaluation (top-up), and `checkMutual` (refund), whose "the channel and nothing else"

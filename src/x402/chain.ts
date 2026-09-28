@@ -58,6 +58,19 @@ export interface Chain {
    * left at the script: one query for any transaction, a second only for those that matter.
    */
   channelMoves(txHash: string, scriptHash: string, wanted: (ref: string) => boolean): Promise<{ spent: string[]; channels?: ChannelView[] }>;
+  /**
+   * The transaction that opened the channel with this tag, walked back to from `ref`, any of its
+   * positions: what it spent and what it paid out, collateral and reference inputs aside.
+   * Undefined when the chain's index does not know a transaction on the way.
+   */
+  openingOf(ref: string, scriptHash: string, tag: string): Promise<Opening | undefined>;
+}
+
+/** A channel's opening transaction: its inputs and outputs, by address and lovelace. */
+export interface Opening {
+  txHash: string;
+  inputs: Array<{ address: string; lovelace: bigint }>;
+  outputs: Array<{ address: string; lovelace: bigint }>;
 }
 
 interface BfOutput {
@@ -66,6 +79,16 @@ interface BfOutput {
   consumed_by_tx?: string | null;
   amount?: Array<{ unit: string; quantity: string }>;
   collateral?: boolean;
+}
+
+/** An input as /txs/{hash}/utxos lists it: the output it spent, and whether it was collateral or only referenced. */
+interface BfInput {
+  address: string;
+  tx_hash: string;
+  output_index: number;
+  amount?: Array<{ unit: string; quantity: string }>;
+  collateral?: boolean;
+  reference?: boolean;
 }
 
 /** How many times a read from Blockfrost is tried before its failure is the caller's. */
@@ -294,11 +317,42 @@ export class BlockfrostChain implements Chain {
     return paid;
   }
 
+  async openingOf(ref: string, scriptHash: string, tag: string): Promise<Opening | undefined> {
+    let [hash] = splitRef(ref);
+    for (let hops = 0; hops < 1000; hops++) {
+      const io = await this.txUtxos(hash);
+      if (!io) return undefined;
+      const spent = io.inputs.filter((i) => !i.collateral && !i.reference);
+      // The position this transaction spent of the same channel, if it spent one: then it was not the opening.
+      const at = spent.filter((i) => isScriptAddress(i.address, scriptHash));
+      const candidates = at.length ? await retryQueries("the channel", () => this.provider.getUtxosByOutRef(at.map((i) => input(i.tx_hash, i.output_index)))) : [];
+      const before = candidates.find((u) => {
+        const ch = readChannel(u, scriptHash);
+        return !("error" in ch) && ch.datum.constants.tag === tag;
+      });
+      if (!before) {
+        const lovelace = (amount?: Array<{ unit: string; quantity: string }>) => BigInt(amount?.find((a) => a.unit === "lovelace")?.quantity ?? "0");
+        return {
+          txHash: hash,
+          inputs: spent.map((i) => ({ address: i.address, lovelace: lovelace(i.amount) })),
+          outputs: io.outputs.filter((o) => !o.collateral).map((o) => ({ address: o.address, lovelace: lovelace(o.amount) })),
+        };
+      }
+      hash = TransactionHash.toHex(before.transactionId);
+    }
+    throw new Error(`channel ${tag.slice(0, 16)}… moved more than 1000 times before ${ref}`);
+  }
+
   /** A transaction's outputs with their spent-by field, or undefined if Blockfrost does not know it. */
   private async txOutputs(hash: string): Promise<BfOutput[] | undefined> {
+    return (await this.txUtxos(hash))?.outputs;
+  }
+
+  /** A transaction's inputs and outputs, as Blockfrost lists them, or undefined if it does not know it. */
+  private async txUtxos(hash: string): Promise<{ inputs: BfInput[]; outputs: BfOutput[] } | undefined> {
     for (let attempt = 0; ; attempt++) {
       const r = await this.get(`/txs/${hash}/utxos`);
-      if (r.ok) return ((await r.json()) as { outputs: BfOutput[] }).outputs;
+      if (r.ok) return (await r.json()) as { inputs: BfInput[]; outputs: BfOutput[] };
       if (r.status !== 404) throw new Error(`Blockfrost /txs/${hash.slice(0, 16)}…/utxos: ${r.status}`);
       if (attempt >= 3) return undefined;
       await new Promise((res) => setTimeout(res, 2_000)); // indexer lag right after confirmation
@@ -317,8 +371,9 @@ export class SubmitError extends Error {
 
 /**
  * Runs an SDK call again when Blockfrost or Koios fails a query (a burst limit or a 5xx; preprod runs
- * showed both) or when the request never got an answer, up to `attempts` times. A script failure
- * or anything else is thrown at once: retrying those would hide a real refusal.
+ * showed both), when the request never got an answer, or when a script evaluation fails for any
+ * reason but a validator's refusal, up to `attempts` times. A validator's refusal, or anything
+ * else, is thrown at once: retrying those would hide a real refusal.
  */
 export async function retryQueries<T>(what: string, fn: () => Promise<T>, attempts = 4, pauseMs = 5_000): Promise<T> {
   for (let i = 1; ; i++) {
@@ -326,11 +381,59 @@ export async function retryQueries<T>(what: string, fn: () => Promise<T>, attemp
       return await fn();
     } catch (e) {
       const text = String((e as Error)?.message ?? e);
+      const causes = causeChain(e).join(" | ");
       const query = /(Blockfrost|Koios) (getProtocolParameters|getUtxos|getUtxosByOutRef|getDelegation|getDatum)[A-Za-z]* failed|Failed to fetch protocol parameters/.test(text) || isNetworkError(e);
-      if (!query || /ScriptFailures|Script evaluation failed/.test(text) || i >= attempts) throw e;
+      // A script evaluation fails for good only when a validator refused. The provider resolves a
+      // transaction's inputs from its own view of the chain, which can trail the block that made
+      // them: on preprod a top-up built two seconds after the one before failed there, and passed
+      // later. Anything else from the evaluator is tried again, as a query is.
+      const evaluation = /Script evaluation failed|evaluateTx failed|evaluation fault|evaluation returned no result/.test(`${text} ${causes}`);
+      const again = evaluation ? !validatorRefused(e, causes) : query;
+      if (!again || i >= attempts) throw e;
       await new Promise((res) => setTimeout(res, pauseMs * i));
     }
   }
+}
+
+/**
+ * The messages down a failure's cause chain, each with its `_tag` and HTTP status where it has
+ * them, and the JSON of a level that has neither: what the SDK keeps under "Script evaluation
+ * failed" or "Blockfrost evaluateTx failed", which its own message does not say.
+ */
+export function causeChain(e: unknown, depth = 8): string[] {
+  const out: string[] = [];
+  let x = e;
+  for (let d = 0; x !== undefined && x !== null && d < depth; d++) {
+    if (typeof x !== "object") {
+      out.push(String(x).slice(0, 500));
+      break;
+    }
+    const { _tag, status, message } = x as { _tag?: unknown; status?: unknown; message?: unknown };
+    const parts = [typeof _tag === "string" ? _tag : "", typeof status === "number" ? String(status) : "", typeof message === "string" ? message : ""].filter(Boolean);
+    if (parts.length) out.push(parts.join(" ").slice(0, 500));
+    else {
+      try {
+        out.push(JSON.stringify(x, (_, v) => (typeof v === "bigint" ? v.toString() : v)).slice(0, 500));
+      } catch {
+        out.push(Object.prototype.toString.call(x));
+      }
+    }
+    const fiber = (x as Record<symbol, unknown>)[FIBER_FAILURE_CAUSE] as { _tag?: unknown; error?: unknown } | undefined;
+    x = fiber?._tag === "Fail" ? fiber.error : (x as { cause?: unknown }).cause;
+  }
+  return out;
+}
+
+/** Whether a failed script evaluation is a validator's refusal: the SDK parsed failures out of it, or it names them. */
+function validatorRefused(e: unknown, causes: string): boolean {
+  let x = e;
+  for (let depth = 0; x && typeof x === "object" && depth < 8; depth++) {
+    const failures = (x as { failures?: unknown }).failures;
+    if (Array.isArray(failures) && failures.length > 0) return true;
+    const fiber = (x as Record<symbol, unknown>)[FIBER_FAILURE_CAUSE] as { _tag?: unknown; error?: unknown } | undefined;
+    x = fiber?._tag === "Fail" ? fiber.error : (x as { cause?: unknown }).cause;
+  }
+  return /ScriptFailures|ValidatorFailed|validator failed/i.test(causes);
 }
 
 /** Where Effect's FiberFailure, which the SDK's calls reject with, keeps the cause they failed with. */

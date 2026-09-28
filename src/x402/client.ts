@@ -27,6 +27,7 @@ import {
   channelReserve,
   constantsOf,
   currencyOf,
+  keyHashOfAddress,
   msOfSlot,
   networkIdOf,
   onlyCurrency,
@@ -40,7 +41,7 @@ import {
   verifyVoucherSignature,
   type ChannelView,
 } from "./cardano.ts";
-import { retryQueries, type Chain } from "./chain.ts";
+import { retryQueries, type Chain, type Opening } from "./chain.ts";
 import { offerIn, offerOnChainProblem, offerProblem, type FeeSponsorOffer } from "./sponsor.ts";
 import {
   Err,
@@ -328,7 +329,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       tx = tx
         .payToAddress({ address: view.address, assets: valueFor(c, view.amount + add, view.lovelace), datum: view.utxo.datumOption as InlineDatum.InlineDatum })
         .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
-      const built = await retryQueries("top-up", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
+      const built = await retryQueries("top-up", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly), ...WITH_OUR_UTXOS }));
       await assertLeavesCollateral(built, adaOnly, me, `a top-up of ${add}`);
       return built;
     });
@@ -599,7 +600,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
     if (owed > 0n) tx = tx.payToAddress({ address: payTo, assets: Assets.fromLovelace(owed) });
     const adaOnly = (await this.available()).filter((u) => Assets.hasOnlyLovelace(u.assets));
-    const sb = await retryQueries("refund", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
+    const sb = await retryQueries("refund", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly), ...WITH_OUR_UTXOS }));
     const signed = await signedHex(sb);
     await this.o.authorize?.({ kind: "refund", channel: ch, amount: charged, payout: owed > 0n ? owed : 0n, transaction: signed, view, requirements: req });
     // The server submits it, if it is sent at all: its inputs stay available, and what it pays back
@@ -737,7 +738,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
         .payToAddress({ address: view.address, assets: valueFor(c, view.amount + add, view.lovelace), datum: view.utxo.datumOption as InlineDatum.InlineDatum })
         .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) })
         .setValidity({ to: this.sponsoredTtl(req, offer) });
-      return retryQueries("sponsored top-up", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [sponsorUtxo], setCollateral: SPONSORED_COLLATERAL }));
+      return retryQueries("sponsored top-up", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [sponsorUtxo], setCollateral: SPONSORED_COLLATERAL, ...WITH_OUR_UTXOS }));
     });
     const body = (await sb.toTransaction()).body;
     if (body.fee > BigInt(offer.maxFee)) throw new Error(`the top-up's fee ${body.fee} exceeds the offer's maxFee ${offer.maxFee}`);
@@ -783,7 +784,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const ref = extra.referenceScript ? await this.o.chain.getUnspent(extra.referenceScript) : undefined;
     tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
     tx = tx.payToAddress({ address: me, assets: home }).setValidity({ to: this.sponsoredTtl(req, offer) });
-    const sb = await retryQueries("sponsored refund", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [utxo], setCollateral: SPONSORED_COLLATERAL }));
+    const sb = await retryQueries("sponsored refund", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [utxo], setCollateral: SPONSORED_COLLATERAL, ...WITH_OUR_UTXOS }));
     const built = await sb.toTransaction();
     if (built.body.inputs.some((i) => `${TransactionHash.toHex(i.transactionId)}#${Number(i.index)}` === offer.input)) throw new Error("the builder spent the offer instead of holding it as collateral");
     if (!onlyCollateral(built.body, offer)) throw new Error("the builder put up collateral other than the offer");
@@ -928,12 +929,33 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
         scriptHash,
         ...(stage.kind === "closed" ? { elapseAt: stage.elapseAt.toString() } : {}),
         ...(usable ? { iouKey: "derived" as const } : { exitOnly: true }),
+        // A token channel's reserve may be the seller's; its refund then pays the reserve back.
+        ...(d.currency.kind !== "ada" && (await this.openedOnOffer(v.ref, scriptHash, d.tag, me)) ? { reserveFrom: "seller" as const } : {}),
         recoveredAt: Date.now(),
       };
       await this.o.storage.set(ch);
       found.push(ch);
     }
     return found;
+  }
+
+  /**
+   * Whether a channel was opened on a seller's fee-sponsor offer, as the chain shows it: its
+   * opening, walked back to, took none of this wallet's ADA and spent an input of someone else's.
+   * The record that said so was lost with the rest; nothing the seller answers is taken for it.
+   */
+  private async openedOnOffer(ref: string, scriptHash: string, tag: string, me: string): Promise<boolean> {
+    const opening = await this.o.chain.openingOf(ref, scriptHash, tag);
+    if (!opening) return false;
+    const mine = (bech32: string) => {
+      try {
+        return keyHashOfAddress(bech32) === me;
+      } catch {
+        return false;
+      }
+    };
+    const own = (xs: Opening["inputs"]) => xs.filter((x) => mine(x.address)).reduce((s, x) => s + x.lovelace, 0n);
+    return own(opening.outputs) >= own(opening.inputs) && opening.inputs.some((i) => !mine(i.address));
   }
 
   /**
@@ -1002,7 +1024,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   private async submitOwn(what: "close" | "end" | "elapse", tx: ReturnType<SeedWallet["newTx"]>, ch: ClientChannel, view: ChannelView): Promise<string> {
     const adaOnly = (await this.available()).filter((u) => Assets.hasOnlyLovelace(u.assets));
     const me = await this.o.wallet.address();
-    const sb = await retryQueries(what, () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly) }));
+    const sb = await retryQueries(what, () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly), ...WITH_OUR_UTXOS }));
     const hex = await signedHex(sb);
     await this.o.authorize?.({ kind: what, channel: ch, transaction: hex, view });
     this.recordOwn(hex, me);
@@ -1108,6 +1130,14 @@ export const TOP_UP_HEADROOM = 2_500_000n;
  * evaluator rules out before broadcast.
  */
 export const SPONSORED_COLLATERAL = 1_000_000n;
+
+/**
+ * For a build that runs a script: the evaluator gets the UTxOs the transaction spends and reads,
+ * as the SDK found them, instead of looking them up in its provider's view of the chain. That view
+ * trails the block before: on preprod a top-up built a second after another failed evaluation
+ * there, twice, and passed once the view had caught up.
+ */
+export const WITH_OUR_UTXOS = { passAdditionalUtxos: true } as const;
 
 /** A fee-sponsor offer this client checked, and the UTxO the chain holds for it, which is what it builds with. */
 interface Sponsorship {

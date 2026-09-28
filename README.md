@@ -67,7 +67,7 @@ its transactions has one signer.
 
 ```
 npm install
-npm test            # 55 chain-free tests
+npm test            # 58 chain-free tests
 npm run typecheck
 npm run validator   # the validator's Aiken tests; needs aiken 1.1.23 or later
 ```

@@ -38,6 +38,7 @@ import {
   checkSponsoredTopUp,
   offerIn,
   offerOnChainProblem,
+  reserveNotReturned,
   sizeWith,
   type FeeSponsorOffer,
   type OwnerLookup,
@@ -256,6 +257,18 @@ test("refund: the seller's reserve to the buyer, a stranger's input, the offer s
   // A channel the buyer funded itself: its reserve is the buyer's, and may go back to it.
   const r5 = await refundCheck(o, toBuyer, { reserveFromSeller: false });
   assert.ok(r5.ok, r5.ok ? "" : `${r5.rule}: ${r5.detail}`);
+});
+
+test("refund of a seller-reserve channel without the offer as collateral: the reserve still goes back to payTo", () => {
+  const o = offer();
+  const unsponsored = (toSeller: boolean) =>
+    refundTx(o, (p) => ({
+      ...p,
+      outputs: toSeller ? p.outputs : [out(buyer, tokens(18_500_000n, OWN + CHANNEL_ADA - p.fee))],
+      extra: { collateralInputs: [input(0xb0, 5)], collateralReturn: out(buyer, Assets.fromLovelace(1_000_000n)), totalCollateral: COLLATERAL },
+    }));
+  assert.equal(reserveNotReturned(unsponsored(true), seller.bech32, CHANNEL_ADA), undefined);
+  assert.match(reserveNotReturned(unsponsored(false), seller.bech32, CHANNEL_ADA) ?? "(none)", /seller's reserve, and the refund pays payTo 0 of it/);
 });
 
 // ---- checkMutual: the consumer's own inputs besides the channel ----

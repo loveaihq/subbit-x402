@@ -6,9 +6,9 @@
 // Koios also shows what is only in its mempool: an output spent there, a transaction not yet in a
 // block. The channel code works from the chain as it stands, as Blockfrost gives it, so only what is
 // in a block counts here.
-import { Address, Client, ScriptHash, Transaction, preprod, type UTxO } from "@evolution-sdk/evolution";
+import { Address, Client, ScriptHash, Transaction, TransactionHash, preprod, type UTxO } from "@evolution-sdk/evolution";
 import { networkIdOf, readChannel, refOf, type ChannelView } from "./cardano.ts";
-import { SubmitError, input, isNetworkError, isScriptAddress, retryQueries, splitRef, type Chain, type ChainCursor } from "./chain.ts";
+import { SubmitError, input, isNetworkError, isScriptAddress, retryQueries, splitRef, type Chain, type ChainCursor, type Opening } from "./chain.ts";
 import type { CardanoNetwork } from "./types.ts";
 
 /** How many times a request to Koios is tried before its failure is the caller's. */
@@ -32,7 +32,7 @@ interface TxRow {
   tx_hash: string;
   block_height: number | null;
   tx_block_index: number;
-  inputs?: Array<{ tx_hash: string; tx_index: number }>;
+  inputs?: Array<{ tx_hash: string; tx_index: number; payment_addr?: { bech32: string }; value?: string }>;
   outputs: Array<{
     tx_index: number;
     payment_addr: { bech32: string };
@@ -220,6 +220,31 @@ export class KoiosChain implements Chain {
         return "error" in ch ? [] : [ch];
       }),
     };
+  }
+
+  async openingOf(ref: string, scriptHash: string, tag: string): Promise<Opening | undefined> {
+    let [hash] = splitRef(ref);
+    for (let hops = 0; hops < 1000; hops++) {
+      // tx_info keeps collateral and reference inputs apart: `inputs` is what the transaction spent.
+      const [tx] = await this.txs([hash], true);
+      if (!tx) return undefined;
+      const spent = tx.inputs ?? [];
+      const at = spent.filter((i) => i.payment_addr && isScriptAddress(i.payment_addr.bech32, scriptHash));
+      const candidates = at.length ? await retryQueries("the channel", () => this.provider.getUtxosByOutRef(at.map((i) => input(i.tx_hash, i.tx_index)))) : [];
+      const before = candidates.find((u) => {
+        const ch = readChannel(u, scriptHash);
+        return !("error" in ch) && ch.datum.constants.tag === tag;
+      });
+      if (!before) {
+        return {
+          txHash: hash,
+          inputs: spent.map((i) => ({ address: i.payment_addr?.bech32 ?? "", lovelace: BigInt(i.value ?? "0") })),
+          outputs: tx.outputs.map((o) => ({ address: o.payment_addr.bech32, lovelace: BigInt(o.value) })),
+        };
+      }
+      hash = TransactionHash.toHex(before.transactionId);
+    }
+    throw new Error(`channel ${tag.slice(0, 16)}… moved more than 1000 times before ${ref}`);
   }
 
   /** The output of `txHash` that continues the channel with this tag, if it does. */

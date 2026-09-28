@@ -2,6 +2,7 @@
 // and its min-ada opens a channel, pays 25 requests, tops up twice, and is refunded after the
 // server's claim, every step sponsored by the seller's offer. `npm run sponsored -- fund | run |
 // negatives | report`; state in out/x402-step16/.
+import { rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Address, Assets, Client, Time, Transaction, TransactionBody, TransactionHash, TransactionInput, TransactionWitnessSet, TxOut, preprod } from "@evolution-sdk/evolution";
 import { x402Facilitator } from "@x402/core/facilitator";
@@ -246,10 +247,21 @@ async function phaseFinish() {
 }
 
 async function finish(s: Awaited<ReturnType<typeof stack>>) {
-  const b = buyer();
+  let b = buyer();
   for (const c of await s.manager.claim()) {
     record((st) => st.steps.push({ step: "claim", tx: c.transaction }));
     log(`claim: ${c.transaction}, ${c.channels.map((r) => `${r.channelId.slice(0, 16)}… +${r.taken}`).join(", ")}`);
+  }
+  if (process.env.STEP16_RECOVER === "1") {
+    // The buyer loses its channel records and finds the channel again on chain. Its opening shows
+    // whose the reserve is, and the refund goes as it would have with the records.
+    rmSync(dir("client"), { recursive: true, force: true });
+    b = buyer();
+    await new Promise((r) => setTimeout(r, 25_000)); // the claim's block, in Blockfrost's index
+    const found = await b.scheme.recover(NETWORK, SUBBIT_HASH);
+    const said = found.map((c) => `${c.channelId.slice(0, 16)}… ${c.status}, reserve ${c.reserveFrom === "seller" ? "the seller's" : "the buyer's"}`).join("; ");
+    log(`recovered: ${said || "nothing"}`);
+    record((st) => st.steps.push({ step: "recover", note: said }));
   }
   const ch = (await b.storage.list()).find((c) => c.status === "open");
   if (!ch) throw new Error("no open channel to refund");
