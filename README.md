@@ -47,7 +47,7 @@ Its source is here too, with tests of our own at the exact hash this code uses (
 | 12 | A watcher that survives rollbacks |
 | 13 | A retry after a lost MCP answer, answered from the kept result; a top-up that falls back to what the wallet can fund |
 | 14 | Buyer and seller through Koios, with no Blockfrost key |
-| 16 | Seller-sponsored channels: a buyer holding only tUSDM opens, tops up and is refunded without ADA of its own ([SPONSORSHIP.md](SPONSORSHIP.md)) |
+| 16 | Seller-sponsored channels: a buyer holding only tUSDM opens, tops up and is refunded without ADA of its own ([SPONSORSHIP.md](SPONSORSHIP.md)). From 0.2.1 the buyer checks the seller's offer against the chain before building with it; upgrade from 0.2.0 |
 
 Each run's wallets reconcile to the lovelace against the fees of its transactions.
 
@@ -67,7 +67,7 @@ its transactions has one signer.
 
 ```
 npm install
-npm test            # 53 chain-free tests
+npm test            # 55 chain-free tests
 npm run typecheck
 npm run validator   # the validator's Aiken tests; needs aiken 1.1.23 or later
 ```

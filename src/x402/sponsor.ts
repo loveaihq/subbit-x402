@@ -90,6 +90,26 @@ export function offerUtxo(offer: FeeSponsorOffer): UTxO.UTxO {
   return new UTxO.UTxO({ transactionId: TransactionHash.fromHex(h), index: BigInt(i), address: Address.fromBech32(offer.address), assets: Assets.fromLovelace(BigInt(offer.lovelace)) });
 }
 
+/**
+ * Why a buyer must not build with `offer`, given what the chain holds at `offer.input` (undefined
+ * when it holds nothing unspent there), or undefined when it may. The offer's address never enters
+ * the transaction: the ledger asks for the witness of the UTxO's real owner. So an offer naming one
+ * of the buyer's own UTxOs, under any address, has the buyer's own signature spend it, and its ADA
+ * goes to `payTo` as the sponsor's would. The buyer reads the UTxO itself before trusting a field.
+ */
+export function offerOnChainProblem(offer: FeeSponsorOffer, onChain: UTxO.UTxO | undefined, buyerKeyHash: string): string | undefined {
+  if (!onChain) return "the offered UTxO is not on chain unspent";
+  const owner = keyHashOf(onChain.address);
+  if (owner === buyerKeyHash.toLowerCase()) return "the offered UTxO is this wallet's own";
+  if (Address.toBech32(onChain.address) !== offer.address) return "the offered UTxO is at another address than the offer names";
+  if (!owner) return "the offered UTxO is not at a key";
+  if (!Assets.hasOnlyLovelace(onChain.assets)) return "the offered UTxO holds tokens";
+  if (Assets.lovelaceOf(onChain.assets) !== BigInt(offer.lovelace)) return `the offered UTxO holds ${Assets.lovelaceOf(onChain.assets)} lovelace, not the ${offer.lovelace} offered`;
+  // Spending it would add the reference-script fee, which a fee built from the offer leaves out.
+  if (onChain.scriptRef) return "the offered UTxO carries a reference script";
+  return undefined;
+}
+
 // ---- fees and witnesses ----------------------------------------------------------
 
 export interface FeeParameters {

@@ -1,6 +1,8 @@
 # Seller-sponsored channels: design
 
-**Status: step 16 passed on preprod on 2026-09-28 (RESULTS.md step 16). Preprod only.** It brings the fee sponsorship of
+**Status: step 16 passed on preprod on 2026-09-28 (RESULTS.md step 16). Preprod only.** 0.2.0's
+client trusted the offer's fields; from 0.2.1 it reads the offered UTxO from the chain first
+(section 3, "What the buyer checks"). This brings the fee sponsorship of
 [cardano-x402-sponsor](https://github.com/loveaihq/cardano-x402-sponsor) (seller-sponsored fees for
 x402 `exact`, milestone 1 passed on preprod on 2026-09-27) to this binding's channels, so that a
 buyer holding only a stablecoin can open, top up and cooperatively close a channel. The offer, its
@@ -76,6 +78,22 @@ S9 for a top-up or a refund checks the size part of the fee: with the seller's w
 the fee still covers `minFeeA × size + minFeeB`. What the scripts' execution adds is the builder's
 estimate, and the SDK's counts a witness for every key-locked input and collateral. A fee short of
 it fails at submission, before anything moves.
+
+### What the buyer checks
+
+The offer is the seller's claim, and its address never enters the transaction: the ledger asks
+for the witness of the UTxO's real owner. An offer naming one of the buyer's own UTxOs, with its
+true lovelace under any address, gives a body that balances and needs no witness but the buyer's.
+That UTxO's ADA then goes where the sponsor's would: to `payTo`, and into the channel as a reserve
+the refund pays back to `payTo`.
+
+So the client reads `offer.input` from the chain before building with it. It uses the offer only
+if the chain holds an ADA-only UTxO there, at exactly the offer's address, with exactly its
+lovelace, with no reference script, and not at the wallet's payment key (`offerOnChainProblem`).
+It then builds with the UTxO the chain returned. A top-up's or a refund's collateral must be that
+UTxO and nothing else. When an offer fails these checks, an opening or a top-up goes ahead as if
+none had been made. A refund of a channel whose reserve is the seller's fails, with the reason.
+0.2.0's client checked none of this (RESULTS.md, "Step 16, after the release").
 
 The facilitator's existing checks still apply: the channel output and datum (open), the `Add`
 shape and evaluation (top-up), and `checkMutual` (refund), whose "the channel and nothing else"

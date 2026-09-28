@@ -41,7 +41,7 @@ import {
   type ChannelView,
 } from "./cardano.ts";
 import { retryQueries, type Chain } from "./chain.ts";
-import { offerIn, offerProblem, offerUtxo, type FeeSponsorOffer } from "./sponsor.ts";
+import { offerIn, offerOnChainProblem, offerProblem, type FeeSponsorOffer } from "./sponsor.ts";
 import {
   Err,
   LOVELACE,
@@ -310,8 +310,8 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
    * out of the channel, the refund first, is a script transaction.
    */
   private async topUp(req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, amount: bigint, short: bigint) {
-    const offer = this.usableOffer(req);
-    if (offer) return this.topUpSponsored(req, extra, ch, view, amount, short, offer);
+    const s = await this.sponsorship(req);
+    if (s && "offer" in s) return this.topUpSponsored(req, extra, ch, view, amount, short, s);
     const w = this.o.wallet;
     const me = await w.address();
     const want = this.depositFor(req, extra, amount, this.maxDepositFor(req));
@@ -400,8 +400,8 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
    * collateral.
    */
   private async openChannel(req: PaymentRequirements, extra: BatchExtra, amount: bigint) {
-    const offer = this.usableOffer(req);
-    if (offer) return this.openSponsored(req, extra, amount, offer);
+    const s = await this.sponsorship(req);
+    if (s && "offer" in s) return this.openSponsored(req, extra, amount, s);
     const w = this.o.wallet;
     const me = await w.address();
     const payer = keyHash(me);
@@ -583,11 +583,13 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       const min = minAdaOutput(payTo, (await w.getProtocolParameters()).coinsPerUtxoByte);
       if (owed < min) throw new Error(`owed ${owed} is below the ${min} lovelace an output needs; the server must claim it first`);
     }
+    const s = ch.reserveFrom === "seller" ? await this.sponsorship(req) : undefined;
+    if (ch.reserveFrom === "seller" && !(s && "offer" in s)) {
+      throw new Error(`this channel's reserve is the seller's: its refund needs the seller's fee-sponsor offer, and ${s ? `this 402's cannot be used: ${s.problem}` : "this 402 has none"}`);
+    }
     const [channelUtxo] = await w.getUtxosByOutRef([new TransactionInput.TransactionInput({ transactionId: TransactionHash.fromHex(view.ref.split("#")[0]!), index: BigInt(view.ref.split("#")[1]!) })]);
     if (!channelUtxo) throw new Error("channel output not readable");
-    const offer = ch.reserveFrom === "seller" ? this.usableOffer(req) : undefined;
-    if (ch.reserveFrom === "seller" && !offer) throw new Error("this channel's reserve is the seller's: its refund needs the seller's fee-sponsor offer, and this 402 has none");
-    if (offer) return this.refundSponsored(pr, req, extra, ch, view, channelUtxo, charged, offer);
+    if (s && "offer" in s) return this.refundSponsored(pr, req, extra, ch, view, channelUtxo, charged, s);
     let tx = w
       .newTx()
       .collectFrom({ inputs: [channelUtxo], redeemer: Redeemer.mutual() })
@@ -615,15 +617,26 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
 
   // ---- fee sponsorship (SPONSORSHIP.md) -------------------------------------------------
 
-  /** The 402's fee-sponsor offer, when it is one this client can build with: a token price, not expired. */
-  private usableOffer(req: PaymentRequirements): FeeSponsorOffer | undefined {
-    if (req.asset === LOVELACE) return undefined;
+  /**
+   * The 402's fee-sponsor offer, with the UTxO the chain holds for it, when this client can build
+   * with it: a token price, not expired, and on chain as offered, which above all means not this
+   * wallet's own (`offerOnChainProblem`). Otherwise why not; undefined when the 402 makes no offer.
+   * An opening or a top-up then goes ahead as if none had been made.
+   */
+  private async sponsorship(req: PaymentRequirements): Promise<Sponsorship | { problem: string } | undefined> {
+    let offer: FeeSponsorOffer | undefined;
     try {
-      const o = offerIn(req.extra);
-      return o && !offerProblem(o, req.network, Date.now()) ? o : undefined;
-    } catch {
-      return undefined;
+      offer = offerIn(req.extra);
+    } catch (e) {
+      return { problem: (e as Error).message };
     }
+    if (!offer) return undefined;
+    if (req.asset === LOVELACE) return { problem: "only token prices are sponsored" };
+    const problem = offerProblem(offer, req.network, Date.now());
+    if (problem) return { problem };
+    const utxo = await this.o.chain.getUnspent(offer.input);
+    const wrong = offerOnChainProblem(offer, utxo, keyHash(await this.o.wallet.address()));
+    return wrong ? { problem: wrong } : { offer, utxo: utxo! };
   }
 
   /** The validity bound of a sponsored transaction: the request's window, and never past the offer. */
@@ -636,7 +649,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
    * UTxOs `planTokens` picks, and every lovelace they carry goes back to the wallet with the
    * remaining tokens; what is left of the offer after the reserve and the fee goes to `payTo`.
    */
-  private async openSponsored(req: PaymentRequirements, extra: BatchExtra, amount: bigint, offer: FeeSponsorOffer) {
+  private async openSponsored(req: PaymentRequirements, extra: BatchExtra, amount: bigint, { offer, utxo }: Sponsorship) {
     const w = this.o.wallet;
     const me = await w.address();
     const payer = keyHash(me);
@@ -659,7 +672,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const back = plan.rest > 0n ? Assets.fromHexStrings(cur.policy, cur.name, plan.rest, own) : Assets.fromLovelace(own);
     const tx = w
       .newTx()
-      .collectFrom({ inputs: [...plan.inputs, offerUtxo(offer)] })
+      .collectFrom({ inputs: [...plan.inputs, utxo] })
       .payToAddress({ address: me, assets: back })
       .payToAddress({ address, assets: valueFor(cur, tokens, reserve), datum: inlineDatum(constants, { kind: "opened", subbed: 0n }) })
       .setValidity({ to: this.sponsoredTtl(req, offer) });
@@ -706,14 +719,13 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
    * channel's ADA does not change, the wallet's tokens join it, the wallet's lovelace goes back to
    * it, and the rest of the offer, and the collateral's return, go to `payTo`.
    */
-  private async topUpSponsored(req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, amount: bigint, short: bigint, offer: FeeSponsorOffer) {
+  private async topUpSponsored(req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, amount: bigint, short: bigint, { offer, utxo: sponsorUtxo }: Sponsorship) {
     const w = this.o.wallet;
     const me = await w.address();
     const c = view.datum.constants.currency;
     if (c.kind === "ada") throw new Error("only token channels are sponsored");
     const want = this.depositFor(req, extra, amount, this.maxDepositFor(req));
     const all = await this.available();
-    const sponsorUtxo = offerUtxo(offer);
     const { built: sb, amount: add } = await firstThatBuilds(topUpAmounts(want, short, tokensHeld(all, c)), async (add) => {
       const plan = planTokens(all, c, add, 0n);
       const own = plan.inputs.reduce((sum, u) => sum + Assets.lovelaceOf(u.assets), 0n);
@@ -727,8 +739,9 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
         .setValidity({ to: this.sponsoredTtl(req, offer) });
       return retryQueries("sponsored top-up", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [sponsorUtxo], setCollateral: SPONSORED_COLLATERAL }));
     });
-    const fee = (await sb.toTransaction()).body.fee;
-    if (fee > BigInt(offer.maxFee)) throw new Error(`the top-up's fee ${fee} exceeds the offer's maxFee ${offer.maxFee}`);
+    const body = (await sb.toTransaction()).body;
+    if (body.fee > BigInt(offer.maxFee)) throw new Error(`the top-up's fee ${body.fee} exceeds the offer's maxFee ${offer.maxFee}`);
+    if (!onlyCollateral(body, offer)) throw new Error("the builder put up collateral other than the offer");
     const signed = await signedHex(sb);
     const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
     await this.o.authorize?.({ kind: "topUp", channel: ch, amount: ceiling, deposit: add, transaction: signed, view, requirements: req, sponsored: true });
@@ -747,7 +760,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
    * of it is spent; the refunded tokens join one of the wallet's own UTxOs, whose lovelace covers
    * them; the channel's ADA, less the fee, goes back to `payTo`.
    */
-  private async refundSponsored(pr: PaymentRequired, req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, channelUtxo: UTxO.UTxO, charged: bigint, offer: FeeSponsorOffer): Promise<PaymentPayload> {
+  private async refundSponsored(pr: PaymentRequired, req: PaymentRequirements, extra: BatchExtra, ch: ClientChannel, view: ChannelView, channelUtxo: UTxO.UTxO, charged: bigint, { offer, utxo }: Sponsorship): Promise<PaymentPayload> {
     const w = this.o.wallet;
     const me = await w.address();
     const cur = view.datum.constants.currency;
@@ -770,9 +783,10 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const ref = extra.referenceScript ? await this.o.chain.getUnspent(extra.referenceScript) : undefined;
     tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
     tx = tx.payToAddress({ address: me, assets: home }).setValidity({ to: this.sponsoredTtl(req, offer) });
-    const sb = await retryQueries("sponsored refund", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [offerUtxo(offer)], setCollateral: SPONSORED_COLLATERAL }));
+    const sb = await retryQueries("sponsored refund", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [utxo], setCollateral: SPONSORED_COLLATERAL }));
     const built = await sb.toTransaction();
     if (built.body.inputs.some((i) => `${TransactionHash.toHex(i.transactionId)}#${Number(i.index)}` === offer.input)) throw new Error("the builder spent the offer instead of holding it as collateral");
+    if (!onlyCollateral(built.body, offer)) throw new Error("the builder put up collateral other than the offer");
     const signed = await signedHex(sb);
     await this.o.authorize?.({ kind: "refund", channel: ch, amount: charged, payout: 0n, transaction: signed, view, requirements: req, sponsored: true });
     this.recordOwn(signed, me, { spends: false });
@@ -1094,6 +1108,18 @@ export const TOP_UP_HEADROOM = 2_500_000n;
  * evaluator rules out before broadcast.
  */
 export const SPONSORED_COLLATERAL = 1_000_000n;
+
+/** A fee-sponsor offer this client checked, and the UTxO the chain holds for it, which is what it builds with. */
+interface Sponsorship {
+  offer: FeeSponsorOffer;
+  utxo: UTxO.UTxO;
+}
+
+/** Whether a sponsored transaction's collateral is the offer and nothing of the wallet's. */
+function onlyCollateral(body: Transaction.Transaction["body"], offer: FeeSponsorOffer): boolean {
+  const refs = (body.collateralInputs ?? []).map((i) => `${TransactionHash.toHex(i.transactionId)}#${Number(i.index)}`);
+  return refs.length === 1 && refs[0] === offer.input;
+}
 
 /** How much of a token currency the UTxOs `planTokens` would draw on hold. */
 function tokensHeld(utxos: UTxO.UTxO[], c: Currency): bigint {

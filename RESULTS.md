@@ -1066,6 +1066,41 @@ chain-free tests only (below).
 opening, a top-up and a refund, each with its refusals, on offline transactions signed for real;
 `checkMutual` letting the consumer's own inputs through and nothing else; and the pool.
 
+## Step 16, after the release: the buyer checks the offer (0.2.1)
+
+Found on 2026-09-28, the day 0.2.0 went to npm, while bringing sponsorship to ada-agent-wallet.
+0.2.0's client trusted the offer's fields: a seller could name one of the buyer's own UTxOs as
+the sponsor's, and the buyer's own signature would then spend it, its ADA going to the seller.
+This was confirmed on preprod, with this project's own test accounts. 0.2.0 had been on npm for a
+few hours, and ada-agent-wallet was still on 0.1.4, which has no sponsorship.
+
+0.2.1 reads the offered UTxO from the chain before building with it, and refuses one that is the
+wallet's own or does not match the offer. A sponsored top-up's or refund's collateral must be
+the offer and nothing else (SPONSORSHIP.md section 3, "What the buyer checks"). Two chain-free
+tests cover it.
+
+**Step 16 again, on 0.2.1** (`STEP16_OUT=x402-step16-0.2.1`, 2026-09-28): step 16's run,
+with the client that checks the offer against the chain. `fund` topped the sponsor up to
+four offers in `928fe86f083cb7c9f48fa1771236883749fde61288268dbd834a2606da57b9df`; the opening
+took the one the first run left.
+
+| Step | Transaction | Block | Size | Fee (tADA) | Paid by | Request to 200 |
+|---|---|---|---|---|---|---|
+| open, request 1 | `70e3909eac82d7bdc5c1e53461355452453dec6c37cc0f6cf30f4b318b72b039` | 5228000 | 790 B | 0.190185 | seller's offer `ea8a…#2` | 45.7 s |
+| top-up, request 11 | `3b9611c05327b887aa0ebb96134878980c14036476e3738e9ebb9c46f0aa8945` | 5228003 | 1,077 B | 0.266182 | seller's offer `928f…#0` | 63.7 s |
+| top-up, request 21 | `c3e2a3c459eef92416d62b378dcce7e4719253b71870cc60b890134ff24fbcda` | 5228007 | 1,077 B | 0.266182 | seller's offer `928f…#2` | 27.1 s |
+| claim | `ee7e31e7151d984bcaf88c11195feb1fcbeab4647f35e36107da83bd2a6f6dcf` | 5228017 | 1,045 B | 0.269074 | provider | — |
+| refund | `5801e7ef78aae956c3175f6d7aa8408badfaedaaf5d43810f68344c4bf9d32b3` | 5228019 | 855 B | 0.244902 | the channel's ADA, the seller's | 36.1 s |
+
+- The buyer's tADA is ±0 again, and its tUSDM −2.5. The seller's net ADA across `payTo` and the
+  sponsor key is −1.236525, the five fees to the lovelace.
+- The refund's collateral was the offer `928f…#1`, not spent.
+- The run's own claim and refund, in the same process, failed before they started: the resource
+  server's second start met a pooled connection to the first one's facilitator, and `/supported`
+  got ECONNRESET. `finish` resumed in a new process. The spike now runs both on one stack.
+- Tests: 55 chain-free, 2 of them new: the buyer's check of an offer against what the chain holds,
+  and the client refusing an offer of its own UTxO before it builds.
+
 ## What this does not show yet
 
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a
@@ -1216,6 +1251,8 @@ aiken build vendor/subbit/aiken   # then compare its plutus.json with vendor/sub
 
 # step 16: seller-sponsored channels; the buyer is account 8, the sponsor key account 9
 npm run sponsored -- fund && npm run sponsored -- run && npm run sponsored -- negatives && npm run sponsored -- report
+# again, with its own state (fund tops the sponsor up to four offers)
+STEP16_OUT=x402-step16-0.2.1 npm run sponsored -- fund && STEP16_OUT=x402-step16-0.2.1 npm run sponsored -- run
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

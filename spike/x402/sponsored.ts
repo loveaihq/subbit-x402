@@ -39,7 +39,8 @@ const projectId = must("BLOCKFROST_PROJECT_ID");
 const mnemonic = must("WALLET_MNEMONIC");
 const wallet = (accountIndex: number) => Client.make(preprod).withBlockfrost({ baseUrl: BF_BASE, projectId }).withSeed({ mnemonic, accountIndex });
 const chain = new BlockfrostChain(NETWORK, BF_BASE, projectId);
-const OUT = new URL("../../out/x402-step16/", import.meta.url);
+// STEP16_OUT keeps a run's state elsewhere under out/, as X402_OUT does for the e2e.
+const OUT = new URL(`../../out/${process.env.STEP16_OUT ?? "x402-step16"}/`, import.meta.url);
 const STATE = new URL("state.json", OUT);
 const dir = (name: string) => new URL(`${name}/`, OUT).pathname.replace(/^\/(\w:)/, "$1");
 
@@ -108,11 +109,13 @@ async function phaseFund() {
     const tx = await submit("buyer funded: 50 tUSDM and its min-ada", await sb.sign(), wallet(ACCOUNT.tokenFunder));
     record((s) => (s.fund = { ...s.fund, buyer: tx }));
   }
-  if ((await holdings(Address.toBech32(sponsorAddr))).utxos === 0) {
+  // Up to OFFERS UTxOs the pool offers (3.5 to 6 ADA): a run after another starts with what that left.
+  const offerable = (await wallet(ACCOUNT.sponsor).getWalletUtxos()).filter((u) => Assets.hasOnlyLovelace(u.assets) && Assets.lovelaceOf(u.assets) >= 3_500_000n && Assets.lovelaceOf(u.assets) <= 6_000_000n).length;
+  if (offerable < OFFERS) {
     let tx = wallet(ACCOUNT.seller).newTx();
-    for (let k = 0; k < OFFERS; k++) tx = tx.payToAddress({ address: sponsorAddr, assets: Assets.fromLovelace(OFFER_LOVELACE) });
+    for (let k = offerable; k < OFFERS; k++) tx = tx.payToAddress({ address: sponsorAddr, assets: Assets.fromLovelace(OFFER_LOVELACE) });
     const sb = await tx.build();
-    const hash = await submit(`sponsor funded by the seller: ${OFFERS} × ${ada(OFFER_LOVELACE)} tADA`, await sb.sign(), wallet(ACCOUNT.seller));
+    const hash = await submit(`sponsor funded by the seller: ${OFFERS - offerable} × ${ada(OFFER_LOVELACE)} tADA`, await sb.sign(), wallet(ACCOUNT.seller));
     record((s) => (s.fund = { ...s.fund, sponsor: hash }));
   }
   await snapshot("funded");
@@ -222,30 +225,41 @@ async function phaseRun() {
       if (onChain || i % 5 === 0) log(`request ${i}: ${step}${onChain ? ` ${onChain}` : ""} in ${(ms / 1000).toFixed(1)} s`);
       record((st) => st.steps.push({ step, request: i, ...(onChain ? { tx: onChain } : {}), ms }));
     }
+    // On the same stack: a second one in this process, on the same ports, met a pooled connection
+    // to the first one's facilitator and failed its `/supported` with ECONNRESET.
+    await finish(s);
   } finally {
     await s.close();
   }
-  await phaseFinish();
+  await snapshotAfter();
 }
 
 /** The server redeems what it charged, then the buyer takes the rest back. Resumes where a run stopped. */
 async function phaseFinish() {
   const s = await stack();
   try {
-    const b = buyer();
-    for (const c of await s.manager.claim()) {
-      record((st) => st.steps.push({ step: "claim", tx: c.transaction }));
-      log(`claim: ${c.transaction}, ${c.channels.map((r) => `${r.channelId.slice(0, 16)}… +${r.taken}`).join(", ")}`);
-    }
-    const ch = (await b.storage.list()).find((c) => c.status === "open");
-    if (!ch) throw new Error("no open channel to refund");
-    const t0 = Date.now();
-    const settle = await b.scheme.refund(URL_DATA, fetch, ch.channelId);
-    record((st) => st.steps.push({ step: "refund", tx: settle.transaction, ms: Date.now() - t0 }));
-    log(`refund: ${settle.transaction} in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+    await finish(s);
   } finally {
     await s.close();
   }
+  await snapshotAfter();
+}
+
+async function finish(s: Awaited<ReturnType<typeof stack>>) {
+  const b = buyer();
+  for (const c of await s.manager.claim()) {
+    record((st) => st.steps.push({ step: "claim", tx: c.transaction }));
+    log(`claim: ${c.transaction}, ${c.channels.map((r) => `${r.channelId.slice(0, 16)}… +${r.taken}`).join(", ")}`);
+  }
+  const ch = (await b.storage.list()).find((c) => c.status === "open");
+  if (!ch) throw new Error("no open channel to refund");
+  const t0 = Date.now();
+  const settle = await b.scheme.refund(URL_DATA, fetch, ch.channelId);
+  record((st) => st.steps.push({ step: "refund", tx: settle.transaction, ms: Date.now() - t0 }));
+  log(`refund: ${settle.transaction} in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+}
+
+async function snapshotAfter() {
   await new Promise((r) => setTimeout(r, 25_000)); // Blockfrost's address index trails a block
   const after = await snapshot("after");
   record((s) => (s.after = after));

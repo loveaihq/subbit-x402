@@ -2,10 +2,15 @@
 // top-up and a refund on offline transactions signed for real, the relaxed `checkMutual`, and the
 // pool's soft offers and exclusive bindings.
 import { strict as assert } from "node:assert";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import type { PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import {
   Address,
   Assets,
+  Client,
   Data,
   KeyHash,
   PrivateKey,
@@ -22,21 +27,24 @@ import {
   Time,
   preprod,
 } from "@evolution-sdk/evolution";
-import { channelAddress, inlineDatum } from "../src/subbit.ts";
-import { channelReserve, constantsOf } from "../src/x402/cardano.ts";
+import { SUBBIT_HASH, channelAddress, inlineDatum, subbitScript } from "../src/subbit.ts";
+import { channelReserve, constantsOf, type ChannelView } from "../src/x402/cardano.ts";
+import type { Chain } from "../src/x402/chain.ts";
+import { BatchSettlementCardanoClient, FileClientStorage, serverKey } from "../src/x402/client.ts";
 import {
   SponsorPool,
   checkSponsoredOpen,
   checkSponsoredRefund,
   checkSponsoredTopUp,
   offerIn,
+  offerOnChainProblem,
   sizeWith,
   type FeeSponsorOffer,
   type OwnerLookup,
   type SponsorWallet,
 } from "../src/x402/sponsor.ts";
 import { checkMutual } from "../src/x402/txcheck.ts";
-import type { ChannelConfig } from "../src/x402/types.ts";
+import { parseExtra, type ChannelConfig } from "../src/x402/types.ts";
 
 const NETWORK = "cardano:preprod";
 const POLICY = "e675b46e4d2242c991a8932a99db3044e80515ae14b4c4ccf6b3f4c9";
@@ -274,6 +282,61 @@ test("checkMutual lets the consumer's own key-locked inputs through beside the c
   // A stranger's, or one the check was not told about, is refused.
   assert.throws(() => checkMutual(mutual(input(0xd0, 0)), NETWORK, SCRIPT, channelRef, buyer.keyHash, seller.keyHash, seller.bech32, currency, 0n, [], true, new Map([[refOf(0xd0, 0), stranger.address]])), /consumer's own/);
   assert.throws(() => checkMutual(mutual(input(0xb0, 2)), NETWORK, SCRIPT, channelRef, buyer.keyHash, seller.keyHash, seller.bech32, currency, 0n, []), /consumer's own/);
+});
+
+// ---- the buyer's check of an offer ----
+
+const held = (to: { address: Address.Address }, assets: Assets.Assets, extra: { scriptRef?: typeof subbitScript } = {}) =>
+  new UTxO.UTxO({ transactionId: TransactionHash.fromHex(txid(0xa0)), index: 3n, address: to.address, assets, ...extra });
+
+test("buyer: an offer is built with only as the chain holds it, and never when it names the buyer's own UTxO", () => {
+  const o = offer();
+  assert.equal(offerOnChainProblem(o, held(sponsor, Assets.fromLovelace(S)), buyer.keyHash), undefined);
+  // The buyer's own UTxO, offered under the sponsor's address: the body would balance, and the
+  // buyer's one witness would spend it, its ADA going to payTo as the sponsor's would.
+  assert.equal(offerOnChainProblem(o, held(buyer, Assets.fromLovelace(S)), buyer.keyHash), "the offered UTxO is this wallet's own");
+  // The buyer's key under an address with a stake part is still the buyer's.
+  const staked = new Address.Address({ networkId: 0, paymentCredential: buyer.address.paymentCredential, stakingCredential: stranger.address.paymentCredential });
+  assert.equal(offerOnChainProblem({ ...o, address: Address.toBech32(staked) }, held({ address: staked }, Assets.fromLovelace(S)), buyer.keyHash), "the offered UTxO is this wallet's own");
+  const cases: Array<[UTxO.UTxO | undefined, RegExp]> = [
+    [undefined, /not on chain unspent/],
+    [held(stranger, Assets.fromLovelace(S)), /another address/],
+    [held(sponsor, tokens(1n, S)), /holds tokens/],
+    [held(sponsor, Assets.fromLovelace(S + 1n)), /holds 4000001 lovelace, not the 4000000 offered/],
+    [held(sponsor, Assets.fromLovelace(S), { scriptRef: subbitScript }), /reference script/],
+  ];
+  for (const [u, why] of cases) assert.match(offerOnChainProblem(o, u, buyer.keyHash) ?? "(none)", why);
+});
+
+test("buyer: the client reads the offered UTxO itself, and refuses one of its own before building", async () => {
+  const wallet = Client.make(preprod).withBlockfrost({ baseUrl: "http://127.0.0.1:9", projectId: "unused" }).withSeed({ mnemonic: `${"abandon ".repeat(23)}art`, accountIndex: 0 });
+  const me = await wallet.address();
+  const cfg: ChannelConfig = { ...config, payer: KeyHash.toHex(me.paymentCredential as KeyHash.KeyHash) };
+  const req: PaymentRequirements = {
+    scheme: "batch-settlement",
+    network: NETWORK,
+    asset: TUSDM,
+    amount: "100000",
+    payTo: seller.bech32,
+    maxTimeoutSeconds: 300,
+    extra: { scriptHash: SUBBIT_HASH, receiverAuthorizer: seller.keyHash, withdrawDelay: 900 },
+  };
+  const storage = new FileClientStorage(mkdtempSync(join(tmpdir(), "sponsor-")));
+  const channelRef = `${"cd".repeat(32)}#0`;
+  await storage.set({ channelId: TAG, serverKey: serverKey(req, parseExtra(req)), channelConfig: cfg, channelRef, deposit: "1000000", balance: "1000000", chargedCumulativeAmount: "0", status: "open", openedAt: Date.now(), reserveFrom: "seller" });
+  const view = { ref: channelRef, address: chan, lovelace: RESERVE, amount: 1_000_000n, datum: { ownHash: SUBBIT_HASH, constants: constantsOf(cfg, TAG), stage: { kind: "opened", subbed: 0n } } } as unknown as ChannelView;
+  const o = offer();
+  const lookups: string[] = [];
+  // What the chain holds at the offered input: one of this wallet's own UTxOs.
+  const chain = {
+    network: NETWORK,
+    followChannel: async () => view,
+    getUnspent: async (ref: string) => (lookups.push(ref), ref === o.input ? held({ address: me }, Assets.fromLovelace(S)) : undefined),
+  } as unknown as Chain;
+  const client = new BatchSettlementCardanoClient({ wallet, storage, chain });
+  const pr: PaymentRequired = { x402Version: 2, resource: { url: "http://seller.invalid/refund" }, accepts: [{ ...req, extra: { ...req.extra, feeSponsor: o } }] };
+  await assert.rejects(client.refundPayload(pr, TAG), /its refund needs the seller's fee-sponsor offer, and this 402's cannot be used: the offered UTxO is this wallet's own/);
+  assert.deepEqual(lookups, [o.input]);
 });
 
 // ---- the pool ----
