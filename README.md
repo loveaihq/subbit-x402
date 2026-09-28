@@ -74,15 +74,18 @@ npm run validator   # the validator's Aiken tests; needs aiken 1.1.23 or later
 
 As a dependency, `npm i subbit-x402` (built, from npm) or a GitHub commit (which builds itself on
 install); it exports `subbit-x402/subbit` and `subbit-x402/x402/<module>` (`client`, `server`,
-`facilitator`, `manager`, `chain`, `koios`, `cardano`, `txcheck`, `types`, `claimtx`). It takes the SDK's
+`facilitator`, `manager`, `chain`, `koios`, `cardano`, `txcheck`, `types`, `claimtx`, `sponsor`). It takes the SDK's
 objects, a wallet among them, so use the `@evolution-sdk/evolution` version it pins (0.5.14).
 [ada-agent-wallet](https://github.com/loveaihq/ada-agent-wallet) uses the client that way: its
 signing daemon runs `BatchSettlementCardanoClient` with an `authorize` hook that puts every
 voucher and deposit through its spend policy. The chain is read through `BlockfrostChain`
-(`chain`), with a Blockfrost key, or `KoiosChain` (`koios`), which needs none.
+(`chain`), with a Blockfrost key, or `KoiosChain` (`koios`), which needs none. A server sponsors
+token channels for buyers that hold no ADA by passing `sponsor: { pool: new SponsorPool({ wallet }) }`,
+with a wallet at a key of its own, not the provider key (`sponsor`, SPONSORSHIP.md); its
+facilitator must be this one, or another that merges `sponsorWitnesses`.
 
 The preprod runs take `WALLET_MNEMONIC`, a preprod test wallet (these used the public
-all-`abandon` test mnemonic, accounts 0 to 3, which anyone can spend from: keep nothing of value
+all-`abandon` test mnemonic, accounts 0 to 3 and, in step 16, 8 and 9, which anyone can spend from: keep nothing of value
 there), and `BLOCKFROST_PROJECT_ID`, a preprod Blockfrost key. The commands for each step are at
 the end of [`RESULTS.md`](RESULTS.md#reproduce).
 
