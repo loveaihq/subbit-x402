@@ -36,7 +36,7 @@ import {
   checkSponsoredRefund,
   checkSponsoredTopUp,
   offerIn,
-  reserveNotReturned,
+  unsponsoredRefundProblem,
   type FeeSponsorOffer,
   type SponsorPool,
   type SponsorResult,
@@ -503,11 +503,9 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
     const owed = BigInt(ch.chargedCumulativeAmount) - BigInt(ch.totalClaimed);
     checkMutual(hex, ctx.requirements.network, this.config.scriptHash, ch.channelRef, ch.channelConfig.payer, this.config.receiverAuthorizer, this.config.payTo, currencyOf(ch.channelConfig.token), owed, collateral, true, others);
     const sponsorWitness = await this.signSponsoredRefund(ctx, hex, ch);
-    if (ch.reserveFrom === "seller" && !sponsorWitness) {
+    if (!sponsorWitness) {
       // A refund without the seller's offer as its collateral still pays the seller's reserve back.
-      const channel = await this.config.chain.getUnspent(ch.channelRef);
-      if (!channel) throw new Error(`${Err.refundTransaction}: the channel is spent or unknown`);
-      const wrong = reserveNotReturned(hex, this.config.payTo, Assets.lovelaceOf(channel.assets));
+      const wrong = await unsponsoredRefundProblem(hex, ch, this.config.payTo, this.config.chain);
       if (wrong) throw new Error(`fee_sponsor_reserve: ${wrong}`);
     }
     this.merge(ctx.paymentPayload, { channelSnapshot: ch });

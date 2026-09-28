@@ -383,10 +383,9 @@ export async function retryQueries<T>(what: string, fn: () => Promise<T>, attemp
       const text = String((e as Error)?.message ?? e);
       const causes = causeChain(e).join(" | ");
       const query = /(Blockfrost|Koios) (getProtocolParameters|getUtxos|getUtxosByOutRef|getDelegation|getDatum)[A-Za-z]* failed|Failed to fetch protocol parameters/.test(text) || isNetworkError(e);
-      // A script evaluation fails for good only when a validator refused. The provider resolves a
-      // transaction's inputs from its own view of the chain, which can trail the block that made
-      // them: on preprod a top-up built two seconds after the one before failed there, and passed
-      // later. Anything else from the evaluator is tried again, as a query is.
+      // A script evaluation fails for good only when a validator refused. On preprod a top-up
+      // built a second or two after the one before failed evaluation, twice, and passed later.
+      // Anything else from the evaluator is tried again, as a query is.
       const evaluation = /Script evaluation failed|evaluateTx failed|evaluation fault|evaluation returned no result/.test(`${text} ${causes}`);
       const again = evaluation ? !validatorRefused(e, causes) : query;
       if (!again || i >= attempts) throw e;

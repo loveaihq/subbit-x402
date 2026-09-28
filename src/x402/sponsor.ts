@@ -14,6 +14,7 @@ import {
   VKey,
 } from "@evolution-sdk/evolution";
 import { isChannelOutput, msOfSlot, networkIdOf, txHashOf } from "./cardano.ts";
+import type { Chain } from "./chain.ts";
 
 // ---- the offer ---------------------------------------------------------------------
 
@@ -108,6 +109,18 @@ export function offerOnChainProblem(offer: FeeSponsorOffer, onChain: UTxO.UTxO |
   // Spending it would add the reference-script fee, which a fee built from the offer leaves out.
   if (onChain.scriptRef) return "the offered UTxO carries a reference script";
   return undefined;
+}
+
+/**
+ * The seller's rule for a refund it does not sponsor: when the channel's reserve is the seller's,
+ * why `txHex` does not pay it back, reading what the channel holds from the chain; undefined when
+ * it does, or when the reserve is not the seller's.
+ */
+export async function unsponsoredRefundProblem(txHex: string, channel: { reserveFrom?: "seller"; channelRef: string }, payTo: string, chain: Pick<Chain, "getUnspent">): Promise<string | undefined> {
+  if (channel.reserveFrom !== "seller") return undefined;
+  const held = await chain.getUnspent(channel.channelRef);
+  if (!held) return `the channel ${channel.channelRef} is spent or unknown`;
+  return reserveNotReturned(txHex, payTo, Assets.lovelaceOf(held.assets));
 }
 
 /**

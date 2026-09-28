@@ -40,6 +40,7 @@ import {
   offerOnChainProblem,
   reserveNotReturned,
   sizeWith,
+  unsponsoredRefundProblem,
   type FeeSponsorOffer,
   type OwnerLookup,
   type SponsorWallet,
@@ -259,7 +260,7 @@ test("refund: the seller's reserve to the buyer, a stranger's input, the offer s
   assert.ok(r5.ok, r5.ok ? "" : `${r5.rule}: ${r5.detail}`);
 });
 
-test("refund of a seller-reserve channel without the offer as collateral: the reserve still goes back to payTo", () => {
+test("refund of a seller-reserve channel without the offer as collateral: the reserve still goes back to payTo", async () => {
   const o = offer();
   const unsponsored = (toSeller: boolean) =>
     refundTx(o, (p) => ({
@@ -269,6 +270,15 @@ test("refund of a seller-reserve channel without the offer as collateral: the re
     }));
   assert.equal(reserveNotReturned(unsponsored(true), seller.bech32, CHANNEL_ADA), undefined);
   assert.match(reserveNotReturned(unsponsored(false), seller.bech32, CHANNEL_ADA) ?? "(none)", /seller's reserve, and the refund pays payTo 0 of it/);
+  // The server's rule, which reads what the channel holds from the chain.
+  const held = new UTxO.UTxO({ transactionId: TransactionHash.fromHex(txid(0xc0)), index: 0n, address: chan, assets: tokens(2_000_000n, CHANNEL_ADA) });
+  const chain = { getUnspent: async (ref: string) => (ref === refOf(0xc0, 0) ? held : undefined) };
+  const sellers = { reserveFrom: "seller" as const, channelRef: refOf(0xc0, 0) };
+  assert.equal(await unsponsoredRefundProblem(unsponsored(true), sellers, seller.bech32, chain), undefined);
+  assert.match((await unsponsoredRefundProblem(unsponsored(false), sellers, seller.bech32, chain)) ?? "(none)", /seller's reserve/);
+  // A channel the buyer funded: its reserve goes back to the buyer.
+  assert.equal(await unsponsoredRefundProblem(unsponsored(false), { channelRef: refOf(0xc0, 0) }, seller.bech32, chain), undefined);
+  assert.match((await unsponsoredRefundProblem(unsponsored(false), { ...sellers, channelRef: refOf(0xc0, 9) }, seller.bech32, chain)) ?? "(none)", /spent or unknown/);
 });
 
 // ---- checkMutual: the consumer's own inputs besides the channel ----

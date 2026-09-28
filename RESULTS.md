@@ -1126,18 +1126,22 @@ the channel again with `recover`, and the refund runs on the record that comes b
   sponsor key, was −0.967504 and −1.236523: the fees of each run.
 
 **What the runs found, and what 0.2.2 changes.**
-- **A top-up right after another failed evaluation.** A second top-up built a second or two after
-  the first had settled failed, twice: in ada-agent-wallet's run, and in the first 0.2.2 run
-  before the evaluator change below. The message was "Script evaluation failed: Provider
-  evaluation failed: Blockfrost evaluateTx failed". Resumed later, the same step passed.
-  evolution-sdk 0.5.14 no longer hands a provider's evaluator the UTxOs the builder found, and
-  Blockfrost then resolves them from its own view of the chain, which can trail the block before.
-  0.2.2 passes them (`passAdditionalUtxos`) in every build that runs a script, as 0.5.13 did.
-  All six evaluations made with it on preprod passed: the second run's two top-ups, claim and
-  refund, and the first run's claim and refund. That run's second top-up came 8 s after the
-  first, not the second or two of the failures. So these runs show the change works, not that
-  the race is gone. `retryQueries` now also tries an evaluation again, a few seconds apart, when it failed
-  for any reason but a validator's refusal. `causeChain` gives what the SDK's message leaves out.
+- **A top-up right after another failed evaluation, and why is not known.** A second top-up
+  built a second or two after the first had settled failed twice: in ada-agent-wallet's run, and
+  in the first 0.2.2 run. The message was "Script evaluation failed: Provider evaluation failed:
+  Blockfrost evaluateTx failed". Resumed later, the same step passed.
+  - The first guess was that Blockfrost's evaluator trailed its index. evolution-sdk 0.5.14 no
+    longer hands a provider's evaluator the UTxOs the builder found, so Blockfrost resolves them
+    itself. 0.2.2 passes them again (`passAdditionalUtxos`) in every build that runs a script, as
+    0.5.13 did. All the evaluations made that way on preprod passed.
+  - A probe did not bear the guess out (`spike/x402/evalrace.ts`, below). Five times it built a
+    top-up 16 to 35 ms after Blockfrost listed the transaction before it, both ways, and every
+    evaluation passed, without the UTxOs too.
+  - So the change stays, since it costs nothing, and the cause of the two failures is open.
+    `retryQueries` tries an evaluation again, a few seconds apart, when it failed for any reason
+    but a validator's refusal. `causeChain` gives what the SDK's message leaves out.
+    ada-agent-wallet 0.2.6 records it with a `batch_error`, and the step-16 spike logs it, for the
+    next time.
 - **A channel claimed in full could not be claimed.** The first run's buyer had used the
   channel's whole capacity, 2 tUSDM of 2, when its second top-up failed. The claim's continuing
   output then held none of the token, and the SDK refuses an output with a zero quantity. It now
@@ -1148,8 +1152,32 @@ the channel again with `recover`, and the refund runs on the record that comes b
 - **The seller holds any refund to its reserve** (SPONSORSHIP.md section 3). Before 0.2.2 a
   refund that did not use the offer was not checked for it. A buyer refunding without the offer
   now has to pay the reserve back as well. A chain-free test covers it; no run refunded that way.
+- **`recover` through Koios.** `Chain.openingOf` has a Koios reader too. ada-agent-wallet's run
+  on 0.2.2 recovered a sponsored channel with signerd reading through Koios, and refunded it
+  sponsored (`470822ba54ce2c4118b8a8ca7ae55d83ed35a70438052b8601837e7c4eb394ea`; that
+  repository's README, "Verified").
 - Tests: 58 chain-free. Four are new: `reserveNotReturned`, `recover` on a sponsored and on an
-  unsponsored token channel, a value with no tokens, and more cases for the retry.
+  unsponsored token channel, a value with no tokens, and more cases for the retry. The seller's
+  rule for a refund it does not sponsor is its own function, `unsponsoredRefundProblem`, which
+  reads the channel from a chain; its test covers the channel's four cases.
+
+**The evaluator probe** (`npm run evalrace`, 2026-09-28): an ADA channel of account 3, provider
+account 1. Each round waited, polling every 200 ms, until Blockfrost listed the transaction
+before, then built the next top-up at once both ways, and sent the second.
+
+| Round | Built after the listing | Without the UTxOs | With them | Sent |
+|---:|---|---|---|---|
+| — | — | — | — | opening `1ad111f32d4966ce491e0e8bdfd394752c18bf63124fba6af1a20b7e5bde3cb3` |
+| 1 | 16 ms | passed | passed | `f4337206a45e6219a64c6dd2498c270bb1a8e25563a5e43c0c8d852c1cdc6a21` |
+| 2 | 35 ms | passed | passed | `a82d8e595d389a780e77e98ff42344e9fe45a72c845689271a17c71e85492a97` |
+| 3 | 22 ms | passed | passed | `979e5b7441e7e7fb447865cf4675363ba0fe11d773f6d84fe9f66b7f93e54bc7` |
+| 4 | 26 ms | passed | passed | `ea997ad0634c299ca58bf4a87d0343bb78d5dfc965428ee13264dfca3ed5b1a9` |
+| 5 | 16 ms | passed | passed | `54b60229bb7f7d595cfd738ee7c247e50d9dfdf057971d5c5adaaaa03de5aa0e` |
+
+A Mutual refund gave the channel's 2.5 tADA back to account 3
+(`2ac70a70f563b13157ecbb9a40bfaa4f7d319387cb0ef08c38bf6b0e0009b0b4`). The probe's top-ups are
+plain ADA-channel ones, built with the consumer's own change. The failures were sponsored token
+top-ups, three parties' UTxOs in one transaction, and the probe does not rule those out.
 
 ## What this does not show yet
 
@@ -1305,6 +1333,8 @@ npm run sponsored -- fund && npm run sponsored -- run && npm run sponsored -- ne
 STEP16_OUT=x402-step16-0.2.1 npm run sponsored -- fund && STEP16_OUT=x402-step16-0.2.1 npm run sponsored -- run
 # 0.2.2: the buyer loses its records after the claim and recovers the channel before the refund
 STEP16_OUT=x402-step16-0.2.2b npm run sponsored -- fund && STEP16_OUT=x402-step16-0.2.2b STEP16_RECOVER=1 npm run sponsored -- run
+# the evaluator probe: account 3 opens an ADA channel, tops it up five times, and refunds it
+npm run evalrace -- 5
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

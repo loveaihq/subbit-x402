@@ -1133,9 +1133,9 @@ export const SPONSORED_COLLATERAL = 1_000_000n;
 
 /**
  * For a build that runs a script: the evaluator gets the UTxOs the transaction spends and reads,
- * as the SDK found them, instead of looking them up in its provider's view of the chain. That view
- * trails the block before: on preprod a top-up built a second after another failed evaluation
- * there, twice, and passed once the view had caught up.
+ * as the SDK found them, as evolution-sdk 0.5.13 gave them, instead of looking them up in its
+ * provider's view of the chain. Kept against a view that trails the block before; a preprod probe
+ * did not catch Blockfrost's trailing (RESULTS.md, "Step 16 with 0.2.2").
  */
 export const WITH_OUR_UTXOS = { passAdditionalUtxos: true } as const;
 

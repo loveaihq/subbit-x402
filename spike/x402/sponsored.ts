@@ -12,7 +12,7 @@ import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
 import { SUBBIT_HASH, channelAddress, inlineDatum, newIouSigner, tagFromInput } from "../../src/subbit.ts";
 import { channelReserve, constantsOf, txHashOf } from "../../src/x402/cardano.ts";
-import { BlockfrostChain } from "../../src/x402/chain.ts";
+import { BlockfrostChain, causeChain } from "../../src/x402/chain.ts";
 import { BatchSettlementCardanoClient, FileClientStorage } from "../../src/x402/client.ts";
 import { BatchSettlementCardanoFacilitator } from "../../src/x402/facilitator.ts";
 import { ChannelManager } from "../../src/x402/manager.ts";
@@ -195,6 +195,16 @@ async function stack() {
 function buyer() {
   const storage = new FileClientStorage(dir("client"));
   const scheme = new BatchSettlementCardanoClient({ wallet: wallet(ACCOUNT.buyer), storage, chain, capacity: CAPACITY, maxDeposit: 5_000_000n, iouKeys: "derived" });
+  // A payload that fails says why all the way down, which the SDK's message and the fetch wrapper leave out.
+  const make = scheme.createPaymentPayload.bind(scheme);
+  scheme.createPaymentPayload = async (version, requirements) => {
+    try {
+      return await make(version, requirements);
+    } catch (e) {
+      log(`  the payment payload failed: ${causeChain(e).join(" | ").slice(0, 800)}`);
+      throw e;
+    }
+  };
   const client = x402Client.fromConfig({ schemes: [{ network: "cardano:*", client: scheme }], spendControls: false });
   return { storage, scheme, pay: wrapFetchWithPayment(fetch, client) };
 }
