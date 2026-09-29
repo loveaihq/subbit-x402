@@ -71,6 +71,8 @@ npm test            # 58 chain-free tests
 npm run typecheck
 npm run validator   # the validator's Aiken tests; needs aiken 1.1.23 or later
 ```
+Node 22 or newer. CI (`.github/workflows/ci.yml`) runs the tests and the typecheck on Linux, macOS
+and Windows, each on Node 22 and 24, and `aiken check` once.
 
 As a dependency, `npm i subbit-x402` (built, from npm) or a GitHub commit (which builds itself on
 install); it exports `subbit-x402/subbit` and `subbit-x402/x402/<module>` (`client`, `server`,
