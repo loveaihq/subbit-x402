@@ -136,3 +136,23 @@ and the seller's net ADA is minus the fees it paid. A buyer with ADA of its own 
 refunds the old way when no offer is made. Build-only negatives for the per-step rules of section 3
 are refused. Chain-free tests cover the rules, the relaxed `checkMutual`, and the facilitator's
 witness handling.
+
+## 6. After the Dijkstra hard fork (CIP-118)
+
+CIP-118's nested transactions (read on 2026-09-29, at `61b21c8` of cardano-foundation/CIPs; status
+Proposed; the Dijkstra hard fork is expected between December 2026 and March 2027) let a buyer sign
+a sub-transaction that is short of ADA, and leave its fee and min-UTxO to whoever wraps it in the
+top-level transaction. Which of the steps in section 1 that could sponsor turns on whether the step
+runs a script:
+
+| Step | Runs Subbit's validator (PlutusV3) | Sponsored by a nested transaction |
+|---|---|---|
+| open | no | possible: the buyer's opening as a sub-transaction, the seller paying the reserve and the fee in the top-level one |
+| top-up, refund, close, end, elapse | yes | no |
+
+A sub-transaction cannot run PlutusV3 or earlier scripts. A top-level transaction can, in the CIP's
+"special mode" for PlutusV1–V3, but then it "will have to balance out by itself", so no
+sub-transaction can pay its fee or put up its collateral. The steps that spend a channel therefore
+keep needing the seller's UTxO as an input of the same transaction, co-signed, as sections 2 and 3
+describe, unless Subbit's validator is rebuilt as PlutusV4: a new script hash, and its author's
+decision. cardano-x402-sponsor's DESIGN.md section 12 has the same reading for `exact`.
