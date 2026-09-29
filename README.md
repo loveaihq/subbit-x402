@@ -75,7 +75,7 @@ npm run validator   # the validator's Aiken tests; needs aiken 1.1.23 or later
 As a dependency, `npm i subbit-x402` (built, from npm) or a GitHub commit (which builds itself on
 install); it exports `subbit-x402/subbit` and `subbit-x402/x402/<module>` (`client`, `server`,
 `facilitator`, `manager`, `chain`, `koios`, `cardano`, `txcheck`, `types`, `claimtx`, `sponsor`). It takes the SDK's
-objects, a wallet among them, so use the `@evolution-sdk/evolution` version it pins (0.5.14).
+objects, a wallet among them, so use the `@evolution-sdk/evolution` version it pins (0.5.15).
 [ada-agent-wallet](https://github.com/loveaihq/ada-agent-wallet) uses the client that way: its
 signing daemon runs `BatchSettlementCardanoClient` with an `authorize` hook that puts every
 voucher and deposit through its spend policy. The chain is read through `BlockfrostChain`
