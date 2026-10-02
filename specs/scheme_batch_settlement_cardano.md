@@ -584,7 +584,7 @@ non-terminal `settlement_pending`.
 
 [loveaihq/subbit-x402](https://github.com/loveaihq/subbit-x402): `src/x402/` implements the client, resource-server and
 facilitator schemes for `@x402/core` 2.27.0 and the server's channel manager, on
-`@evolution-sdk/evolution` 0.5.14 and Blockfrost or Koios, with 58 chain-free tests, and 73 Aiken
+`@evolution-sdk/evolution` 0.5.15 and Blockfrost or Koios, with 58 chain-free tests, and 73 Aiken
 tests of the validator at the hash above.
 [`RESULTS.md`](https://github.com/loveaihq/subbit-x402/blob/main/RESULTS.md) records every preprod transaction: steps 1–3 exercise the validator,
 step 4 the ADA binding end to end, step 5 a token binding, step 6 top-ups and the automatic
