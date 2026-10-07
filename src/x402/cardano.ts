@@ -17,7 +17,7 @@ import {
   preview,
   type UTxO,
 } from "@evolution-sdk/evolution";
-import { SUBBIT_HASH, inlineDatum, iouVerifier, parseDatum, type Constants, type Currency, type ParsedDatum, type Stage } from "../subbit.ts";
+import { SUBBIT_HASH, inlineDatum, iouVerifier, parseDatum, validatorByHash, type Constants, type Currency, type ParsedDatum, type Sponsor, type Stage, type Validator } from "../subbit.ts";
 import { Err, LOVELACE, NETWORKS, type CardanoNetwork, type ChannelConfig, type ChannelState } from "./types.ts";
 
 export function networkIdOf(network: string): number {
@@ -52,7 +52,7 @@ export function assetOf(c: Currency): string {
   return c.kind === "ada" ? LOVELACE : `${c.policy}.${c.name}`;
 }
 
-export function constantsOf(config: ChannelConfig, tag: string): Constants {
+export function constantsOf(config: ChannelConfig, tag: string, sponsor?: Sponsor): Constants {
   return {
     tag,
     currency: currencyOf(config.token),
@@ -60,7 +60,17 @@ export function constantsOf(config: ChannelConfig, tag: string): Constants {
     consumer: config.payer,
     provider: config.receiverAuthorizer,
     closePeriodMs: BigInt(config.withdrawDelay) * 1000n,
+    ...(sponsor ? { sponsor } : {}),
   };
+}
+
+/** Whether two bech32 strings are one address, compared by its bytes (stake part included). False for one that does not parse. */
+export function sameAddress(a: string, b: string): boolean {
+  try {
+    return Address.toHex(Address.fromBech32(a)) === Address.toHex(Address.fromBech32(b));
+  } catch {
+    return false;
+  }
 }
 
 /** Where a config's fields sit in the datum. Returns the first mismatch, if any. */
@@ -74,7 +84,24 @@ export function datumBindingError(d: ParsedDatum, config: ChannelConfig, channel
   if (c.iouKey !== config.payerAuthorizer || c.consumer !== config.payer) return Err.channelConfig;
   if (c.provider !== config.receiverAuthorizer) return Err.receiverAuthorizerMismatch;
   if (c.closePeriodMs !== BigInt(config.withdrawDelay) * 1000n) return Err.withdrawDelayMismatch;
+  // A sponsored channel repays its reserve to its sponsor: the receiver, whose ADA it is.
+  if (c.sponsor && !sameAddress(c.sponsor.address, config.receiver)) return Err.receiverMismatch;
   return undefined;
+}
+
+/** The validator a channel address belongs to, by its payment credential; throws when this package does not know it. */
+export function validatorOfAddress(address: Address.Address): Validator {
+  const pay = address.paymentCredential;
+  const v = pay instanceof ScriptHash.ScriptHash ? validatorByHash(ScriptHash.toHex(pay)) : undefined;
+  if (!v) throw new Error("not the address of a validator this package knows");
+  return v;
+}
+
+/** The validator a channel as read belongs to: the one its datum names, which `readChannel` has checked is the one its address pays to. */
+export function validatorOf(ch: Pick<ChannelView, "datum">): Validator {
+  const v = validatorByHash(ch.datum.ownHash);
+  if (!v) throw new Error("not a channel of a validator this package knows");
+  return v;
 }
 
 /** A channel UTxO as the binding sees it. */
@@ -110,11 +137,13 @@ export const onlyCurrency = (assets: Assets.Assets, c: Currency) => Assets.getUn
 export function readChannel(u: UTxO.UTxO, scriptHash: string): ChannelView | { error: string } {
   const pay = u.address.paymentCredential;
   if (!(pay instanceof ScriptHash.ScriptHash) || ScriptHash.toHex(pay) !== scriptHash) return { error: "not at the channel script" };
+  const v = validatorByHash(scriptHash);
+  if (!v) return { error: "not a validator this package knows" };
   if (u.scriptRef) return { error: "channel output carries a reference script" };
   if (!(u.datumOption instanceof InlineDatum.InlineDatum)) return { error: "channel datum is not inline" };
   let datum: ParsedDatum;
   try {
-    datum = parseDatum(u.datumOption.data);
+    datum = parseDatum(u.datumOption.data, v, u.address.networkId);
   } catch (e) {
     return { error: `channel datum: ${(e as Error).message}` };
   }
@@ -129,6 +158,8 @@ export function readChannel(u: UTxO.UTxO, scriptHash: string): ChannelView | { e
  * datum, holding its currency, and sized with every integer at its widest CBOR form so the
  * figure never falls short when `subbed`, `elapse_at` or the value grow. An ADA channel keeps it
  * back from what IOUs may reach; a token channel carries exactly this much ADA beside its tokens.
+ * The datum is that of the validator at `address`, a sponsor included: its floor is an integer
+ * too, so the reserve of a sponsored channel depends on it (`sponsoredChannel`).
  */
 export function channelReserve(address: Address.Address, constants: Constants, coinsPerUtxoByte: bigint): bigint {
   const wide = 2n ** 63n;
@@ -136,9 +167,28 @@ export function channelReserve(address: Address.Address, constants: Constants, c
   const out = new TxOut.TransactionOutput({
     address,
     assets: c.kind === "ada" ? Assets.fromLovelace(wide) : Assets.fromHexStrings(c.policy, c.name, wide, wide),
-    datumOption: inlineDatum(constants, { kind: "closed", subbed: wide, elapseAt: wide }),
+    datumOption: inlineDatum(constants, { kind: "closed", subbed: wide, elapseAt: wide }, validatorOfAddress(address)),
   });
   return coinsPerUtxoByte * (160n + BigInt(TxOut.toCBORBytes(out).length));
+}
+
+/**
+ * The constants of a token channel at the sponsored validator whose sponsor is `sponsor`, with the
+ * floor set to the channel's whole reserve, and that reserve. The floor is the lovelace the
+ * channel holds, and its CBOR size is part of the datum, which sizes the reserve: so the floor is
+ * raised to the reserve it implies until the two agree. The reserve only grows with the floor and
+ * is bounded, so this ends within a few rounds, at the least such figure.
+ */
+export function sponsoredChannel(address: Address.Address, constants: Constants, sponsor: string, coinsPerUtxoByte: bigint): { constants: Constants; reserve: bigint } {
+  if (constants.currency.kind === "ada") throw new Error("only token channels are sponsored (R0)");
+  let floor = 0n;
+  for (let round = 0; round < 8; round++) {
+    const sponsored = { ...constants, sponsor: { address: sponsor, floor } };
+    const reserve = channelReserve(address, sponsored, coinsPerUtxoByte);
+    if (reserve === floor) return { constants: sponsored, reserve };
+    floor = reserve;
+  }
+  throw new Error("the sponsored channel's reserve does not settle");
 }
 
 /** How many of a wallet's token UTxOs one transaction folds into one. */

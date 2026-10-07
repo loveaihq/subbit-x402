@@ -7,7 +7,8 @@
 // so this is custody, not an authorisation: the server trusts the facilitator with its revenue.
 import { TransactionWitnessSet } from "@evolution-sdk/evolution";
 import type { PaymentPayload, PaymentRequirements, SchemeNetworkFacilitator, SettleResponse, VerifyResponse } from "@x402/core/types";
-import { Address, Data, KeyHash, Transaction, TransactionHash } from "@evolution-sdk/evolution";
+import { Address, Data, KeyHash, ScriptHash, Transaction, TransactionHash, type UTxO } from "@evolution-sdk/evolution";
+import { UPSTREAM, validatorByHash, type Validator } from "../subbit.ts";
 import { capacityOf, channelStateOf, datumBindingError, readChannel, txHashOf, verifyVoucherSignature, type ChannelView } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
 import { buildClaimTx, compareRefs, type ClaimLine } from "./claimtx.ts";
@@ -33,8 +34,14 @@ import {
 } from "./types.ts";
 
 export interface FacilitatorOptions {
-  /** The Subbit validator this facilitator serves. */
-  scriptHash: string;
+  /** The Subbit validator this facilitator serves, by script hash; one of `validators`' too, when both are given. */
+  scriptHash?: string;
+  /**
+   * Every validator it serves: it refuses a payment whose `extra.scriptHash` is another. The
+   * default is upstream's alone (or `scriptHash`, when that is given). The sponsored variant
+   * (`SPONSORED`) is unaudited, so it is served only when named here or in `scriptHash`.
+   */
+  validators?: readonly Validator[];
   /** How long `/settle` waits for a transaction to reach a block before answering `settlement_pending`. */
   confirmationTimeoutMs?: number;
   /** Provider keys servers have delegated to this facilitator, one per server. */
@@ -64,11 +71,17 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
   private readonly pending = new Map<string, Verified>();
   /** Delegated keys by the `payTo` they serve, and the inputs each one's claims just spent. */
   private readonly delegates = new Map<string, { d: Delegate; spent: Map<string, number> }>();
+  /** The validators it serves, by script hash. */
+  private readonly served: ReadonlyMap<string, Validator>;
 
   constructor(
     private readonly chain: Chain,
     private readonly options: FacilitatorOptions,
   ) {
+    const named = options.scriptHash === undefined ? undefined : validatorByHash(options.scriptHash);
+    if (options.scriptHash !== undefined && !named) throw new Error(`script ${options.scriptHash} is not a validator this package knows`);
+    const served = [...(options.validators ?? []), ...(named ? [named] : [])];
+    this.served = new Map((served.length ? served : [UPSTREAM]).map((v) => [v.hash, v]));
     for (const d of options.delegates ?? []) {
       if (this.delegates.has(d.payTo)) throw new Error(`two delegated keys for ${d.payTo}`);
       this.delegates.set(d.payTo, { d, spent: new Map() });
@@ -140,7 +153,7 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
       const p = parseClientPayload(paymentPayload.payload);
       payer = p.channelConfig.payer;
       const extra = parseExtra(requirements);
-      if (extra.scriptHash !== this.options.scriptHash) return bad(Err.extra, `this facilitator serves script ${this.options.scriptHash}`, payer);
+      if (!this.served.has(extra.scriptHash)) return bad(Err.extra, `this facilitator serves script ${[...this.served.keys()].join(", ")}`, payer);
       const bind = configBindingError(p.channelConfig, requirements, extra);
       if (bind) return bad(bind, "channel config does not match the payment requirements", payer);
       switch (p.type) {
@@ -198,7 +211,7 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     if (p.voucher.channelRef) return this.checkTopUp(p, req, extra);
     const cpb = await this.chain.coinsPerUtxoByte();
     const hex = fromBase64(p.deposit.transaction);
-    const d = checkDeposit(hex, req.network, p.channelConfig, p.voucher.channelId, extra.scriptHash, BigInt(p.deposit.amount), cpb);
+    const d = checkDeposit(hex, req.network, p.channelConfig, p.voucher.channelId, extra.scriptHash, BigInt(p.deposit.amount), cpb, req.payTo);
     // Every input must exist and be unspent, and every key-locked one signed for, but for a fee
     // sponsor's, which the seller signs at settlement.
     const resolved = [];
@@ -361,6 +374,23 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     return `the transaction uses the offered ${s.offer.input} without the seller's witness`;
   }
 
+  /** A UTxO read as a channel of whichever validator it is at, if this facilitator serves that one. */
+  private readServed(u: UTxO.UTxO): ChannelView | { error: string } {
+    const pay = u.address.paymentCredential;
+    const hash = pay instanceof ScriptHash.ScriptHash ? ScriptHash.toHex(pay) : undefined;
+    if (!hash || !this.served.has(hash)) return { error: "not at a validator this facilitator serves" };
+    return readChannel(u, hash);
+  }
+
+  /** The channel with this tag, followed from a position of it, at whichever served validator it is. */
+  private async follow(ref: string, tag: string): Promise<ChannelView | undefined> {
+    for (const hash of this.served.keys()) {
+      const v = await this.chain.followChannel(ref, hash, tag);
+      if (v) return v;
+    }
+    return undefined;
+  }
+
   // ---- settlement ---------------------------------------------------------------
 
   /** Broadcasts once, then waits for a block; a timeout is `settlement_pending`, and a retry only waits again. */
@@ -439,7 +469,6 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     if (p.transaction === undefined) return this.settleDelegatedClaim(p, paymentPayload.payload, req);
     const hex = fromBase64(p.transaction);
     const tx = decodeTx(hex, Err.claimTransaction);
-    const scriptHash = this.options.scriptHash;
     const refs = sortedInputRefs(tx);
     const redeemers = spendRedeemers(tx);
     const mutual = Data.toCBORHex(Data.constr(2n, []));
@@ -447,7 +476,7 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     for (let i = 0; i < refs.length; i++) {
       const u = await this.chain.getUnspent(refs[i]!);
       if (!u) return { success: false, errorReason: Err.claimTransaction, errorMessage: `input ${refs[i]} is spent or unknown`, transaction: "", network: req.network };
-      const ch = readChannel(u, scriptHash);
+      const ch = this.readServed(u);
       if ("error" in ch) continue;
       channels++;
       const r = redeemers.get(i);
@@ -477,7 +506,7 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     if (!checkDelegationMac(held.d.secret, req.payTo, raw)) return failed(Err.claimTransaction, "claim not authenticated by the server whose key this facilitator holds");
     const lines: ClaimLine[] = [];
     for (const c of p.claims) {
-      const v = await this.chain.followChannel(c.channelRef!, this.options.scriptHash, c.channelId);
+      const v = await this.follow(c.channelRef!, c.channelId);
       if (!v) return failed(Err.channelNotFound, `channel ${c.channelId.slice(0, 16)}… not found`);
       if (v.datum.constants.provider !== held.d.keyHash) return failed(Err.claimTransaction, `channel ${c.channelId.slice(0, 16)}… is not this server's`);
       const stage = v.datum.stage;

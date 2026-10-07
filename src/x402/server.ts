@@ -25,8 +25,8 @@ import type {
 } from "@x402/core/types";
 import { decodePaymentSignatureHeader } from "@x402/core/http";
 import { Assets, InlineDatum, KeyHash, Transaction, TransactionHash, TransactionWitnessSet, type Address } from "@evolution-sdk/evolution";
-import { parseDatum } from "../subbit.ts";
-import { channelReserve, currencyOf, isChannelOutput, msOfSlot, txHashOf, verifyVoucherSignature } from "./cardano.ts";
+import { parseDatum, validatorByHash, type Validator } from "../subbit.ts";
+import { channelReserve, currencyOf, isChannelOutput, msOfSlot, networkIdOf, txHashOf, verifyVoucherSignature } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
 import {
   CAPABILITY_KEY,
@@ -166,6 +166,11 @@ export interface ServerConfig {
   payTo: string;
   /** Provider key hash: the datum's `provider`, the key that signs every redemption. */
   receiverAuthorizer: string;
+  /**
+   * The validator its channels live at: Subbit's (`UPSTREAM.hash`), or the sponsor-safe variant's
+   * (`SPONSORED.hash`), which is unaudited. It goes into every 402 as `extra.scriptHash`, and a
+   * client that does not trust it refuses the 402.
+   */
   scriptHash: string;
   referenceScript?: string;
   withdrawDelay?: number;
@@ -252,8 +257,13 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   /** The facilitator merges fee-sponsor witnesses, so offers may go out. */
   private sponsorCapable = false;
   private lastPoolRefresh = 0;
+  /** The validator it serves. */
+  private readonly validator: Validator;
 
   constructor(private readonly config: ServerConfig) {
+    const validator = validatorByHash(config.scriptHash);
+    if (!validator) throw new Error(`script ${config.scriptHash} is not a validator this package knows`);
+    this.validator = validator;
     this.withdrawDelay = config.withdrawDelay ?? MIN_WITHDRAW_DELAY;
     this.replayTtlMs = config.replayTtlMs ?? 10 * 60_000;
     this.storage = config.storage ?? new InMemoryChannelStorage();
@@ -721,7 +731,7 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
       const tx = decodeTx(hex, Err.depositTransaction);
       const out = tx.body.outputs.find((o) => isChannelOutput(o.address, this.config.scriptHash));
       if (!out || !(out.datumOption instanceof InlineDatum.InlineDatum)) return { abort: true as const, reason: "fee_sponsor_S4", message: "no channel output" };
-      const reserve = channelReserve(out.address, parseDatum(out.datumOption.data).constants, await this.config.chain.coinsPerUtxoByte());
+      const reserve = channelReserve(out.address, parseDatum(out.datumOption.data, this.validator, networkIdOf(req.network)).constants, await this.config.chain.coinsPerUtxoByte());
       r = await checkSponsoredOpen({ ...base, scriptHash: this.config.scriptHash, reserve });
     } else {
       r = await checkSponsoredTopUp(base);

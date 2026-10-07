@@ -6,3 +6,5 @@ out/
 keys/
 vendor/subbit/aiken/build/
 vendor/subbit/aiken/plutus.json
+variant/sponsored/aiken/build/
+variant/sponsored/aiken/plutus.json

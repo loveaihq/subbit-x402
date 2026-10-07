@@ -1,6 +1,7 @@
 # Seller-sponsored channels: design
 
-**Status: step 16 passed on preprod on 2026-09-28 (RESULTS.md step 16). Preprod only.** 0.2.0's
+**Status: step 16 passed on preprod on 2026-09-28 (RESULTS.md step 16), and section 7's variant on
+2026-10-07 (step 17). Preprod only.** 0.2.0's
 client trusted the offer's fields; from 0.2.1 it reads the offered UTxO from the chain first
 (section 3, "What the buyer checks"). This brings the fee sponsorship of
 [cardano-x402-sponsor](https://github.com/loveaihq/cardano-x402-sponsor) (seller-sponsored fees for
@@ -156,3 +157,70 @@ sub-transaction can pay its fee or put up its collateral. The steps that spend a
 keep needing the seller's UTxO as an input of the same transaction, co-signed, as sections 2 and 3
 describe, unless Subbit's validator is rebuilt as PlutusV4: a new script hash, and its author's
 decision. cardano-x402-sponsor's DESIGN.md section 12 has the same reading for `exact`.
+
+## 7. The sponsor-safe variant
+
+**Status: the TypeScript side is built and tested without a chain, its transactions pass the compiled
+variant when that is run locally (`aiken tx simulate`, in `test/variant.test.ts`), and the whole of it
+ran on preprod on 2026-10-07 (RESULTS.md, step 17). The validator has had no audit. Opt-in, preprod
+only.**
+
+With upstream's validator the reserve is the buyer's to keep when it exits alone (the last row of
+section 2's table). [`variant/sponsored/`](variant/sponsored/DESIGN.md) is a fork of Subbit's
+validator (spend hash `20b64ee2…`; upstream's is `62ce4309…`) that sends it back. Its datum has a
+seventh constant, `sponsor: Option<(Address, floor)>`, and a sponsored channel must keep `floor`
+lovelace in every continuing output (R1), repay the sponsor at least `floor` when it ends (R2), and,
+when it holds none of its currency, be ended by its provider (R3).
+
+| | Upstream's validator | The variant |
+|---|---|---|
+| The 402's `extra.scriptHash` | `62ce4309…` | `20b64ee2…`. The client must be told to trust it (`trustedValidators: [UPSTREAM, SPONSORED]`), the facilitator to serve it (`validators`), the server to name it (`scriptHash: SPONSORED.hash`) |
+| Opening on the seller's offer | six constants | seven, with `sponsor = (payTo, floor)` and `floor` the channel's whole reserve. The client writes it; the facilitator and the seller each refuse an opening that does not |
+| Opening the buyer pays for | as before | `sponsor = None` |
+| A token channel's reserve | 2.13 tADA | 2.53 tADA for a base-address `payTo`, 2.36 for an enterprise one: the datum carries the address and the floor |
+| Top-up, claim, close | as before | as before, and each builder checks that the continuing output holds `floor` before it signs |
+| Mutual refund | as before | as before: it skips the validator's rules, both keys sign, and the seller's refund checks are unchanged |
+| The buyer's Elapse, or End | all the channel's ADA to the buyer | `floor` of it to `payTo` first, with the channel input's output reference as the output's inline datum: the client adds it and checks it |
+| End of a channel that a settle left empty | – | the server ends it as provider and gets the floor back, less its fee |
+
+**Exposure.** With `floor` = the reserve, a buyer's solo exit sends the whole reserve back, so what
+the seller loses per sponsored channel is about the opening's fee (0.19 tADA in the step 16 runs,
+0.194233 at the variant in step 17).
+Section 2's last row becomes: buyer − its own exit costs, seller − the open fee. What it does not
+remove is abandonment: a channel whose buyer never acts, or that a settle leaves holding a few
+tokens (only its buyer may End one that is not empty), keeps the floor in the channel until a mutual
+refund or the buyer's exit, and the seller's only limits on that are the size of its pool and the
+`minDeposit` it asks.
+
+**What a solo exit costs the buyer.** The channel's ADA no longer pays for it, and none of it comes
+back. The buyer pays its own fee (0.37 to 0.39 tADA at the variant on preprod, in step 17, with the validator
+attached to the transaction; 0.19 to 0.35 in the earlier runs) and needs ADA beside it, for
+the collateral (one ADA-only UTxO of 2 tADA, or two of 1.5, which come back) and for the min-ADA of the
+output the tokens return in (1.18 tADA, which stays its own). A buyer with none cannot exit alone, as
+with upstream's validator, and the client says so before it builds anything. A settled channel that
+holds none of its currency is not the buyer's to End at all (R3): it has nothing to take there, and
+nothing to pay.
+
+**The server's End.** `ChannelManager.claim` tries it once, after a settle that leaves a channel at
+the variant empty with `payTo` as its sponsor: it builds the End (`buildEndTx`), signs as provider,
+pays the fee out of its own ADA and takes the floor at `payTo`. A failed End is reported in the
+claim's row (`endError`) and `endEmpty` tries it again; `endEmptySponsored: false` turns it off.
+Not yet: a closed channel that nothing was owed on, which needs a settle of nothing first, and a
+server whose facilitator holds its key. A repayment is an output with an inline datum, so what lands
+at `payTo` is a UTxO that carries one: it spends like any other at a key address.
+
+**A pool for it** offers UTxOs of 4 tADA or more. A sponsored opening's change goes to `payTo` and
+must clear min-UTxO after the larger reserve: with the pool's default smallest offer, 3.5 tADA, it
+does not for a base-address `payTo`.
+
+**Run on preprod** (RESULTS.md, step 17, 2026-10-07): four sponsored channels at the variant, each opened
+on the seller's offer, with the validator attached to each transaction. A stablecoin-only buyer's open,
+top-up, claim and refund moved its ADA by nothing and the seller's net ADA by minus its fees, to the
+lovelace. A buyer that closed alone was settled and ended its channel itself (R2, 0.6 tUSDM back); a buyer
+whose server did not settle elapsed (R2, all of its 1.0 tUSDM back); and the server ended the channel its
+settle had emptied (R3). Each of the three exits repaid `payTo` 2.529970 tADA, the floor, with the channel
+input's output reference as the datum, and the seller's net ADA in each channel was minus its fees to the
+lovelace: the opening's 0.194233 tADA alone, for the buyer that left alone and was never settled. 21
+changed versions of those transactions, each breaking R1, R2 or R3 (no repayment, a lovelace short, the
+channel's tag for the reference, a Close at the floor less a lovelace, a provider's End of a channel that
+held tokens, among them), were refused by Blockfrost's evaluator, against 13 unchanged ones that it took.

@@ -19,7 +19,7 @@ import type {
 } from "@x402/core/types";
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
 import { Address, Assets, Client, InlineDatum, KeyHash, ScriptHash, Transaction, TransactionHash, TransactionInput, TransactionWitnessSet, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
-import { Redeemer, Step, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, subbitScript, tagFromInput, type Currency } from "../subbit.ts";
+import { Redeemer, Step, UPSTREAM, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, parseDatum, tagFromInput, type Currency, type Validator } from "../subbit.ts";
 import {
   amountIn,
   assetOf,
@@ -27,21 +27,26 @@ import {
   channelReserve,
   constantsOf,
   currencyOf,
+  isChannelOutput,
   keyHashOfAddress,
   msOfSlot,
   networkIdOf,
   onlyCurrency,
   planTokens,
   refOf,
+  sameAddress,
   slotAtOrAfter,
   slotOfMs,
+  sponsoredChannel,
   subbedOf,
   txHashOf,
+  validatorOf,
   valueFor,
   verifyVoucherSignature,
   type ChannelView,
 } from "./cardano.ts";
 import { retryQueries, type Chain, type Opening } from "./chain.ts";
+import { assertKeepsFloor, assertRepays, repaymentOutput } from "./repay.ts";
 import { offerIn, offerOnChainProblem, offerProblem, type FeeSponsorOffer } from "./sponsor.ts";
 import {
   Err,
@@ -209,6 +214,13 @@ export interface ClientOptions {
    * such a channel, once its record is lost, can only be closed.
    */
   iouKeys?: "derived" | "random";
+  /**
+   * The validators this client trusts a channel with: it opens, tops up and pays only at a
+   * `scriptHash` among them, and refuses a 402 that names any other (spec: Client verification
+   * rules). The default is Subbit's own. The sponsor-safe variant (`SPONSORED`) is unaudited, so it
+   * is trusted only when named here.
+   */
+  trustedValidators?: readonly Validator[];
 }
 
 /** How long spent inputs are held back from coin selection (`spentInputs` entries expire after it). */
@@ -237,8 +249,13 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   private root?: Promise<Uint8Array>;
   /** This client's own top-ups, until the chain shows them: where each spent its channel from, and when. */
   private readonly topUps = new Map<string, { from: string; tx: string; at: number }>();
+  /** The validators it trusts, by script hash. */
+  private readonly trusted: ReadonlyMap<string, Validator>;
 
   constructor(private readonly o: ClientOptions) {
+    const trusted = o.trustedValidators ?? [UPSTREAM];
+    if (trusted.length === 0) throw new Error("trustedValidators is empty: this client would trust no validator");
+    this.trusted = new Map(trusted.map((v) => [v.hash, v]));
     this.spent = o.spentInputs ?? new Map<string, number>();
     this.ownOutputs = o.ownOutputs ?? new Map<string, OwnOutput>();
     this.schemeHooks = {
@@ -253,9 +270,17 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     };
   }
 
+  /** The trusted validator with this script hash; throws for any other, which is the server's to name and not the client's to take on its word. */
+  private validatorFor(scriptHash: string): Validator {
+    const v = this.trusted.get(scriptHash.toLowerCase());
+    if (!v) throw new Error(`server asks for a validator this client does not trust: ${scriptHash} (it trusts ${[...this.trusted.keys()].join(", ")})`);
+    return v;
+  }
+
   async createPaymentPayload(x402Version: number, req: PaymentRequirements): Promise<PaymentPayloadResult> {
     currencyOf(req.asset); // lovelace or policy.name, else throws
     const extra = parseExtra(req);
+    this.validatorFor(extra.scriptHash); // before any voucher, top-up or opening
     const amount = BigInt(req.amount);
     let ch = (await this.o.storage.current(serverKey(req, extra))) ?? (await this.bindRecovered(req, extra));
     if (ch?.status === "pending") ch = await this.settlePending(ch, extra);
@@ -322,15 +347,18 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const adaOnly = all.filter((u) => Assets.hasOnlyLovelace(u.assets));
     const c = view.datum.constants.currency;
     const fundable = c.kind === "ada" ? adaOnly.reduce((s, u) => s + Assets.lovelaceOf(u.assets), 0n) - TOP_UP_HEADROOM : tokensHeld(all, c);
+    const v = validatorOf(view);
+    const floor = view.datum.constants.sponsor?.floor;
     const { built: sb, amount: add } = await firstThatBuilds(topUpAmounts(want, short, fundable), async (add) => {
       let tx = w.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.add()]) });
-      tx = await this.withValidator(tx, extra.referenceScript);
+      tx = await this.withValidator(tx, v, extra.referenceScript);
       if (c.kind !== "ada") tx = withTokens(tx, me, c, planTokens(all, c, add, 0n));
       tx = tx
         .payToAddress({ address: view.address, assets: valueFor(c, view.amount + add, view.lovelace), datum: view.utxo.datumOption as InlineDatum.InlineDatum })
         .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
       const built = await retryQueries("top-up", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly), ...WITH_OUR_UTXOS }));
       await assertLeavesCollateral(built, adaOnly, me, `a top-up of ${add}`);
+      assertKeepsFloor(await built.toTransaction(), v.hash, [floor]); // R1
       return built;
     });
     const signed = await signedHex(sb);
@@ -366,9 +394,9 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     return view;
   }
 
-  private async withValidator(tx: ReturnType<SeedWallet["newTx"]>, referenceScript?: string) {
+  private async withValidator(tx: ReturnType<SeedWallet["newTx"]>, v: Validator, referenceScript?: string) {
     const ref = referenceScript ? await this.o.chain.getUnspent(referenceScript) : undefined;
-    return ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
+    return ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: v.script });
   }
 
   /**
@@ -432,9 +460,10 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       token: req.asset,
       withdrawDelay: extra.withdrawDelay,
     };
+    // At the sponsored validator too, a channel the buyer pays for names no sponsor: its reserve is the buyer's.
+    const v = this.validatorFor(extra.scriptHash);
     const constants = constantsOf(config, tag);
-    const address = channelAddress(networkIdOf(req.network));
-    if (ScriptHash.toHex(address.paymentCredential as ScriptHash.ScriptHash) !== extra.scriptHash) throw new Error("server asks for a validator this client does not have");
+    const address = channelAddress(networkIdOf(req.network), undefined, v);
     const cpb = (await w.getProtocolParameters()).coinsPerUtxoByte;
     const reserve = channelReserve(address, constants, cpb);
     // An ADA channel holds its capacity plus the reserve; a token channel holds its capacity in
@@ -446,7 +475,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const tx = (plan ? withTokens(w.newTx(), me, cur, plan) : w.newTx().collectFrom({ inputs: [seed] })).payToAddress({
       address,
       assets: valueFor(constants.currency, deposit, reserve),
-      datum: inlineDatum(constants, { kind: "opened", subbed: 0n }),
+      datum: inlineDatum(constants, { kind: "opened", subbed: 0n }, v),
     });
     const sb = await retryQueries("open", () => tx.build({ changeAddress: me, availableUtxos: adaOnly }));
     await assertLeavesCollateral(sb, adaOnly, me, `an opening of ${deposit}`);
@@ -566,6 +595,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const req = pr.accepts.find((a) => a.scheme === SCHEME);
     if (!req) throw new Error(`no ${SCHEME} option in this 402`);
     const extra = parseExtra(req);
+    this.validatorFor(extra.scriptHash);
     let ch = channelId ? await this.o.storage.get(channelId) : ((await this.o.storage.current(serverKey(req, extra))) ?? (await this.bindRecovered(req, extra)));
     if (ch && ch.status === "open" && this.bindable(ch, req, extra)) ch = await this.bind(ch, req, extra);
     if (!ch || ch.status !== "open" || !ch.channelRef || ch.serverKey !== serverKey(req, extra)) throw new Error("no open channel with this server");
@@ -596,8 +626,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       .collectFrom({ inputs: [channelUtxo], redeemer: Redeemer.mutual() })
       .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) })
       .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.receiverAuthorizer) });
-    const ref = extra.referenceScript ? await this.o.chain.getUnspent(extra.referenceScript) : undefined;
-    tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
+    tx = await this.withValidator(tx, validatorOf(view), extra.referenceScript);
     if (owed > 0n) tx = tx.payToAddress({ address: payTo, assets: Assets.fromLovelace(owed) });
     const adaOnly = (await this.available()).filter((u) => Assets.hasOnlyLovelace(u.assets));
     const sb = await retryQueries("refund", () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly), ...WITH_OUR_UTXOS }));
@@ -665,21 +694,33 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     const random = this.o.iouKeys === "random";
     const signer = random ? newIouSigner() : derivedIouSigner(await this.iouRoot(), req.network, tag);
     const config: ChannelConfig = { payer, payerAuthorizer: signer.publicKey, receiver: req.payTo, receiverAuthorizer: extra.receiverAuthorizer, token: req.asset, withdrawDelay: extra.withdrawDelay };
-    const constants = constantsOf(config, tag);
-    const address = channelAddress(networkIdOf(req.network));
-    if (ScriptHash.toHex(address.paymentCredential as ScriptHash.ScriptHash) !== extra.scriptHash) throw new Error("server asks for a validator this client does not have");
-    const reserve = channelReserve(address, constants, (await w.getProtocolParameters()).coinsPerUtxoByte);
+    const v = this.validatorFor(extra.scriptHash);
+    const address = channelAddress(networkIdOf(req.network), undefined, v);
+    const cpb = (await w.getProtocolParameters()).coinsPerUtxoByte;
+    // At the sponsored validator the datum names the seller, who pays the reserve, as sponsor: the
+    // reserve goes back to `payTo` when the buyer exits alone, and the floor is that whole reserve.
+    // Upstream's datum has no such constant, and the seller bears the reserve if the buyer exits alone.
+    const plain = constantsOf(config, tag);
+    const { constants, reserve } = v.sponsored ? sponsoredChannel(address, plain, req.payTo, cpb) : { constants: plain, reserve: channelReserve(address, plain, cpb) };
     const own = plan.inputs.reduce((sum, u) => sum + Assets.lovelaceOf(u.assets), 0n);
     const back = plan.rest > 0n ? Assets.fromHexStrings(cur.policy, cur.name, plan.rest, own) : Assets.fromLovelace(own);
     const tx = w
       .newTx()
       .collectFrom({ inputs: [...plan.inputs, utxo] })
       .payToAddress({ address: me, assets: back })
-      .payToAddress({ address, assets: valueFor(cur, tokens, reserve), datum: inlineDatum(constants, { kind: "opened", subbed: 0n }) })
+      .payToAddress({ address, assets: valueFor(cur, tokens, reserve), datum: inlineDatum(constants, { kind: "opened", subbed: 0n }, v) })
       .setValidity({ to: this.sponsoredTtl(req, offer) });
     const sb = await retryQueries("sponsored open", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [] }));
     const built = await sb.toTransaction();
     if (built.body.fee > BigInt(offer.maxFee)) throw new Error(`the opening's fee ${built.body.fee} exceeds the offer's maxFee ${offer.maxFee}`);
+    if (v.sponsored) {
+      // What protects the seller's ADA: the datum as it will be on chain names payTo, with the channel's whole ADA as the floor.
+      const channel = built.body.outputs.find((o) => isChannelOutput(o.address, v.hash));
+      const named = channel?.datumOption instanceof InlineDatum.InlineDatum ? parseDatum(channel.datumOption.data, v, networkIdOf(req.network)).constants.sponsor : undefined;
+      if (!channel || !named || !sameAddress(named.address, req.payTo) || named.floor !== Assets.lovelaceOf(channel.assets)) {
+        throw new Error("the sponsored opening does not name payTo as the sponsor, with the channel's whole ADA as the floor");
+      }
+    }
     const mine = built.body.outputs.filter((o) => Address.toBech32(o.address) === Address.toBech32(me));
     if (mine.length !== 1 || Assets.lovelaceOf(mine[0]!.assets) !== own) throw new Error("the sponsored opening does not return exactly the wallet's own lovelace");
     const signed = await signedHex(sb);
@@ -727,11 +768,12 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     if (c.kind === "ada") throw new Error("only token channels are sponsored");
     const want = this.depositFor(req, extra, amount, this.maxDepositFor(req));
     const all = await this.available();
+    const v = validatorOf(view);
     const { built: sb, amount: add } = await firstThatBuilds(topUpAmounts(want, short, tokensHeld(all, c)), async (add) => {
       const plan = planTokens(all, c, add, 0n);
       const own = plan.inputs.reduce((sum, u) => sum + Assets.lovelaceOf(u.assets), 0n);
       let tx = w.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.add()]) });
-      tx = await this.withValidator(tx, extra.referenceScript);
+      tx = await this.withValidator(tx, v, extra.referenceScript);
       tx = tx
         .collectFrom({ inputs: [...plan.inputs, sponsorUtxo] })
         .payToAddress({ address: me, assets: plan.rest > 0n ? Assets.fromHexStrings(c.policy, c.name, plan.rest, own) : Assets.fromLovelace(own) })
@@ -740,9 +782,11 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
         .setValidity({ to: this.sponsoredTtl(req, offer) });
       return retryQueries("sponsored top-up", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [sponsorUtxo], setCollateral: SPONSORED_COLLATERAL, ...WITH_OUR_UTXOS }));
     });
-    const body = (await sb.toTransaction()).body;
+    const unsigned = await sb.toTransaction();
+    const body = unsigned.body;
     if (body.fee > BigInt(offer.maxFee)) throw new Error(`the top-up's fee ${body.fee} exceeds the offer's maxFee ${offer.maxFee}`);
     if (!onlyCollateral(body, offer)) throw new Error("the builder put up collateral other than the offer");
+    assertKeepsFloor(unsigned, v.hash, [view.datum.constants.sponsor?.floor]); // R1
     const signed = await signedHex(sb);
     const ceiling = BigInt(ch.chargedCumulativeAmount) + amount;
     await this.o.authorize?.({ kind: "topUp", channel: ch, amount: ceiling, deposit: add, transaction: signed, view, requirements: req, sponsored: true });
@@ -781,8 +825,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
       .collectFrom({ inputs: [own] })
       .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) })
       .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.receiverAuthorizer) });
-    const ref = extra.referenceScript ? await this.o.chain.getUnspent(extra.referenceScript) : undefined;
-    tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
+    tx = await this.withValidator(tx, validatorOf(view), extra.referenceScript);
     tx = tx.payToAddress({ address: me, assets: home }).setValidity({ to: this.sponsoredTtl(req, offer) });
     const sb = await retryQueries("sponsored refund", () => tx.build({ changeAddress: Address.fromBech32(req.payTo), availableUtxos: [utxo], setCollateral: SPONSORED_COLLATERAL, ...WITH_OUR_UTXOS }));
     const built = await sb.toTransaction();
@@ -834,28 +877,43 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     if (view.datum.stage.kind !== "opened") throw new Error(`channel is ${view.datum.stage.kind}`);
     const to = msOfSlot(network, slotOfMs(network, BigInt(Date.now())) + 300n);
     const elapseAt = to + view.datum.constants.closePeriodMs;
+    const v = validatorOf(view);
     let tx = this.o.wallet.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.close()]) });
-    tx = await this.withValidator(tx, ch.referenceScript);
+    tx = await this.withValidator(tx, v, ch.referenceScript);
+    // The channel's whole value stays, a sponsored channel's floor with it (R1).
     tx = tx
-      .payToAddress({ address: view.address, assets: view.utxo.assets, datum: inlineDatum(view.datum.constants, { kind: "closed", subbed: view.datum.stage.subbed, elapseAt }) })
+      .payToAddress({ address: view.address, assets: view.utxo.assets, datum: inlineDatum(view.datum.constants, { kind: "closed", subbed: view.datum.stage.subbed, elapseAt }, v) })
       .addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) })
       .setValidity({ to });
-    const transaction = await this.submitOwn("close", tx, ch, view);
+    const floor = view.datum.constants.sponsor?.floor;
+    const transaction = await this.submitOwn("close", tx, ch, view, (t) => assertKeepsFloor(t, v.hash, [floor]));
     await this.o.storage.set({ ...ch, status: "closing", elapseAt: elapseAt.toString() });
     return { transaction, elapseAt };
   }
 
-  /** After the server has settled a channel this client closed: `Main([End])`, everything left comes back. */
+  /**
+   * After the server has settled a channel this client closed: `Main([End])`, everything left
+   * comes back. A sponsored channel's End also repays its sponsor, out of the channel's ADA (R2),
+   * so this wallet's own ADA pays its fee and collateral and the min-ADA of the tokens that come
+   * back. One that holds none of its currency is for the provider to end (R3), not this wallet.
+   */
   async end(channelId: string): Promise<string> {
     const { ch, view } = await this.openView(channelId);
     if (view.datum.stage.kind !== "settled") throw new Error(`channel is ${view.datum.stage.kind}, not settled`);
+    const v = validatorOf(view);
+    const sponsor = view.datum.constants.sponsor;
+    if (sponsor && view.amount === 0n) {
+      throw new Error(`channel ${channelId.slice(0, 16)}… holds none of its currency, so R3 leaves its End to the provider, who signs it and gets the sponsor's ${sponsor.floor} lovelace back; this wallet has nothing to take from it`);
+    }
+    await this.fundedExit("end", view);
     let tx = this.o.wallet.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.end()]) });
-    tx = await this.withValidator(tx, ch.referenceScript);
+    tx = await this.withValidator(tx, v, ch.referenceScript);
     tx = tx.addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) });
+    if (sponsor) tx = tx.payToAddress(repaymentOutput(sponsor, view.ref));
     // The tokens coming back go out in one output with the wallet's older ones, not as a new UTxO of their own.
     const c = view.datum.constants.currency;
     if (c.kind !== "ada") tx = withTokens(tx, await this.o.wallet.address(), c, planTokens(await this.available(), c, 0n, view.amount));
-    const transaction = await this.submitOwn("end", tx, ch, view);
+    const transaction = await this.submitOwn("end", tx, ch, view, sponsor ? (t) => assertRepays(t, view.ref, sponsor) : undefined);
     await this.o.storage.set({ ...ch, status: "closed" });
     return transaction;
   }
@@ -865,23 +923,32 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
    * without it. The lower validity bound is the first slot starting at or after `elapse_at`; a
    * node refuses the transaction until the chain has reached that slot, so this waits for it —
    * or, with `wait: false`, refuses with "not yet", for a caller holding a lock while it runs.
-   * Either way the decision rests on the same read of the channel as the transaction does.
+   * Either way the decision rests on the same read of the channel as the transaction does. A
+   * sponsored channel's Elapse also repays its sponsor, out of the channel's ADA (R2), as `end` does.
    */
   async elapse(channelId: string, opts: { wait?: boolean } = {}): Promise<string> {
     const { ch, view, network } = await this.openView(channelId);
     const stage = view.datum.stage;
     if (stage.kind !== "closed") throw new Error(`channel is ${stage.kind}, not closed`);
     const from = slotAtOrAfter(network, stage.elapseAt);
+    // A sponsored channel's wallet is looked at once: before this sleeps for its time (a wallet that
+    // cannot pay would wait for nothing), but not for an elapse that only says it is too early.
+    let funded = false;
     for (let tip = await this.o.chain.tipSlot(); tip < from; tip = await this.o.chain.tipSlot()) {
       if (opts.wait === false) throw new Error(`not yet: the channel's elapse_at is ${new Date(Number(stage.elapseAt)).toISOString()}`);
+      if (!funded) await this.fundedExit("elapse", view);
+      funded = true;
       await new Promise((r) => setTimeout(r, Math.min(60_000, Number(from - tip) * 1_000 + 5_000)));
     }
+    if (!funded) await this.fundedExit("elapse", view);
+    const sponsor = view.datum.constants.sponsor;
     let tx = this.o.wallet.newTx().collectFrom({ inputs: [view.utxo], redeemer: Redeemer.main([Step.elapse()]) });
-    tx = await this.withValidator(tx, ch.referenceScript);
+    tx = await this.withValidator(tx, validatorOf(view), ch.referenceScript);
     tx = tx.addSigner({ keyHash: KeyHash.fromHex(ch.channelConfig.payer) }).setValidity({ from: msOfSlot(network, from) });
+    if (sponsor) tx = tx.payToAddress(repaymentOutput(sponsor, view.ref));
     const c = view.datum.constants.currency;
     if (c.kind !== "ada") tx = withTokens(tx, await this.o.wallet.address(), c, planTokens(await this.available(), c, 0n, view.amount));
-    const transaction = await this.submitOwn("elapse", tx, ch, view);
+    const transaction = await this.submitOwn("elapse", tx, ch, view, sponsor ? (t) => assertRepays(t, view.ref, sponsor) : undefined);
     await this.o.storage.set({ ...ch, status: "closed" });
     return transaction;
   }
@@ -895,12 +962,21 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
    * comes back through the corrective 402, which adopts only a count the server proves with a
    * voucher of this key. Any other channel is exit-only: `close`, then `end` once the server has
    * settled, or `elapse` after `elapse_at`. Only the address without a stake credential is
-   * searched: that is where this client opens channels.
+   * searched: that is where this client opens channels. With no `scriptHash` it searches every
+   * validator it trusts; with one, only that validator, which it must trust.
    */
-  async recover(network: string, scriptHash: string): Promise<ClientChannel[]> {
+  async recover(network: string, scriptHash?: string): Promise<ClientChannel[]> {
+    const validators = scriptHash === undefined ? [...this.trusted.values()] : [this.validatorFor(scriptHash)];
     const me = keyHash(await this.o.wallet.address());
     const known = new Set((await this.o.storage.list()).map((c) => c.channelId));
     const cpb = await this.o.chain.coinsPerUtxoByte();
+    const found: ClientChannel[] = [];
+    for (const validator of validators) found.push(...(await this.recoverAt(validator.hash, network, me, known, cpb)));
+    return found;
+  }
+
+  /** `recover` at one validator. */
+  private async recoverAt(scriptHash: string, network: string, me: string, known: Set<string>, cpb: bigint): Promise<ClientChannel[]> {
     const found: ClientChannel[] = [];
     for (const seen of await this.o.chain.channels(scriptHash)) {
       const d = seen.datum.constants;
@@ -1020,12 +1096,24 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
     return { ch, view, network: ch.network };
   }
 
-  /** Builds, signs and submits a transaction of this client's own, and waits for a block. */
-  private async submitOwn(what: "close" | "end" | "elapse", tx: ReturnType<SeedWallet["newTx"]>, ch: ClientChannel, view: ChannelView): Promise<string> {
+  /**
+   * A sponsored channel's solo exit repays the sponsor out of the channel's ADA, so the wallet's own
+   * pays what the channel's would have: fail before building, and say so, when it cannot.
+   */
+  private async fundedExit(what: "end" | "elapse", view: ChannelView): Promise<void> {
+    if (view.datum.constants.sponsor) assertExitFunds(what, (await this.available()).filter((u) => Assets.hasOnlyLovelace(u.assets)), view);
+  }
+
+  /**
+   * Builds, signs and submits a transaction of this client's own, and waits for a block. `check`
+   * sees the transaction as it will go out, and throws to stop it before `authorize` or the chain does.
+   */
+  private async submitOwn(what: "close" | "end" | "elapse", tx: ReturnType<SeedWallet["newTx"]>, ch: ClientChannel, view: ChannelView, check?: (built: Transaction.Transaction) => void): Promise<string> {
     const adaOnly = (await this.available()).filter((u) => Assets.hasOnlyLovelace(u.assets));
     const me = await this.o.wallet.address();
     const sb = await retryQueries(what, () => tx.build({ changeAddress: me, availableUtxos: adaOnly, setCollateral: collateralTarget(adaOnly), ...WITH_OUR_UTXOS }));
     const hex = await signedHex(sb);
+    check?.(Transaction.fromCBORHex(hex));
     await this.o.authorize?.({ kind: what, channel: ch, transaction: hex, view });
     this.recordOwn(hex, me);
     const txHash = await this.o.chain.submit(hex);
@@ -1149,6 +1237,37 @@ interface Sponsorship {
 function onlyCollateral(body: Transaction.Transaction["body"], offer: FeeSponsorOffer): boolean {
   const refs = (body.collateralInputs ?? []).map((i) => `${TransactionHash.toHex(i.transactionId)}#${Number(i.index)}`);
   return refs.length === 1 && refs[0] === offer.input;
+}
+
+/**
+ * About what a solo exit costs besides the collateral, from the preprod runs (RESULTS.md, steps 11,
+ * 16 and 17): a fee of 0.19 to 0.39 ADA (the top with the validator attached rather than read from
+ * a reference script), and 1.18 ADA for the output of the tokens that come back.
+ */
+export const EXIT_FEE_ADA = 400_000n;
+export const EXIT_TOKEN_OUTPUT_ADA = 1_200_000n;
+
+/**
+ * The wallet's side of a sponsored channel's solo exit (End, Elapse): the sponsor takes its floor
+ * out of the channel's ADA, so the fee, the collateral and the min-ADA of the tokens that come back
+ * are paid from `adaOnly`, the wallet's ADA-only UTxOs. Throws, naming what is missing, when they
+ * cannot be: before anything is built, and before Elapse waits for its time. An exit of a channel
+ * nobody sponsors is not checked here: its own ADA pays for it.
+ */
+export function assertExitFunds(what: "end" | "elapse", adaOnly: UTxO.UTxO[], view: ChannelView): void {
+  const sponsor = view.datum.constants.sponsor;
+  if (!sponsor) return;
+  const tokens = view.amount > 0n;
+  const why = `a solo ${what} of a sponsored channel repays its sponsor ${sponsor.floor} lovelace out of the channel, so the fee, ${tokens ? "the min-ADA of the tokens that come back, " : ""}and the collateral are this wallet's own to pay`;
+  const held = adaOnly.reduce((sum, u) => sum + Assets.lovelaceOf(u.assets), 0n);
+  const need = EXIT_FEE_ADA + (tokens ? EXIT_TOKEN_OUTPUT_ADA : 0n);
+  if (adaOnly.length === 0) throw new Error(`${why}, and it holds no ADA-only UTxO`);
+  if (held < need) throw new Error(`${why}: about ${need} lovelace beside the collateral, and it holds ${held}`);
+  try {
+    collateralTarget(adaOnly);
+  } catch (e) {
+    throw new Error(`${why}, and it has none to put up: ${(e as Error).message}`);
+  }
 }
 
 /** How much of a token currency the UTxOs `planTokens` would draw on hold. */

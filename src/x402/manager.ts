@@ -9,9 +9,9 @@
 // that it paid `payTo` everything it redeemed.
 import type { FacilitatorClient } from "@x402/core/server";
 import type { PaymentRequirements } from "@x402/core/types";
-import { subbedOf, type ChannelView } from "./cardano.ts";
+import { sameAddress, subbedOf, type ChannelView } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
-import { buildClaimTx, compareRefs, type ClaimLine, type ClaimRow } from "./claimtx.ts";
+import { buildClaimTx, buildEndTx, compareRefs, type ClaimLine, type ClaimRow } from "./claimtx.ts";
 import type { SeedWallet } from "./client.ts";
 import type { ChannelStorage, ServerChannel } from "./server.ts";
 import { LOVELACE, SCHEME, delegationMac, toBase64, type CardanoNetwork } from "./types.ts";
@@ -32,6 +32,13 @@ export interface ManagerOptions {
   payTo: string;
   scriptHash: string;
   referenceScript?: string;
+  /**
+   * Whether `claim` ends a sponsored channel its settle leaves empty, as provider (R3), to bring the
+   * sponsor's floor back. Default true. Only for a channel at the sponsored validator whose sponsor
+   * is this server's `payTo` and whose provider is this server's key, and only with the provider's
+   * own wallet.
+   */
+  endEmptySponsored?: boolean;
 }
 
 export interface ClaimResult {
@@ -113,6 +120,8 @@ export class ChannelManager {
           // deep enough in the chain to stay: the record holds the voucher should the settle roll back.
           if (now && now.datum.stage.kind !== "settled") throw new Error(`channel ${c.channelId.slice(0, 16)}… is ${now.datum.stage.kind} after its settle`);
           if (now) await this.o.storage.updateChannel(c.channelId, (cur) => (cur ? { ...cur, channelRef: now.ref, onchainSyncedAt: Date.now() } : cur));
+          // R3: a sponsored channel this settle left empty is the provider's to end, which brings the floor back.
+          if (now && this.o.endEmptySponsored !== false && this.endsOwn(now)) await this.endAfterSettle(now, rows[j]!);
           continue;
         }
         if (!now || now.datum.stage.kind === "settled") throw new Error(`channel ${c.channelId.slice(0, 16)}… not found after the claim`);
@@ -139,6 +148,51 @@ export class ChannelManager {
     });
     for (const [unit, amount] of owed) {
       if ((paid.get(unit) ?? 0n) < amount) throw new Error(`the facilitator's claim ${txHash} paid ${paid.get(unit) ?? 0n} ${unit} to payTo, having redeemed ${amount}`);
+    }
+  }
+
+  /**
+   * Whether this manager ends `v` itself: a settled channel of the sponsored validator that holds
+   * none of its currency, whose provider is this server's key and whose sponsor is its `payTo`, with
+   * the provider's wallet to pay for it. An End of such a channel is for the provider to sign (R3):
+   * its consumer has nothing to take from it, so it never will. The delegating facilitator builds no
+   * Ends yet.
+   */
+  endsOwn(v: ChannelView): boolean {
+    const sponsor = v.datum.constants.sponsor;
+    return (
+      this.o.wallet !== undefined &&
+      sponsor !== undefined &&
+      v.datum.stage.kind === "settled" &&
+      v.amount === 0n &&
+      v.datum.constants.provider === this.o.providerKeyHash &&
+      sameAddress(sponsor.address, this.o.payTo)
+    );
+  }
+
+  /**
+   * Ends a settled sponsored channel that holds none of its currency, as its provider (R3): the
+   * channel's ADA goes back to the sponsor (R2), which is this server's `payTo`, and the provider's
+   * own ADA pays the fee, so the server nets the floor less that fee. Submits through the chain
+   * itself, as a consumer's own exit does, and waits for a block; returns the transaction's id.
+   * `claim` calls this once for each such channel its settle leaves; call it again for one whose
+   * End failed, with the channel as `chain.followChannel` reads it now.
+   */
+  async endEmpty(v: ChannelView): Promise<string> {
+    if (!this.o.wallet) throw new Error("the facilitator holds the provider key: it builds no Ends");
+    const b = { wallet: this.o.wallet, providerKeyHash: this.o.providerKeyHash, chain: this.o.chain, payTo: this.o.payTo, payout: "own" as const, spent: this.spent };
+    const hex = await buildEndTx(this.o.referenceScript ? { ...b, referenceScript: this.o.referenceScript } : b, v);
+    const txHash = await this.o.chain.submit(hex);
+    if (!(await this.o.chain.awaitTx(txHash, 300_000))) throw new Error(`End ${txHash} not in a block after 5 minutes`);
+    return txHash;
+  }
+
+  /** An End the settle that just landed makes possible: it is tried once, and a failure is the row's, not the claim's. */
+  private async endAfterSettle(v: ChannelView, row: ClaimRow): Promise<void> {
+    try {
+      row.ended = await this.endEmpty(v);
+    } catch (e) {
+      row.endError = (e as Error).message;
     }
   }
 

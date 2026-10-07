@@ -32,7 +32,10 @@
   "files": [
     "dist",
     "vendor/subbit/plutus.json",
-    "vendor/subbit/PROVENANCE.md"
+    "vendor/subbit/PROVENANCE.md",
+    "variant/sponsored/plutus.json",
+    "variant/sponsored/PROVENANCE.md",
+    "variant/sponsored/DESIGN.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -42,10 +45,12 @@
     "refscript": "tsx spike/refscript.ts",
     "x402": "tsx spike/x402/e2e.ts",
     "sponsored": "tsx spike/x402/sponsored.ts",
+    "variant": "tsx spike/x402/variant.ts",
     "evalrace": "tsx spike/x402/evalrace.ts",
     "mint": "tsx spike/mint.ts",
     "test": "node --test --import tsx test/*.test.ts",
     "validator": "aiken check vendor/subbit/aiken",
+    "validator:sponsored": "aiken check variant/sponsored/aiken",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "engines": {

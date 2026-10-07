@@ -28,6 +28,7 @@ Its source is here too, with tests of our own at the exact hash this code uses (
 | [`DESIGN.md`](DESIGN.md) | the design and its decisions |
 | [`SPONSORSHIP.md`](SPONSORSHIP.md) | seller-sponsored channels: the seller's offer pays a token channel's fees and reserve |
 | `vendor/subbit/` | Subbit's Aiken blueprint and its source, unmodified, with our tests of the validator in `aiken/lib/mark/` ([provenance](vendor/subbit/PROVENANCE.md)) |
+| `variant/sponsored/` | an opt-in fork of that validator that sends a seller's reserve back to it when a buyer exits alone: unaudited, run on preprod (RESULTS.md step 17), trusted only when named ([DESIGN.md](variant/sponsored/DESIGN.md), [SPONSORSHIP.md](SPONSORSHIP.md) section 7) |
 
 ## What ran on preprod
 
@@ -67,7 +68,7 @@ its transactions has one signer.
 
 ```
 npm install
-npm test            # 58 chain-free tests
+npm test            # 106 chain-free tests; 6 of them run the compiled validators and need aiken on the PATH
 npm run typecheck
 npm run validator   # the validator's Aiken tests; needs aiken 1.1.23 or later
 ```
@@ -76,7 +77,7 @@ and Windows, each on Node 22 and 24, and `aiken check` once.
 
 As a dependency, `npm i subbit-x402` (built, from npm) or a GitHub commit (which builds itself on
 install); it exports `subbit-x402/subbit` and `subbit-x402/x402/<module>` (`client`, `server`,
-`facilitator`, `manager`, `chain`, `koios`, `cardano`, `txcheck`, `types`, `claimtx`, `sponsor`). It takes the SDK's
+`facilitator`, `manager`, `chain`, `koios`, `cardano`, `txcheck`, `types`, `claimtx`, `sponsor`, `repay`). It takes the SDK's
 objects, a wallet among them, so use the `@evolution-sdk/evolution` version it pins (0.5.15).
 [ada-agent-wallet](https://github.com/loveaihq/ada-agent-wallet) uses the client that way: its
 signing daemon runs `BatchSettlementCardanoClient` with an `authorize` hook that puts every

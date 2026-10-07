@@ -7,7 +7,8 @@ for this is the `batch-settlement` scheme, which exists for EVM and in draft for
 Cardano. This spike checks whether Subbit.xyz channels can carry it.
 
 Validator: `subbit.subbit.spend` from kompact-io/subbit-xyz @ 66648db, unmodified
-(`vendor/subbit/PROVENANCE.md`). Wallets: the public all-`abandon` test mnemonic, account 0 as
+(`vendor/subbit/PROVENANCE.md`); step 17 runs this repository's sponsor-safe variant of it instead
+(`variant/sponsored/`). Wallets: the public all-`abandon` test mnemonic, account 0 as
 consumer, account 1 as provider. Every figure below was read back from Blockfrost, not taken
 from the transaction builder.
 
@@ -1179,12 +1180,212 @@ A Mutual refund gave the channel's 2.5 tADA back to account 3
 plain ADA-channel ones, built with the consumer's own change. The failures were sponsored token
 top-ups, three parties' UTxOs in one transaction, and the probe does not rule those out.
 
+## Step 17: the sponsor-safe variant on preprod
+
+The variant ([variant/sponsored/](variant/sponsored/DESIGN.md), spend hash
+`20b64ee22a509c164e0e16ad1189b12be7f0a497b0eb096180c923ea`) had only run locally until now: Aiken's
+tests, and `aiken tx simulate` on the transactions the binding builds. Here it runs on a chain. Four
+token channels at its address, each opened on the seller's offer, each ended another way:
+
+- **A, cooperative.** A buyer that holds only tUSDM and its min-ada: open, 12 requests with one top-up
+  at the 11th, the server's claim, the sponsored `Mutual` refund.
+- **B1, R3.** A buyer with ADA of its own spends its whole deposit (10 requests) and Closes alone. The
+  server settles it, which leaves the channel empty, and Ends it as provider.
+- **B2, Elapse.** A buyer spends part (5 requests) and Closes alone. The server never looks at this
+  channel again, so nothing settles it. After `elapse_at` the buyer Elapses.
+- **B3, the consumer's End.** A buyer spends part (4 requests) and Closes. The server settles what it was
+  owed, and the buyer Ends what is left.
+
+Every exit repays `payTo` (R2). Then each rule is tried against Blockfrost's evaluator: a transaction
+this binding built, with one thing changed, never submitted. `npm run variant -- fund | run | report |
+sweep`, state in `out/x402-step17/`, 2026-10-07.
+
+**Setup.**
+- The stack is step 16's with the validator swapped: the clients trust `SPONSORED` alone
+  (`trustedValidators`), the facilitator serves it alone (`validators`), the server names it in every 402
+  (`scriptHash`). The validator, 3,798 bytes, is attached to each transaction that spends a channel: no
+  reference script was deployed for it, so those transactions are 4.4 to 5.0 KB.
+- Seller, provider and `payTo`: account 1. Sponsor key: account 4, 8 offers of 4 tADA from the seller, in
+  `5c3db781adf9a6f2613dbdd839984af95410f245a2ac529bb61ba9d903d07c8d`. Four tADA and not the pool's
+  default smallest offer of 3.5, since a base-address `payTo`'s change must clear min-UTxO after the
+  variant's larger reserve (SPONSORSHIP.md section 7). The pool's `maxFee` was 0.6 tADA; the most it paid
+  was 0.397278.
+- Buyers. A is account 8, which holds 40.5 tUSDM and exactly its min-ada, 1.176630 tADA, in one UTxO:
+  no ADA-only UTxO (checked first). B1, B2 and B3 are accounts 5, 7 and 2, each given 5 tADA by account 1
+  and account 2 also 5 tUSDM with its min-ada, in
+  `0bd3bb15cac3597549e2a4afb8dc48721518ff3a4b7c3b8b25b63bc24b9ee4ad`. Accounts 5 and 7 already held 14.99
+  and 19 tUSDM, each in one UTxO with its min-ada.
+- Price 0.1 tUSDM, 1 tUSDM a deposit, close period 900 s, the shortest the binding allows.
+- Each opening's datum, read back from the chain, names `payTo` whole (stake part included) as `sponsor`
+  with `floor` 2,529,970 lovelace, which is all the ADA the channel holds: 2.529970 tADA is the reserve at
+  the variant for a base-address `payTo`, 2.13 at upstream's validator.
+
+**The run.** `Request to 200` is the buyer's wait for the request that made the transaction. Units are
+the redeemer's memory / steps, as the landed transaction carries them.
+
+| Step | Transaction | Block | Size | Fee (tADA) | Paid by | Units | Request to 200 |
+|---|---|---|---|---|---|---|---|
+| B2 open, request 1 | `0ccf17a4a44fc771d0f86e21f940bc4b5f1418026148057b5d5849f2f0781266` | 5262222 | 882 B | 0.194233 | seller's offer `5c3d…#0` | — | 38.1 s |
+| B2 close | `70dee7a4dabe18a306ab7d9f40724b78cee52fa19ae9c5e155b694463b5c60a0` | 5262225 | 4,693 B | 0.386701 | the buyer's own ADA | 297,024 / 106,022,228 | — |
+| B3 open, request 1 | `ddbb3c56209fedf49a776696d20ecfdc07d843ef9b3933691c1d7ec56b51caea` | 5262227 | 882 B | 0.194233 | seller's offer `5c3d…#5` | — | 41.4 s |
+| B3 close | `bd95d51c1e8b4c2550236b266857d601d1a6e5ce067b628ac1696a567edb2088` | 5262229 | 4,693 B | 0.386701 | the buyer's own ADA | 297,024 / 106,022,228 | — |
+| B1 open, request 1 | `b9c0ea9d6c63693b179667586bb6d8e610a332efa4724ba51fb67b787c748791` | 5262231 | 882 B | 0.194233 | seller's offer `5c3d…#2` | — | 19.7 s |
+| B1 close | `7ff227445be3852ddef9bd6df3e4ab95681f9a99d51ac714218a78a080534b92` | 5262232 | 4,693 B | 0.386701 | the buyer's own ADA | 297,024 / 106,022,228 | — |
+| B3 settle (0.4 tUSDM) | `1bc0b7683f4626a8c18f92201d331718b2ff394c0c6091ddd03e3aaeaa65a47c` | 5262235 | 4,968 B | 0.403921 | the seller | 307,985 / 168,276,255 | — |
+| B1 settle (1.0 tUSDM, all) | `6734485bc0e020a81e4fd5435b402d12bf5b440b3c0e86c16617b0ea8abe0cb5` | 5262238 | 4,956 B | 0.403239 | the seller | 304,793 / 168,682,545 | — |
+| B1 End, by the provider | `21366a6d543ff44e195b1f92ba0441e21086a2e090f95442c7902c6281360a9e` | 5262239 | 4,425 B | 0.366988 | the seller | 203,702 / 70,846,309 | — |
+| A open, request 1 | `a48e17c38784bf5c4cc4164962bd4649e413e8f3d654195a2a1c8b87c94892a2` | 5262240 | 882 B | 0.194233 | seller's offer `5c3d…#1` | — | 36.4 s |
+| A top-up, request 11 | `e23bd39cc92c0786a1046e6f43b6c36895472ef6a67d8ae13f49d8eaddaa500e` | 5262245 | 4,934 B | 0.397278 | seller's offer `5c3d…#7` | 293,814 / 108,224,535 | 46.3 s |
+| A claim (1.2 tUSDM) | `9f895c5c0dc6ecd52356ce837369ba9de0e20f0046035737aa59c9d4bfdb46d6` | 5262248 | 4,938 B | 0.402328 | the seller | 304,304 / 167,424,199 | — |
+| A refund | `2fa5596fd1d5dea93327bb882d90dbd744843d7bd9121b1befb49ca50ab71fa8` | 5262249 | 4,620 B | 0.364441 | the channel's ADA, the seller's | 68,086 / 25,054,574 | 34.4 s |
+| B3 End, by the buyer (0.6 tUSDM left) | `beba736789b6031c61d1d1080f8afa1ee91370dad2da4d53c49b96018113fca9` | 5262251 | 4,574 B | 0.374732 | the buyer's own ADA | 217,185 / 76,537,594 | — |
+| B2 Elapse, by the buyer | `208640344e766bf1938314ff6ef9e6645a1143e3e61d16ab62500bff6187ac61` | 5262279 | 4,544 B | 0.372013 | the buyer's own ADA | 199,360 / 71,395,185 | — |
+
+- The other 26 requests (A's 10, B1's 9, B2's 4, B3's 3) were vouchers, answered with no chain.
+- The sponsor key's UTxOs `5c3d…#0` to `#7`: five were spent, by the four openings and A's top-up. `#4`,
+  the refund's collateral, was not.
+- A close sets `elapse_at` to the time of the call, plus its validity window of 300 s, plus the 900 s of
+  the close period: 23:21:06 (B2), 23:22:22 (B3) and 23:24:10 UTC (B1), 18.6 to 19.6 minutes after the
+  closes landed. The server settled B3 and B1 well inside that, within about 2 minutes of their closes.
+  B2's Elapse was in a block by 23:21:52, 46 s after its `elapse_at`.
+- B1's End was made inside the server's `claim`, after its Settle landed and before the call returned
+  (73 s in all), with no call of the operator's: the transaction R3 exists for. The buyer has nothing to
+  take from an empty channel, so nothing but the provider's End brings the floor back.
+
+**What each exit paid `payTo`, read back from Blockfrost.** In all three the output is at `payTo`
+whole, 2,529,970 lovelace (the floor, exactly), with the inline datum `d8799f5820` + the channel input's
+transaction id + its output index + `ff`, and that is the reference of the channel input the same
+transaction spends:
+
+| Exit | Channel input it spends | The buyer got back | Required signer, and witness |
+|---|---|---|---|
+| B1 End, by the provider | `6734485b…0cb5#0`, the Settle's output | 0: the channel held no tUSDM | account 1, the provider |
+| B3 End, by the buyer | `1bc0b768…a47c#0`, the Settle's output | 0.6 tUSDM, what the server had not taken | account 2, the buyer |
+| B2 Elapse, by the buyer | `70dee7a4…60a0#0`, the Close's output | 1.0 tUSDM, all of it | account 7, the buyer |
+
+**Reconciliation, per scenario, over its transactions** (each is the sum over the addresses of what
+the transactions spent and made, read from Blockfrost; the channel script nets 0 in all four):
+
+| | Buyer's tADA | Buyer's tUSDM | Seller's tADA (`payTo` + sponsor key) | Seller's tUSDM | The seller's fees |
+|---|---|---|---|---|---|
+| A | **±0** | −1.2 | **−1.358280** | +1.2 | open 0.194233, top-up 0.397278, claim 0.402328, refund 0.364441 |
+| B1 | −0.386701 | −1.0 | **−0.964460** | +1.0 | open 0.194233, settle 0.403239, End 0.366988 |
+| B2 | −0.758714 | 0 | **−0.194233** | 0 | open 0.194233 |
+| B3 | −0.761433 | −0.4 | **−0.598154** | +0.4 | open 0.194233, settle 0.403921 |
+
+- **The seller's net ADA is minus the fees it paid, to the lovelace, in all four.** The reserve it put
+  into each channel, 2.529970 tADA, came back to `payTo` at the exit: at the End in B1 and B3, at the
+  Elapse in B2, and in A at the refund, less that refund's fee, which the channel's ADA pays.
+- **The buyer's ADA is ±0 in A, and minus its own fees, to the lovelace, in the others**: B1 its Close,
+  B2 its Close and its Elapse (0.386701 + 0.372013), B3 its Close and its End (0.386701 + 0.374732). The
+  1.176630 tADA of the output the tokens came home in is in the buyer's wallet, so it is not a cost.
+- B2 is what exiting alone costs the seller at the variant: the opening's fee, 0.194233 tADA, and nothing
+  else. Its server had charged 5 requests, 0.5 tUSDM, settled none, and the buyer's Elapse took the whole
+  1.0 tUSDM back: an unwatched server loses what it charged.
+
+**Per account.** The `before` is after the funding.
+
+| Account | Before the run | After the run | After the sweep |
+|---|---|---|---|
+| 0, token funder | 4.762052 tADA, 905.458 tUSDM | the same | the same |
+| 1, seller | 9,960.167438 tADA, 14.102 tUSDM | 9,977.052311, 16.702 | 10,005.870074, 54.292 |
+| 4, sponsor key | 32.000000 (8 UTxOs) | 12.000000 (3) | 0 |
+| 8, buyer A | 1.176630, 40.5 tUSDM | 1.176630, 39.3 | the same |
+| 5, buyer B1 | 6.176630, 14.99 tUSDM | 5.789929, 13.99 | 0 |
+| 7, buyer B2 | 6.176630, 19 tUSDM | 5.417916, 19 | 0 |
+| 2, buyer B3 | 7.216764, 5 tUSDM | 6.455331, 4.6 | 0 |
+
+Account 1 began at 10,008.719202 tADA and 19.102 tUSDM. The six accounts together (not account 0)
+hold 6.242522 tADA less than at the start, and that is the fees to the lovelace: funding 0.375134, the
+scenarios 5.021975 (the seller's 3.115127, the buyers' 1.906848), the sweep 0.845413.
+
+**Fees and units against the local runs.** The first column is `test/variant.test.ts` run with
+`VARIANT_UNITS=1`, `aiken tx simulate` on the transactions the builders make from fixtures. The second
+is the redeemer of the landed transaction, which for the four the run evaluated first (the Close, the Elapse
+and the two Ends) is exactly what Blockfrost's evaluator returned for it. The ledger's limits are 14,000,000 and 10,000,000,000; the
+largest landed here is 307,985 and 168,682,545, 2.2% and 1.7% of them.
+
+| Step | Local run (memory / steps) | Landed (memory / steps) | Change |
+|---|---|---|---|
+| Close | 297,024 / 106,022,228 | 297,024 / 106,022,228 | none |
+| Add (top-up) | 293,814 / 108,224,535 | 293,814 / 108,224,535 | none |
+| Settle | 292,755 / 161,863,704 | 304,793 / 168,682,545 (B1), 307,985 / 168,276,255 (B3) | +4.1%, +4.2% / +5.2%, +4.0% |
+| Sub (a claim of one channel) | not run alone | 304,304 / 167,424,199 | |
+| Elapse | 193,341 / 67,992,931 | 199,360 / 71,395,185 | +3.1%, +5.0% |
+| End, by the consumer | 211,565 / 73,071,960 | 217,185 / 76,537,594 | +2.7%, +4.7% |
+| End, by the provider | 204,101 / 70,782,929 | 203,702 / 70,846,309 | −0.2%, +0.1% |
+| Mutual, sponsored | 71,980 / 27,632,051 | 68,086 / 25,054,574 | −5.4%, −9.3% |
+
+Close and Add are exact. The others differ, by up to 5% more memory and 9% fewer steps: a fixture's
+transaction is not the real one, with its addresses, hashes, inputs and outputs. Fees: an opening is
+0.194233 tADA at 882 B, against step 16's 0.190185 at 790 B, 92 bytes more at 44 lovelace a byte, most of
+them the datum's sponsor. The transactions that run the validator are 0.364 to 0.404 tADA with it
+attached, against 0.244 to 0.269 for upstream's, read from a reference script, in step 16.
+
+**Evaluated, never submitted.** Each case is a transaction the binding built (a buyer's through its
+`authorize` hook, which refused it before it was recorded or sent; the server's End, just before its
+`submit`), and the same transaction with one thing changed. All were evaluated with the transaction's own
+inputs, as the builder does, through the SDK's `evaluateTx`, which posts to Blockfrost's
+`/utils/txs/evaluate/utxos`. The unchanged transaction is the control, and so is the one decoded and
+encoded again with nothing changed: that is how the changed ones are built. **Accepted** is the evaluator's
+answer with units; every **refused** one is `ScriptFailures: {}`, which says no more than step 2 found it
+does. Nothing in this table was sent to a node.
+
+| The unchanged transaction, with | Close (B2) | Elapse (B2) | End by the buyer (B3) | End by the provider (B1) |
+|---|---|---|---|---|
+| nothing changed (control) | accepted, 297,024 / 106,022,228 | accepted, 199,360 / 71,395,185 | accepted, 217,185 / 76,537,594 | accepted, 203,702 / 70,846,309 |
+| decoded and encoded again (control) | accepted, the same | accepted, the same | accepted, the same | accepted, the same |
+| the repayment a lovelace over the floor | — | accepted, the same | accepted, the same | accepted, the same |
+| signed by both the buyer and the provider | — | — | accepted, the same | accepted, 206,832 / 71,749,362 |
+| **the continuing output at floor − 1 lovelace (R1)** | refused | — | — | — |
+| **no repayment (R2)** | — | refused | refused | refused |
+| **the repayment 1 lovelace short (R2)** | — | refused | refused | refused |
+| **the repayment's datum the channel's tag, not its output reference (R2)** | — | refused | refused | refused |
+| the repayment with no datum | — | refused | refused | refused |
+| the repayment's datum another output reference | — | refused | refused | refused |
+| the repayment to `payTo`'s payment key alone, without its stake part | — | refused | refused | refused |
+| **signed by the provider alone, the channel holding 0.6 tUSDM (R3)** | — | — | refused | — |
+| signed by the buyer alone, the channel empty (R3) | — | — | — | refused |
+
+34 evaluations: 13 accepted, 21 refused. The five the milestone named are in bold. A transaction with a
+changed output no longer balances, and the evaluator did not mind: it runs the scripts and checks nothing
+else, so each refusal is the validator's and each is one value away from an accepted control.
+
+**Finish.** Everything of accounts 4, 5, 7 and 2, tokens included, went to account 1 in one transaction
+each (`67d8bf8f3002b1e50e9cfdb97db27d5c3f5e0b19748157f4bcf1469871d84eb8`,
+`f9efdb014c0fc7505aea3b19282cb9572e042d36abba5656dac11180ce598c00`,
+`2213a0f55f7c5b312a3abe93ce2571c77aa4cac5db3f99473e8a54a7e452f83f`,
+`db263364e4a01fa094359e2905ec2e32cd5fe238d0da914a0d137cbab3a70736`; 0.168 to 0.171 tADA each, out of what
+each held). Account 8 keeps its 1.176630 tADA and 39.3 tUSDM: it holds no ADA beyond what backs its
+tUSDM, so it cannot pay a fee, and it stays the stablecoin-only buyer. The three repayments at account 1,
+UTxOs that each carry an inline datum, were then spent into one output of its own in
+`8398dc3b619296655fcb365f87c1c1a0886f810a9592ed937454275b5ccd0d08` (0.168449 tADA): a UTxO with a datum
+at a key address spends like any other.
+
+**Found on the way.**
+- **Nothing unexpected on the chain.** All 15 transactions of the four channels landed the first time:
+  no refusal by the validator or the ledger, no second attempt. The ledger's own checks, the fees, the
+  collateral and min-UTxO, raised nothing, and the units are the local runs' to within the figures above.
+- **A solo exit costs more than the estimate by a little.** With the validator attached, a transaction
+  that spends a channel is 0.37 to 0.39 tADA for the buyer, so Close, Elapse and the 1.18 tADA of the
+  tokens' output come to 1.94 tADA, against the 1.6 to 1.9 in `variant/sponsored/DESIGN.md` (which counts
+  0.19 to 0.35 for a fee). `EXIT_FEE_ADA`, 0.4 tADA a fee, held.
+- **The server's End is worth doing.** It paid 0.366988 tADA to bring back 2.529970: a net 2.162982 tADA
+  per empty sponsored channel. Nobody else can end such a channel alone: the buyer's End needs the
+  provider's signature there (R3), and a `Mutual` needs both.
+- **An exit leaves a UTxO with a datum at `payTo`.** The three of them are as spendable as any other.
+- The evaluator's answer to a refusal names nothing. The control next to each case is what says which rule
+  it was.
+
+**Tests.** No change to `src/` or to the chain-free tests: 106 pass, 48 of them in
+`test/variant.test.ts`, of which 6 run the compiled validators and need `aiken` 1.1.24 on the PATH.
+
 ## What this does not show yet
 
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a
   client whose own transaction is rolled back re-reads its channel from the last position it
   recorded, which may then be gone; its funds stay safe, and `recover` finds the channel again.
-- Anything on mainnet.
+- Anything on mainnet, and an audit of the variant.
 
 ## Notes for the binding spec
 
@@ -1335,6 +1536,11 @@ STEP16_OUT=x402-step16-0.2.1 npm run sponsored -- fund && STEP16_OUT=x402-step16
 STEP16_OUT=x402-step16-0.2.2b npm run sponsored -- fund && STEP16_OUT=x402-step16-0.2.2b STEP16_RECOVER=1 npm run sponsored -- run
 # the evaluator probe: account 3 opens an ADA channel, tops it up five times, and refunds it
 npm run evalrace -- 5
+
+# step 17: the sponsor-safe variant. The sponsor key is account 4; the buyers are accounts 8 (A), 5, 7 and 2 (B1 to B3).
+# `run` takes about 25 minutes: B2's elapse_at is 20 minutes after its close. It is resumable, and `report` reads everything back.
+npm run variant -- fund && npm run variant -- run && npm run variant -- report
+npm run variant -- sweep   # the sponsor key's and the B buyers' leftovers back to account 1
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

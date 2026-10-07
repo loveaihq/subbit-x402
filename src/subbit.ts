@@ -1,34 +1,77 @@
 // Off-chain side of Subbit.xyz (kompact-io/subbit-xyz @ 66648db): the datum,
 // redeemer and IOU encodings its validator checks, and the checks a provider
-// must make itself because opening a channel runs no validator.
+// must make itself because opening a channel runs no validator. Two validators
+// are known: Subbit's own, and this repository's sponsor-safe variant
+// (variant/sponsored/DESIGN.md), whose datum has a seventh constant.
 import { readFileSync } from "node:fs";
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify, type KeyObject } from "node:crypto";
 import { blake2b } from "@noble/hashes/blake2.js";
 import { Address, Data, InlineDatum, KeyHash, PlutusV3, ScriptHash, TransactionInput } from "@evolution-sdk/evolution";
 
-const blueprint = JSON.parse(
-  readFileSync(new URL("../vendor/subbit/plutus.json", import.meta.url), "utf8"),
-) as { validators: Array<{ title: string; hash: string; compiledCode: string }> };
-const spend = blueprint.validators.find((v) => v.title === "subbit.subbit.spend");
-if (!spend) throw new Error("subbit.subbit.spend is missing from vendor/subbit/plutus.json");
+// ---- the validators ----------------------------------------------------
 
-export const SUBBIT_HASH = spend.hash;
-export const subbitScript = new PlutusV3.PlutusV3({ bytes: hex(spend.compiledCode) });
-const computedHash = ScriptHash.toHex(ScriptHash.fromScript(subbitScript));
-if (computedHash !== SUBBIT_HASH) {
-  throw new Error(`script bytes hash to ${computedHash}, blueprint says ${SUBBIT_HASH}`);
+/** One build of the Subbit spend validator: what a channel's address, datum and script depend on. */
+export interface Validator {
+  /** `upstream`: Subbit's, six constants. `sponsored`: this repository's variant, seven. */
+  readonly name: "upstream" | "sponsored";
+  /** The spend validator's script hash, lowercase hex. */
+  readonly hash: string;
+  readonly script: PlutusV3.PlutusV3;
+  /** Its datum's constants end with the sponsor (`Option<(Address, Int)>`), and it enforces rules R0 to R3. */
+  readonly sponsored: boolean;
+}
+
+/** The validator in a blueprint, its script bytes checked against the hash the blueprint states. */
+function loadValidator(name: Validator["name"], blueprintUrl: URL, sponsored: boolean): Validator {
+  const blueprint = JSON.parse(readFileSync(blueprintUrl, "utf8")) as { validators: Array<{ title: string; hash: string; compiledCode: string }> };
+  const spend = blueprint.validators.find((v) => v.title === "subbit.subbit.spend");
+  if (!spend) throw new Error(`subbit.subbit.spend is missing from the ${name} blueprint`);
+  const script = new PlutusV3.PlutusV3({ bytes: hex(spend.compiledCode) });
+  const computedHash = ScriptHash.toHex(ScriptHash.fromScript(script));
+  if (computedHash !== spend.hash) {
+    throw new Error(`script bytes hash to ${computedHash}, blueprint says ${spend.hash}`);
+  }
+  return { name, hash: spend.hash, script, sponsored };
+}
+
+/** Subbit's validator, vendor/subbit/plutus.json: six constants, nothing audited. */
+export const UPSTREAM: Validator = loadValidator("upstream", new URL("../vendor/subbit/plutus.json", import.meta.url), false);
+/** The sponsor-safe variant, variant/sponsored/plutus.json: seven constants, nothing audited; run on preprod (RESULTS.md, step 17). */
+export const SPONSORED: Validator = loadValidator("sponsored", new URL("../variant/sponsored/plutus.json", import.meta.url), true);
+/** Every validator this package can build a transaction for. A client or facilitator serves the ones it is told to trust. */
+export const VALIDATORS: readonly Validator[] = [UPSTREAM, SPONSORED];
+
+/** Upstream's, under the names this package has always exported them by. */
+export const SUBBIT_HASH = UPSTREAM.hash;
+export const subbitScript = UPSTREAM.script;
+
+/** The known validator with this script hash, if any. */
+export function validatorByHash(hash: string): Validator | undefined {
+  const h = hash.toLowerCase();
+  return VALIDATORS.find((v) => v.hash === h);
 }
 
 /** A channel lives at the script's payment credential; the stake part is the consumer's choice and must never change. */
-export function channelAddress(networkId: number, delegation?: KeyHash.KeyHash | ScriptHash.ScriptHash): Address.Address {
+export function channelAddress(networkId: number, delegation?: KeyHash.KeyHash | ScriptHash.ScriptHash, v: Validator = UPSTREAM): Address.Address {
   return new Address.Address({
     networkId,
-    paymentCredential: ScriptHash.fromHex(SUBBIT_HASH),
+    paymentCredential: ScriptHash.fromHex(v.hash),
     ...(delegation ? { stakingCredential: delegation } : {}),
   });
 }
 
 export type Currency = { readonly kind: "ada" } | { readonly kind: "asset"; readonly policy: string; readonly name: string };
+
+/**
+ * Who paid a token channel's reserve and must get it back (the sponsored validator's seventh
+ * constant). The validator keeps `floor` lovelace in every continuing output (R1) and, when the
+ * channel ends, wants an output of at least `floor` at `address` that names the channel input (R2).
+ */
+export interface Sponsor {
+  /** bech32, compared whole by the validator, stake part included. */
+  readonly address: string;
+  readonly floor: bigint;
+}
 
 export interface Constants {
   /** Unique per (iouKey, tag); ADR tag.md recommends blake2b-256 of an input the open tx spends. */
@@ -39,6 +82,8 @@ export interface Constants {
   readonly consumer: string;
   readonly provider: string;
   readonly closePeriodMs: bigint;
+  /** The sponsored validator's seventh constant; absent is `None`. Upstream's validator has no such constant. */
+  readonly sponsor?: Sponsor;
 }
 
 export type Stage =
@@ -64,16 +109,59 @@ function stageData(s: Stage): Data.Data {
   }
 }
 
-export function datumData(c: Constants, s: Stage): Data.Data {
+/**
+ * An address as Aiken's `Address` (`cardano/address`): a payment credential, and `Option` of an
+ * inline stake credential. Only base and enterprise addresses have one; anything else throws.
+ */
+export function addressData(bech32: string): Data.Data {
+  const a = Address.fromBech32(bech32);
+  const credential = (c: KeyHash.KeyHash | ScriptHash.ScriptHash): Data.Data =>
+    c instanceof KeyHash.KeyHash ? Data.constr(0n, [hex(KeyHash.toHex(c))]) : Data.constr(1n, [hex(ScriptHash.toHex(c))]);
+  const stake = a.stakingCredential ? Data.constr(0n, [Data.constr(0n, [credential(a.stakingCredential)])]) : unit(1n);
+  return Data.constr(0n, [credential(a.paymentCredential), stake]);
+}
+
+/** The sponsor constant: `None`, or `Some((address, floor))`, a tuple being a Data list. */
+function sponsorData(s: Sponsor | undefined): Data.Data {
+  if (!s) return unit(1n);
+  if (s.floor < 0n) throw new Error("a sponsor's floor must not be negative");
+  return Data.constr(0n, [Data.list([addressData(s.address), s.floor])]);
+}
+
+/**
+ * The datum of a channel at validator `v`, whose `own_hash` is that validator's hash. Upstream's
+ * has six constants and no sponsor, the variant's seven: a sponsor given for upstream throws
+ * rather than being dropped.
+ */
+export function datumData(c: Constants, s: Stage, v: Validator = UPSTREAM): Data.Data {
+  if (c.sponsor && !v.sponsored) throw new Error(`the ${v.name} validator has no sponsor constant`);
   return Data.list([
-    hex(SUBBIT_HASH),
-    Data.list([hex(c.tag), currencyData(c.currency), hex(c.iouKey), hex(c.consumer), hex(c.provider), c.closePeriodMs]),
+    hex(v.hash),
+    Data.list([
+      hex(c.tag),
+      currencyData(c.currency),
+      hex(c.iouKey),
+      hex(c.consumer),
+      hex(c.provider),
+      c.closePeriodMs,
+      ...(v.sponsored ? [sponsorData(c.sponsor)] : []),
+    ]),
     stageData(s),
   ]);
 }
 
-export function inlineDatum(c: Constants, s: Stage): InlineDatum.InlineDatum {
-  return new InlineDatum.InlineDatum({ data: datumData(c, s) });
+export function inlineDatum(c: Constants, s: Stage, v: Validator = UPSTREAM): InlineDatum.InlineDatum {
+  return new InlineDatum.InlineDatum({ data: datumData(c, s, v) });
+}
+
+/**
+ * The repayment datum rule R2 looks for: the output reference of the channel input that ends,
+ * `Constr 0 [B txid, I index]`, the id bare as in a V3 script context. `ref` is `txHash#index`.
+ */
+export function repaymentDatum(ref: string): Data.Data {
+  const m = /^([0-9a-f]{64})#(0|[1-9][0-9]*)$/.exec(ref);
+  if (!m) throw new Error(`not an output reference: ${ref}`);
+  return Data.constr(0n, [hex(m[1]!), BigInt(m[2]!)]);
 }
 
 export const Redeemer = {
@@ -97,10 +185,23 @@ export interface ParsedDatum {
   readonly stage: Stage;
 }
 
-/** Strict inverse of datumData: anything that is not exactly a Subbit datum throws. */
-export function parseDatum(d: Data.Data): ParsedDatum {
+/**
+ * Strict inverse of datumData: anything that is not exactly a datum of validator `v` throws, one
+ * with another validator's number of constants included. The sponsored validator's datum names an
+ * address, whose network the datum does not hold, so `networkId` is the channel's.
+ */
+export function parseDatum(d: Data.Data): ParsedDatum;
+export function parseDatum(d: Data.Data, v: Validator, networkId: number): ParsedDatum;
+export function parseDatum(d: Data.Data, v: Validator = UPSTREAM, networkId?: number): ParsedDatum {
   const [ownHash, constants, stage] = list(d, 3, "datum");
-  const [tag, currency, iouKey, consumer, provider, closePeriod] = list(constants, 6, "constants");
+  const want = v.sponsored ? 7 : 6;
+  // The other validator's shape is not a typo to tolerate: the channel could never be spent.
+  if (Array.isArray(constants) && constants.length === (v.sponsored ? 6 : 7)) {
+    throw new Error(`constants: ${constants.length} where the ${v.name} validator reads ${want}: no step could read this datum, so whatever it holds is locked for good`);
+  }
+  const [tag, currency, iouKey, consumer, provider, closePeriod, sponsor] = list(constants, want, "constants");
+  if (v.sponsored && networkId === undefined) throw new Error("a sponsored datum names an address: its network is needed to read it");
+  const sponsorOf = v.sponsored ? parseSponsor(sponsor!, networkId!) : undefined;
   return {
     ownHash: bytes(ownHash, "own_hash"),
     constants: {
@@ -110,9 +211,42 @@ export function parseDatum(d: Data.Data): ParsedDatum {
       consumer: bytes(consumer, "consumer"),
       provider: bytes(provider, "provider"),
       closePeriodMs: int(closePeriod, "close_period"),
+      ...(sponsorOf ? { sponsor: sponsorOf } : {}),
     },
     stage: parseStage(stage),
   };
+}
+
+function parseSponsor(d: Data.Data, networkId: number): Sponsor | undefined {
+  const c = constr(d, "sponsor");
+  if (c.index === 1n && c.fields.length === 0) return undefined;
+  if (c.index !== 0n || c.fields.length !== 1) throw new Error("sponsor: unknown constructor");
+  const [address, floor] = list(c.fields[0]!, 2, "sponsor");
+  return { address: parseAddress(address!, networkId), floor: int(floor!, "floor") };
+}
+
+/** Aiken's `Address` as bech32: a key or script payment credential, and no stake credential or an inline one. */
+function parseAddress(d: Data.Data, networkId: number): string {
+  const a = constr(d, "sponsor address");
+  if (a.index !== 0n || a.fields.length !== 2) throw new Error("sponsor address: unknown constructor");
+  const stake = constr(a.fields[1]!, "sponsor stake credential");
+  let stakingCredential: KeyHash.KeyHash | ScriptHash.ScriptHash | undefined;
+  if (stake.index === 0n && stake.fields.length === 1) {
+    const inline = constr(stake.fields[0]!, "sponsor stake credential");
+    if (inline.index !== 0n || inline.fields.length !== 1) throw new Error("sponsor address: a pointer stake credential is not supported");
+    stakingCredential = parseCredential(inline.fields[0]!, "sponsor stake credential");
+  } else if (!(stake.index === 1n && stake.fields.length === 0)) {
+    throw new Error("sponsor address: unknown stake credential");
+  }
+  return Address.toBech32(new Address.Address({ networkId, paymentCredential: parseCredential(a.fields[0]!, "sponsor payment credential"), ...(stakingCredential ? { stakingCredential } : {}) }));
+}
+
+function parseCredential(d: Data.Data, what: string): KeyHash.KeyHash | ScriptHash.ScriptHash {
+  const c = constr(d, what);
+  if (c.fields.length !== 1 || (c.index !== 0n && c.index !== 1n)) throw new Error(`${what}: unknown constructor`);
+  const h = bytes(c.fields[0]!, what);
+  if (h.length !== 56) throw new Error(`${what}: expected 28 bytes`);
+  return c.index === 0n ? KeyHash.fromHex(h) : ScriptHash.fromHex(h);
 }
 
 function parseCurrency(d: Data.Data): Currency {

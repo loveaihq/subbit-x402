@@ -16,9 +16,10 @@ import {
   VKey,
   type TransactionInput,
 } from "@evolution-sdk/evolution";
-import { Redeemer, Step, parseDatum, tagFromInput } from "../subbit.ts";
-import { amountIn, channelReserve, datumBindingError, isChannelOutput, networkIdOf, onlyCurrency, redeemableOf, subbedOf, txHashOf, type ChannelView } from "./cardano.ts";
+import { Redeemer, Step, parseDatum, tagFromInput, validatorByHash } from "../subbit.ts";
+import { amountIn, channelReserve, datumBindingError, isChannelOutput, networkIdOf, onlyCurrency, redeemableOf, sameAddress, subbedOf, txHashOf, validatorOf, type ChannelView } from "./cardano.ts";
 import type { Currency } from "../subbit.ts";
+import { minRepayment } from "./repay.ts";
 import { Err, type ChannelConfig } from "./types.ts";
 
 const SPKI_ED25519 = Buffer.from("302a300506032b6570032100", "hex");
@@ -105,6 +106,11 @@ export interface DepositCheck {
  * script on it, a tag derived from one of the transaction's own inputs (Subbit ADR tag.md), and
  * a value of exactly `amount` of the currency and nothing else, except that a token channel
  * carries at least its reserve in ADA, so every continuing output it will have clears min-UTxO.
+ *
+ * At the sponsored validator the datum has seven constants (one with six could never be spent, so
+ * whatever it holds would be locked for good), and a datum that names a sponsor must also be a
+ * token channel (R0) whose sponsor is `payTo` and whose floor is the whole of the channel's ADA,
+ * and at least a repayment's min-UTxO: otherwise the exit the floor pays for would not hold.
  */
 export function checkDeposit(
   cborHex: string,
@@ -114,6 +120,7 @@ export function checkDeposit(
   scriptHash: string,
   amount: bigint,
   coinsPerUtxoByte: bigint,
+  payTo: string = config.receiver,
 ): DepositCheck {
   const R = Err.depositTransaction;
   const tx = decodeTx(cborHex, R);
@@ -128,11 +135,22 @@ export function checkDeposit(
   const o = tx.body.outputs[outputIndex]!;
   if (o.scriptRef) fail(R, "channel output carries a reference script");
   if (!(o.datumOption instanceof InlineDatum.InlineDatum)) fail(R, "channel datum is not inline");
+  const validator = validatorByHash(scriptHash);
+  if (!validator) return fail(R, `${scriptHash} is not a validator this package can read`);
   let d;
   try {
-    d = parseDatum((o.datumOption as InlineDatum.InlineDatum).data);
+    d = parseDatum((o.datumOption as InlineDatum.InlineDatum).data, validator, netId);
   } catch (e) {
     return fail(R, `channel datum: ${(e as Error).message}`);
+  }
+  const sponsor = d.constants.sponsor;
+  if (sponsor) {
+    if (d.constants.currency.kind === "ada") return fail(R, "a sponsored channel's currency must be a token (R0): one in ADA could only be spent by Mutual");
+    if (!sameAddress(sponsor.address, payTo)) return fail(R, `the sponsor ${sponsor.address} is not payTo`);
+    const held = Assets.lovelaceOf(o.assets);
+    if (sponsor.floor !== held) return fail(R, `the sponsor's floor ${sponsor.floor} is not the ${held} lovelace the channel holds: it must be the whole reserve`);
+    const least = minRepayment(Address.fromBech32(sponsor.address), coinsPerUtxoByte);
+    if (sponsor.floor < least) return fail(R, `the sponsor's floor ${sponsor.floor} is under the ${least} lovelace a repayment output needs`);
   }
   const bind = datumBindingError(d, config, channelId, scriptHash);
   if (bind) fail(bind, "channel datum does not match the channel config");
@@ -209,7 +227,7 @@ export function checkTopUp(cborHex: string, network: string, ch: ChannelView, am
   // By value, as the validator compares it: another encoder may write the same datum differently.
   let after;
   try {
-    after = parseDatum((o.datumOption as InlineDatum.InlineDatum).data);
+    after = parseDatum((o.datumOption as InlineDatum.InlineDatum).data, validatorOf(ch), netId);
   } catch (e) {
     return fail(R, `channel datum: ${(e as Error).message}`);
   }
@@ -221,6 +239,9 @@ export function checkTopUp(cborHex: string, network: string, ch: ChannelView, am
   if (grown !== amount) fail(R, `the channel grows by ${grown}, the deposit says ${amount}`);
   const reserve = channelReserve(o.address, ch.datum.constants, coinsPerUtxoByte);
   if (c.kind !== "ada" && Assets.lovelaceOf(o.assets) < reserve) fail(R, `a token channel carries at least ${reserve} lovelace`);
+  // R1: a sponsored channel keeps its floor, or the validator refuses every step that continues it.
+  const floor = ch.datum.constants.sponsor?.floor;
+  if (floor !== undefined && Assets.lovelaceOf(o.assets) < floor) fail(R, `a sponsored channel keeps at least its floor, ${floor} lovelace (R1)`);
   if (!witnessKeyHashes(tx).has(ch.datum.constants.consumer)) fail(R, "the consumer has not signed");
   // IOUs are cumulative: what is already redeemed counts toward the capacity.
   const capacity = subbedOf(ch.datum.stage) + redeemableOf(o.address, ch.datum.constants, amountIn(o.assets, c), coinsPerUtxoByte);

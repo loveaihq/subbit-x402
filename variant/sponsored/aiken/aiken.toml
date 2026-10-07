@@ -1,0 +1,25 @@
+# Modified from kompact-io/subbit-xyz @ 66648db for the sponsored variant (name, description,
+# repository); see variant/sponsored/PROVENANCE.md. Dependencies and compiler are as upstream's.
+name = "loveaihq/subbit-sponsored"
+version = "0.0.0"
+compiler = "v1.1.23"
+plutus = "v3"
+license = "Apache-2.0"
+description = "Subbit with sponsor-safe token channels: a fork of kompact-io/subbit-xyz @ 66648db"
+
+[repository]
+user = "loveaihq"
+project = "subbit-x402"
+platform = "github"
+
+[[dependencies]]
+name = "aiken-lang/stdlib"
+version = "v3.1.0"
+source = "github"
+
+[[dependencies]]
+name = "aiken-lang/fuzz"
+version = "2.2.0"
+source = "github"
+
+[config]

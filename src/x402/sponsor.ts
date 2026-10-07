@@ -6,6 +6,7 @@ import {
   Address,
   Assets,
   Ed25519Signature,
+  InlineDatum,
   KeyHash,
   Transaction,
   TransactionHash,
@@ -13,7 +14,8 @@ import {
   UTxO,
   VKey,
 } from "@evolution-sdk/evolution";
-import { isChannelOutput, msOfSlot, networkIdOf, txHashOf } from "./cardano.ts";
+import { parseDatum, validatorByHash } from "../subbit.ts";
+import { isChannelOutput, msOfSlot, networkIdOf, sameAddress, txHashOf } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
 
 // ---- the offer ---------------------------------------------------------------------
@@ -443,6 +445,11 @@ function collateralOnlyOffered(tx: Transaction.Transaction, c: SponsorCheck) {
 /**
  * An opening: the offered input pays the channel's reserve and the fee, the rest goes to `payTo`,
  * and the channel holds no more ADA than its reserve. No script runs, so no collateral.
+ *
+ * At the sponsored validator the seller also requires what makes that reserve its to get back: the
+ * channel's datum names `payTo` as its sponsor, with the channel's whole ADA as the floor. The
+ * facilitator accepts a sponsorless opening there (a buyer may pay its own reserve), so without this
+ * a buyer could spend the seller's offer on a channel that owes the seller nothing.
  */
 export async function checkSponsoredOpen(c: SponsorCheck & { scriptHash: string; reserve: bigint }): Promise<SponsorResult> {
   try {
@@ -455,6 +462,19 @@ export async function checkSponsoredOpen(c: SponsorCheck & { scriptHash: string;
     if (channels.length !== 1) no("S4", `expected one channel output, found ${channels.length}`);
     const channelL = Assets.lovelaceOf(channels[0]!.assets);
     if (channelL > c.reserve) no("S4", `the channel holds ${channelL} lovelace, more than its reserve ${c.reserve}`);
+    const validator = validatorByHash(c.scriptHash);
+    if (validator?.sponsored) {
+      const datum = channels[0]!.datumOption;
+      let named;
+      try {
+        named = datum instanceof InlineDatum.InlineDatum ? parseDatum(datum.data, validator, networkIdOf(c.network)).constants.sponsor : undefined;
+      } catch (e) {
+        return no("S4", `the channel's datum does not read: ${(e as Error).message}`);
+      }
+      if (!named || !sameAddress(named.address, c.payTo) || named.floor !== channelL) {
+        no("S4", `at the sponsored validator the channel names payTo as its sponsor with its whole ${channelL} lovelace as the floor, so that its reserve comes back`);
+      }
+    }
     const s = BigInt(c.offer.lovelace);
     const paid = toPayTo(tx, c.payTo);
     if (paid + channelL + b.fee < s) no("S4", `channel ${channelL} + payTo ${paid} + fee ${b.fee} < the sponsor's ${s}: the rest would go elsewhere`);

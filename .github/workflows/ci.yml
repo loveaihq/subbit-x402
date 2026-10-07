@@ -62,10 +62,20 @@ jobs:
   validator:
     name: aiken check
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: aiken-lang/setup-aiken@v1
         with:
           version: v1.1.24
       - run: aiken check vendor/subbit/aiken
+      # The sponsored variant (variant/sponsored/) and its tests.
+      - run: aiken check variant/sponsored/aiken
+      # test/variant.test.ts runs the compiled validators on the transactions the builders make
+      # (`aiken tx simulate`). Those tests skip where aiken is not on PATH, as in the job above.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: node --test --import tsx test/variant.test.ts
