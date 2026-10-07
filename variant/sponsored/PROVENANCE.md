@@ -14,7 +14,9 @@ alpha software by Kompact.io, and nothing here has been audited.**
   `ordered_insert` has `Greater -> [item, x, ..xs]` where `66648db` has `Greater -> fail
   @"Impossible"`. That makes a batch whose signers come in descending order possible (RESULTS.md,
   step 15, "The defect"). The commit and the line are as the milestone brief gave them; this
-  session had no network and did not fetch `21c1905`.
+  session had no network and did not fetch `21c1905`. Upstream has since merged the same line in its
+  pull request #10, and `vendor/subbit` carries it too (its PROVENANCE.md): the two sources now differ
+  only by the sponsor feature, apart from the package's metadata and the tests.
 - **Licence.** Apache-2.0, as declared in upstream's `aiken/aiken.toml` (upstream has no top-level
   LICENSE file, and the files carry no copyright or NOTICE text of their own). The licence of this
   repository, Apache-2.0, is [../../LICENSE](../../LICENSE). Each of upstream's files that this
@@ -24,7 +26,8 @@ alpha software by Kompact.io, and nothing here has been audited.**
 ## The validator
 
 - **Spend validator `subbit.subbit.spend`:** `20b64ee22a509c164e0e16ad1189b12be7f0a497b0eb096180c923ea`
-  (Plutus V3, 3,798 bytes of compiled code; upstream's `62ce4309…` is 3,046). Milestone 1's, before
+  (Plutus V3, 3,798 bytes of compiled code; upstream's `6d877463…` is 3,058, and its `62ce4309…`, before
+  the fix, 3,046). Milestone 1's, before
   R2 named the channel input's output reference instead of the tag, was `bdf4e042…`.
 - **Blueprint:** [plutus.json](plutus.json), the `aiken/plutus.json` that `aiken build` writes,
   sha256 `974b68c608c8971e7cde1cda473c92070ca404040bf7c4a04467d572b2ca7c52`. It has 16 entries:
@@ -68,7 +71,7 @@ Paths are under `aiken/`. Everything not listed is byte for byte upstream's (and
 | `lib/mark/outputs.ak` | `output_keeps_the_constants` changes each of seven constants (the seventh: no sponsor to one). |
 | `lib/mark/mutual.ak` | The 7-tuple in `mutual_can_rewrite_the_channel`. |
 | `lib/mark/batch.ak` | The 7-tuple in `two_adds`. The three `bug_` tests lose `fail` and the prefix: `batch_passes_when_signers_descend`, `two_consumers_in_descending_order`, `ordered_insert_takes_a_smaller_item`. `fixed_insert`, a copy of the fix, goes: `fix_gathers_any_signers` tests `xlist.ordered_insert` itself. |
-| `lib/mark/vectors.ak` | Three datum vectors end their constants with `d87a80`, no sponsor. Nothing else changes (checked against upstream's, ignoring comments and layout). The validator's hash in it stays upstream's. |
+| `lib/mark/vectors.ak` | Three datum vectors end their constants with `d87a80`, no sponsor. Nothing else changes (checked against upstream's, ignoring comments and layout). The validator's hash in it stays upstream's at 66648db, `62ce4309…`: the vectors of `vendor/subbit`, which this file was compared with, now name the fixed build's `6d877463…`. |
 | `lib/mark/{steps,design,conformance}.ak` | Layout only, by `aiken fmt`: they are the same as upstream's once whitespace and trailing commas are ignored (checked). |
 
 `lib/mark/vectors.ak` is generated from the TypeScript client in `vendor/subbit/aiken`; here its

@@ -1,6 +1,7 @@
 //// Builders for the tests in lib/mark (subbit-x402's; the rest of this project is Subbit's
-//// source at 66648db, unmodified): channels, transactions, and a runner that validates a
-//// transaction as the ledger does, by running the validator for every channel input.
+//// source at 66648db, with one line changed in lib/extra/xlist.ak): channels, transactions, and a
+//// runner that validates a transaction as the ledger does, by running the validator for every
+//// channel input.
 
 use aiken/collection/list
 use aiken/crypto.{ScriptHash, VerificationKeyHash}

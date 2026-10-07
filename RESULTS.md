@@ -6,9 +6,10 @@ facilitator enforces it (`invalid_exact_cardano_payload_min_utxo_insufficient`).
 for this is the `batch-settlement` scheme, which exists for EVM and in draft for SVM, not for
 Cardano. This spike checks whether Subbit.xyz channels can carry it.
 
-Validator: `subbit.subbit.spend` from kompact-io/subbit-xyz @ 66648db, unmodified
-(`vendor/subbit/PROVENANCE.md`); step 17 runs this repository's sponsor-safe variant of it instead
-(`variant/sponsored/`). Wallets: the public all-`abandon` test mnemonic, account 0 as
+Validator: `subbit.subbit.spend` from kompact-io/subbit-xyz @ 66648db, unmodified, hash `62ce4309…`, in
+steps 1 to 16 (`vendor/subbit/PROVENANCE.md`); step 17 runs this repository's sponsor-safe variant of it
+instead (`variant/sponsored/`); step 18 runs it with the one line upstream fixed, hash `6d877463…`, which
+the vendored source now has and which is the default. Wallets: the public all-`abandon` test mnemonic, account 0 as
 consumer, account 1 as provider. Every figure below was read back from Blockfrost, not taken
 from the transaction builder.
 
@@ -964,6 +965,8 @@ empty value, and some cases failed on that instead. Amounts now start at 1.
   with mixed signers.
 - **This binding never meets it.** A claim has one signer, the provider key its builder holds.
   Each consumer step has one, the consumer. A refund is `Mutual`, which gathers no signers.
+- **Fixed upstream.** Upstream merged the line in its pull request #10. `vendor/subbit` has it, the three
+  `bug_` tests are positive tests now, and step 18 runs such a batch on a chain at both builds.
 
 **Design properties** that the `design` tests pin, each with what makes it safe here:
 - **A UTxO at the validator whose datum names another hash is anyone's.** `Main([])` spends it
@@ -1380,6 +1383,166 @@ at a key address spends like any other.
 **Tests.** No change to `src/` or to the chain-free tests: 106 pass, 48 of them in
 `test/variant.test.ts`, of which 6 run the compiled validators and need `aiken` 1.1.24 on the PATH.
 
+## Step 18: Subbit's fixed validator
+
+Upstream merged the fix this repository reported in step 15 (`xlist.ordered_insert`, its pull request #10;
+its main is at `74c20d2`). The vendored source now has that line, builds to upstream's blueprint, and is
+the default validator: spend hash `6d8774631fece31d0c768afb960c9a8a9957f8a85fa31deae1159094`, in place of
+`62ce4309…`, which steps 1 to 16 ran at and which stays for the channels opened there. Here it runs on a
+chain: the x402 flow at the new hash, and the batch of two signers that the old hash cannot take, taken.
+`npm run fixed -- fund-e2e | sweep-e2e | fund | open | batch | refund | sweep | report`, state in
+`out/x402-step18/` and `out/x402-step18-e2e/`, 2026-10-07.
+
+**The validator** (no chain).
+- **Source.** `vendor/subbit/aiken/lib/extra/xlist.ak` has `Greater -> [item, x, ..xs]` where 66648db had
+  `Greater -> fail @"Impossible"`, and a notice at its top that says so. The three `bug_` tests of step 15 are
+  positive tests now (`batch_passes_when_signers_descend`, `two_consumers_in_descending_order`,
+  `ordered_insert_takes_a_smaller_item`), and `fix_gathers_any_signers` tests `xlist.ordered_insert` itself.
+  The source is still on stdlib v3.1.0; upstream's main has moved to v4.0.0, which does not change the
+  compiled code.
+- **Suite.** `aiken check --max-success 1000 --seed 66648` passes all 74 tests (28 unit, 46 property), in
+  46,028 checks and 53 s on Aiken v1.1.24+bacbeb3, with the vectors regenerated for the new hash.
+- **The variant's own suite**, which has its copy of the same line since step 15 and is unchanged, passes the same
+  85,073 checks (`aiken check variant/sponsored/aiken --max-success 1000 --seed 66648`, 109 s).
+- **Blueprint.** `aiken build vendor/subbit/aiken` writes a blueprint equal to the file at
+  `https://raw.githubusercontent.com/kompact-io/subbit-xyz/74c20d2/aiken/plutus.json` (29,447 bytes; that file
+  only was fetched, for this comparison): the preamble, compiler `v1.1.24+bacbeb3` included, all 16
+  validators (title, hash and compiled code) and all 18 definitions. Spend hash `6d877463…` in both,
+  compiled code 3,058 bytes (3,046 before the fix). Aiken leaves off the file's last newline; with it,
+  `vendor/subbit/plutus.json` is upstream's byte for byte (sha256 `519a5ac6…df1f`).
+- **The old blueprint** is kept as `vendor/subbit/plutus-62ce4309.json`, unmodified (sha256 `0f114913…3c20`). The
+  new source with the one line put back builds its 16 validators again, hash and compiled code alike.
+- **Both builds, side by side, on the compiled scripts** (`test/variant.test.ts`, `aiken tx simulate` on
+  what the SDK's builders make): a batch of the consumer's `Add` and the provider's `Sub` on two channels,
+  the later step's signer the smaller key, is refused by the `62ce4309…` blueprint and taken by `6d877463…`
+  at 371,134 memory and 198,408,274 steps; in the other order both take it, at 370,462 and 198,195,782. Two
+  consumers adding to their own channels, the keys descending: refused, then taken at 354,823 and
+  136,326,846 (ascending, both: 354,151 and 136,114,354).
+
+**Setup.**
+- Provider, seller and `payTo`: account 1. Reference script, deployed from account 1 into account 2
+  (`REFSCRIPT_FROM=1 npm run refscript -- deploy`, as step 3's was): `ff61e3f44d45b57e02a474f4d0f24effa017abf71744f4fd7d33df7aa0ee458c#0`,
+  block 5262612, 3,469 B, fee 0.308061 tADA. It holds 14.205760 tADA and the validator, 3,058 bytes
+  (step 3's `544752f6…#0` held 14.15 tADA and was swept at the end of step 17). Read back through the SDK, it carries script `6d877463…`; a
+  transaction that reads it pays 15 × 3,058 = 0.045870 tADA for it. It stays account 2's.
+- (a), the buyer: account 4, given 10 and 5 tADA in `b18272b67f445387f6654a0fc0a2970e3883af83c798fd0e4f34d974d79fb27b`.
+  (b), the consumer of the four channels: account 5, given six UTxOs of 5 tADA in
+  `17ec7d58d956baae6a68cca7d671254b856b8d6c64093b3905872dbd795a0114`.
+- The spike scripts run at `6d877463…` now. What they keep is named by its hash (`out/refscript-6d877463.json`,
+  `out/x402-6d877463/` by default), so the state of steps 1 to 16 is not resumed by mistake.
+
+**(a) The x402 flow at the fixed validator** (`SPIKE_CONSUMER=4 X402_OUT=x402-step18-e2e npm run x402 -- pay 5`,
+then `claim`, `refund`, `report`; the stack of step 4 with `scriptHash` the new hash and the reference script
+above). One ADA route at 1,000 lovelace a request.
+
+| Step | Transaction | Block | Size | Fee (tADA) | Units | Request to 200 |
+|---|---|---|---|---|---|---|
+| open, request 1 | `2478e04aff79c6bbb035c06824d6eb4454e0586977cae0b20e671765ced67ffe` | 5262620 | 445 B | 0.175005 | — | 43.8 s |
+| claim of 5 requests (0.005 tADA) | `6d0c490937d6dbe8f83166a3f4c61fff760f3d0f83e01407eeccd8ad65e03036` | 5262624 | 839 B | 0.258494 | 190,923 / 127,474,793 | — |
+| refund (`Mutual`) | `875a7881cbc7906570e339a6741b64fc6a0d21d872c190656be41efad6fb8b62` | 5262626 | 597 B | 0.232725 | 61,168 / 21,584,369 | — |
+
+- **The channel sat at `6d877463…`, read back from the chain.** Its output `2478e04a…#0` is at the script address
+  `6d877463…`, with the datum's `own_hash` the same, and held 4.732620 tADA. The claim and the refund each read the
+  reference script `ff61e3f4…#0` as a reference input (839 B and 597 B, with no script attached).
+- The other 4 requests were vouchers, answered with no chain in 9.0 to 11.3 ms. The refund gave the buyer 4.494895 tADA.
+- **Reconciliation**, over those three transactions: the buyer 15.000000 → 14.587270 tADA (−0.412730: the opening's
+  and the refund's fees, and the 0.005 it paid), the provider 9,976.183668 → 9,975.930174 (−0.253494: the claim's fee
+  less the 0.005), the facilitator's delegated key unchanged. The three wallets lost 0.666224 tADA, the three fees to
+  the lovelace.
+
+**(b) The batch of two signers.** Two ADA channels at each build, the same consumer (account 5) and provider
+(account 1) on all four, 3 tADA each, close period 900 s. The batch is one `Main` over the two channels of a
+build: the consumer's `Add` of 0.5 tADA on one, the provider's `Sub` of an IOU of 1 tADA on the other, the consumer's
+UTxO paying the fee and the collateral, both keys required. Step order is the order of the channel inputs in the
+ledger, which the builder cannot change, so the builder picks which channel gets which step from the key
+hashes: the consumer's is `4cb184e1…`, the provider's `cd8bede8…`, and `cd8bede8…` is the larger. **Descending**
+puts the provider's `Sub` first (the later step's signer, the consumer, sorts first); **ascending** puts the
+`Add` first. Each order was built at each build and run through Blockfrost's evaluator, the SDK's `evaluateTx`
+(`/utils/txs/evaluate/utxos`), against the four channels as the chain held them. The unchanged transaction in the
+other order is the control.
+
+| Build | Order | Evaluator | Units (memory / steps) | Sent |
+|---|---|---|---|---|
+| `62ce4309…` | ascending | accepted | 325,284 / 179,073,434 and 39,261 / 15,939,523 | no |
+| `62ce4309…` | **descending** | **refused**, `{"ScriptFailures":{}}` | — | **no, never** |
+| `6d877463…` | ascending | accepted | 325,383 / 178,962,054 and 45,079 / 19,233,728 | no |
+| `6d877463…` | **descending** | **accepted** | 326,055 / 179,174,546 and 45,079 / 19,233,728 | **yes** |
+
+- **The refusal is the order.** The evaluator's answer to a refusal names nothing, and the blueprints carry no traces,
+  so it does not say `Impossible`. What says it is the control: the same two steps, the same channels, the other
+  order, are accepted by the same build, and the fixed build takes the order the old one refuses. The Aiken test
+  at the source (step 15) says where.
+- Nothing was sent at `62ce4309…`: the descending batch is the one expected to fail, and it was never submitted; the
+  ascending one was a control and was not either. Nor was the ascending batch at `6d877463…`. An evaluation costs nothing.
+- The spend indexes differ (0 and 1 at the old channels, 1 and 2 at the new) only because the consumer's own input
+  sorts between the two pairs' transaction ids; the `Defer`'s cost follows its position.
+
+**What landed:** the descending batch at `6d877463…`, `8895a66d2c6353f693c45b095df51639adc0070804c8aae793639fae31ae5777`,
+block 5262651, 1,282 B, fee 0.293500 tADA, units 326,055 / 179,174,546 for the `Main` and 45,079 / 19,233,728 for the
+`Defer`, exactly what the evaluator said. Read back from the chain: inputs the two channels `dd8a7612…311a#0` and `#1`,
+the consumer's UTxO `17ec7d58…#4` (also its collateral) and the reference script `ff61e3f4…#0` as a reference input; two
+vkey witnesses, for the two required signers `4cb184e1…` and `cd8bede8…`; outputs `#0` the `Sub`'d channel, 2.000000
+tADA with `subbed` 1,000,000, `#1` the `Add`'d one, 3.500000, `#2` 1.000000 tADA to account 1 (the take), `#3` 4.206500 back to account 5.
+
+**The run.** `Block` and `Size` are Blockfrost's.
+
+| Step | Transaction | Block | Size | Fee (tADA) | Units |
+|---|---|---|---|---|---|
+| fund, account 1 → 5 | `17ec7d58d956baae6a68cca7d671254b856b8d6c64093b3905872dbd795a0114` | 5262644 | 974 B | 0.198281 | — |
+| open two channels at `62ce4309…` | `02a0c49687cf47d9b85da089a2b79b0251d6274411fdbcab761993da3af7a700` | 5262648 | 702 B | 0.186313 | — |
+| open two channels at `6d877463…` | `dd8a76122f473e2027416fe6e3b2b5e582c7a77346fe5f6837d48599b104311a` | 5262649 | 702 B | 0.186313 | — |
+| the batch at `6d877463…`, `Sub` then `Add` | `8895a66d2c6353f693c45b095df51639adc0070804c8aae793639fae31ae5777` | 5262651 | 1,282 B | 0.293500 | 326,055 / 179,174,546; 45,079 / 19,233,728 |
+| refund, `62ce4309…` channel 1 (3.000000) | `192311a7fd07f081b5f78e2c459c5f0612719fb913eeed868f0777d9d46d81e4` | 5262652 | 3,610 B | 0.319352 | 61,168 / 21,584,369 |
+| refund, `62ce4309…` channel 2 (3.000000) | `32288695b0997eadfee5acf1a35810f4e90f27659556fac0229f900ec47291a3` | 5262653 | 3,610 B | 0.319352 | 61,168 / 21,584,369 |
+| refund, `6d877463…` channel 1 (2.000000) | `edfa1632466349883b48729f068e48572f6e52cc53f8439199e518a2bd670b7f` | 5262654 | 597 B | 0.232725 | 61,168 / 21,584,369 |
+| refund, `6d877463…` channel 2 (3.500000) | `3381a32cb4d89a5ef3f9d7097d4521503ae8b07d1950f580053cf8ddce0ffc5c` | 5262658 | 597 B | 0.232725 | 61,168 / 21,584,369 |
+| sweep, account 5 → 1 | `a237368a82b47157d47bfc5e1b4c1dfe4b1d4cf7aea8aad8060bcd72a6f28de1` | 5262663 | 476 B | 0.176369 | — |
+
+- The refunds of the old channels attach the 3,046-byte validator (3,610 B, 0.319352 tADA); those of the new read the
+  reference script (597 B, 0.232725). The step's units are the same: the `Mutual` path is the same code.
+- **Reconciliation** of accounts 1 and 5 over those nine transactions: 9,990.348995 → 9,988.204065 tADA, 2.144930 less,
+  which is the nine fees to the lovelace. Account 5 ends with nothing. The `Sub`'s 1.000000 went from account 5's channel to account 1.
+  All five channels of the step, (a)'s and (b)'s four, are closed; none holds anything.
+
+**Per account**, the whole step, from before the reference script to after the last sweep (the two Koios reads of
+every account this step touched):
+
+| Account | Before | After | Change | Why |
+|---|---|---|---|---|
+| 0 | 4.762052 | 4.762052 | 0 | not touched |
+| 1, seller | 10,005.870074 | 9,988.204065 | −17.666009 | the reference script's output, 14.205760, and all 15 fees, 3.460249: accounts 4 and 5 were funded from it and swept back to it |
+| 2, the reference script | 0 | 14.205760 | +14.205760 | the output `ff61e3f4…#0` |
+| 3, the delegated key | 1.035498 | 1.035498 | 0 | not touched |
+| 4, buyer (a) | 0 | 0 | 0 | 15.000000 given; 14.587270 was left to sweep (the rest is its two fees and the 0.005 paid for requests), and 14.418821 came back after the sweep's fee, 0.168449 |
+| 5, consumer (b) | 0 | 0 | 0 | 30.000000 given; 27.229720 was left to sweep (the rest is its fees and the `Sub`'s 1.000000 to account 1), and 27.053351 came back after the sweep's fee, 0.176369 |
+| 7 | 0 | 0 | 0 | not touched |
+| 8, the stablecoin-only buyer | 1.176630, 39.3 tUSDM | the same | 0 | left alone |
+
+The eight accounts together hold 3.460249 tADA less, which is the fees of all 15 transactions of the step to the
+lovelace (the deploy 0.308061; (a) 0.175005 + 0.258494 + 0.232725, and its funding 0.172585 and sweep 0.168449; (b) 2.144930). The reference
+script's 14.205760 is in account 2, not lost. No tUSDM moved. Nothing was run on mainnet.
+
+**Found on the way.**
+- **Nothing unexpected on the chain.** Every transaction that was sent landed the first time, and the one refusal was the
+  one expected.
+- **A reference script must be the right one.** The builders read `extra.referenceScript` whenever the output held any script.
+  With two builds at two hashes an output made for one would leave a transaction at the other without its script.
+  `referenceFor` reads an output only when its script hashes to the validator at hand, and attaches the validator's bytes
+  otherwise (a chain-free test builds a claim with each).
+- **A default is a trap for a channel at another hash.** A continuing output's datum names its own validator, so every builder
+  has to write the one its channel is at (`validatorOf(view)`), and none may fall back to the default. A close of a channel
+  at `62ce4309…` that did would be refused by the compiled validator, and the tests run closes, claims, top-ups and
+  refunds at both builds, compiled, to hold that.
+- **Upgrading.** `SUBBIT_HASH`, `subbitScript` and `channelAddress()` are the fixed build's now, so a facilitator given
+  `scriptHash: SUBBIT_HASH` serves the fixed build alone (`validators: UPSTREAM_VALIDATORS` serves both, and is the default),
+  and a server or manager given it names the fixed build: one whose channels are at `62ce4309…` names
+  `UPSTREAM_66648DB.hash`. README, "Which validator".
+
+**Tests.** 116 chain-free, up from 106, 9 of them run the compiled validators (up from 6): the registry and its
+defaults, the two blueprints' hashes and bytes, the client's trust, `recover` and the 402 at both builds, the facilitator and
+the manager at either, a close, exits, refunds, top-ups and claims at both builds (compiled too), the two batches
+above on both compiled blueprints, and a reference script of the wrong build.
+
 ## What this does not show yet
 
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a
@@ -1541,6 +1704,20 @@ npm run evalrace -- 5
 # `run` takes about 25 minutes: B2's elapse_at is 20 minutes after its close. It is resumable, and `report` reads everything back.
 npm run variant -- fund && npm run variant -- run && npm run variant -- report
 npm run variant -- sweep   # the sponsor key's and the B buyers' leftovers back to account 1
+
+# step 18: Subbit's fixed validator (6d877463…). Accounts 1 (provider, seller, funder), 2 (the reference script), 4 (a) and 5 (b).
+# The commands above, steps 1 to 16, ran at 62ce4309…; the spike scripts now run at 6d877463… and name what they keep by its hash.
+npm run validator && aiken check --max-success 1000 --seed 66648 vendor/subbit/aiken   # no chain; then `aiken build vendor/subbit/aiken`
+REFSCRIPT_FROM=1 npm run refscript -- deploy && npm run refscript -- check            # the reference script, from account 1 to account 2
+npm run fixed -- fund-e2e                                                              # (a): account 4 gets 15 tADA
+SPIKE_CONSUMER=4 X402_OUT=x402-step18-e2e npm run x402 -- pay 5
+SPIKE_CONSUMER=4 X402_OUT=x402-step18-e2e npm run x402 -- claim
+SPIKE_CONSUMER=4 X402_OUT=x402-step18-e2e npm run x402 -- refund
+SPIKE_CONSUMER=4 X402_OUT=x402-step18-e2e npm run x402 -- report
+npm run fixed -- sweep-e2e
+npm run fixed -- fund && npm run fixed -- open                                         # (b): account 5, four channels
+npm run fixed -- batch                                                                 # evaluates at both builds, sends one batch, at 6d877463…
+npm run fixed -- refund && npm run fixed -- sweep && npm run fixed -- report
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

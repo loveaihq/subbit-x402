@@ -25,7 +25,7 @@ import type {
 } from "@x402/core/types";
 import { decodePaymentSignatureHeader } from "@x402/core/http";
 import { Assets, InlineDatum, KeyHash, Transaction, TransactionHash, TransactionWitnessSet, type Address } from "@evolution-sdk/evolution";
-import { parseDatum, validatorByHash, type Validator } from "../subbit.ts";
+import { UPSTREAM, parseDatum, validatorByHash, type Validator } from "../subbit.ts";
 import { channelReserve, currencyOf, isChannelOutput, msOfSlot, networkIdOf, txHashOf, verifyVoucherSignature } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
 import {
@@ -167,11 +167,14 @@ export interface ServerConfig {
   /** Provider key hash: the datum's `provider`, the key that signs every redemption. */
   receiverAuthorizer: string;
   /**
-   * The validator its channels live at: Subbit's (`UPSTREAM.hash`), or the sponsor-safe variant's
-   * (`SPONSORED.hash`), which is unaudited. It goes into every 402 as `extra.scriptHash`, and a
-   * client that does not trust it refuses the 402.
+   * The validator its channels live at: Subbit's as fixed upstream (`UPSTREAM.hash`, the default,
+   * where new channels should open), Subbit's before the fix (`UPSTREAM_66648DB.hash`, for a server
+   * whose earlier channels sit there: it follows, claims and refunds them as before), or the
+   * sponsor-safe variant's (`SPONSORED.hash`), which is unaudited. It goes into every 402 as
+   * `extra.scriptHash`, and a client that does not trust it refuses the 402. A server names one
+   * validator: to keep channels at two, run a second server and manager at the other.
    */
-  scriptHash: string;
+  scriptHash?: string;
   referenceScript?: string;
   withdrawDelay?: number;
   storage?: ChannelStorage;
@@ -261,7 +264,7 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   private readonly validator: Validator;
 
   constructor(private readonly config: ServerConfig) {
-    const validator = validatorByHash(config.scriptHash);
+    const validator = validatorByHash(config.scriptHash ?? UPSTREAM.hash);
     if (!validator) throw new Error(`script ${config.scriptHash} is not a validator this package knows`);
     this.validator = validator;
     this.withdrawDelay = config.withdrawDelay ?? MIN_WITHDRAW_DELAY;
@@ -309,7 +312,7 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
       ...req,
       extra: {
         ...req.extra,
-        scriptHash: this.config.scriptHash,
+        scriptHash: this.validator.hash,
         receiverAuthorizer: this.config.receiverAuthorizer,
         withdrawDelay: this.withdrawDelay,
         ...(this.config.referenceScript ? { referenceScript: this.config.referenceScript } : {}),
@@ -511,7 +514,7 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
       others.set(ref, u.address);
     }
     const owed = BigInt(ch.chargedCumulativeAmount) - BigInt(ch.totalClaimed);
-    checkMutual(hex, ctx.requirements.network, this.config.scriptHash, ch.channelRef, ch.channelConfig.payer, this.config.receiverAuthorizer, this.config.payTo, currencyOf(ch.channelConfig.token), owed, collateral, true, others);
+    checkMutual(hex, ctx.requirements.network, this.validator.hash, ch.channelRef, ch.channelConfig.payer, this.config.receiverAuthorizer, this.config.payTo, currencyOf(ch.channelConfig.token), owed, collateral, true, others);
     const sponsorWitness = await this.signSponsoredRefund(ctx, hex, ch);
     if (!sponsorWitness) {
       // A refund without the seller's offer as its collateral still pays the seller's reserve back.
@@ -729,10 +732,10 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
     let r: SponsorResult;
     if (opening) {
       const tx = decodeTx(hex, Err.depositTransaction);
-      const out = tx.body.outputs.find((o) => isChannelOutput(o.address, this.config.scriptHash));
+      const out = tx.body.outputs.find((o) => isChannelOutput(o.address, this.validator.hash));
       if (!out || !(out.datumOption instanceof InlineDatum.InlineDatum)) return { abort: true as const, reason: "fee_sponsor_S4", message: "no channel output" };
       const reserve = channelReserve(out.address, parseDatum(out.datumOption.data, this.validator, networkIdOf(req.network)).constants, await this.config.chain.coinsPerUtxoByte());
-      r = await checkSponsoredOpen({ ...base, scriptHash: this.config.scriptHash, reserve });
+      r = await checkSponsoredOpen({ ...base, scriptHash: this.validator.hash, reserve });
     } else {
       r = await checkSponsoredTopUp(base);
     }

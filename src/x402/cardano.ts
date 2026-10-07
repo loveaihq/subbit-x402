@@ -104,6 +104,17 @@ export function validatorOf(ch: Pick<ChannelView, "datum">): Validator {
   return v;
 }
 
+/**
+ * The reference-script output a transaction may read `v` from: `ref` when it carries exactly this
+ * validator, and nothing otherwise. Subbit's two builds are two scripts, and an output made for one
+ * (or for any other script) would leave the transaction without the script its channel asks for, so
+ * the caller attaches the validator's own bytes instead.
+ */
+export function referenceFor(ref: UTxO.UTxO | undefined, v: Validator): UTxO.UTxO | undefined {
+  if (!ref?.scriptRef) return undefined;
+  return ScriptHash.toHex(ScriptHash.fromScript(ref.scriptRef)) === v.hash ? ref : undefined;
+}
+
 /** A channel UTxO as the binding sees it. */
 export interface ChannelView {
   utxo: UTxO.UTxO;

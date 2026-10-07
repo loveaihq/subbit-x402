@@ -20,7 +20,7 @@ sends it back to the sponsor.
 `Constants` gets a seventh field, `sponsor: Option<(Address, Int)>`.
 
 - `None`: nothing changes. The channel behaves as upstream's does, plus the `ordered_insert` fix
-  (PROVENANCE.md).
+  (PROVENANCE.md), which upstream has since merged, so it behaves as upstream's fixed validator does.
 - `Some((address, floor))`: `address` is where the reserve goes back to, a `cardano/address`
   `Address` compared whole, stake part included. `floor` is the least lovelace that must reach it.
 
@@ -106,8 +106,8 @@ The opening runs no script, so only these checks stand between a bad datum and t
 - **The datum** is longer by 88 bytes with a base-address sponsor and by 49 with an enterprise
   address (measured), so about 0.38 or 0.21 ADA more min-UTxO on the channel, at 4,310 lovelace a
   byte. `reserve` must cover it.
-- **The script** is 3,798 bytes against upstream's 3,046, so a reference-script output for it needs
-  about 3.2 ADA more.
+- **The script** is 3,798 bytes against upstream's 3,058 (3,046 before its fix), so a reference-script
+  output for it needs about 3.2 ADA more.
 - **Execution units** of a channel with no sponsor rise, because of the longer constants and the
   checks that find `None`: in the 18 unit tests that upstream's suite and this one share and that
   run a channel through the validator, 3.9% to 10.5% more memory (mean 7.7%) and 3.5% to 10.4% more

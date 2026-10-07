@@ -5,7 +5,7 @@
 // server's own channel manager, or a facilitator the server has delegated the key to.
 import { Address, Assets, KeyHash, Transaction, TransactionHash, type UTxO } from "@evolution-sdk/evolution";
 import { Redeemer, Step, inlineDatum, type Stage, type Validator } from "../subbit.ts";
-import { FOLD, refOf, valueFor, validatorOf, type ChannelView } from "./cardano.ts";
+import { FOLD, referenceFor, refOf, valueFor, validatorOf, type ChannelView } from "./cardano.ts";
 import { retryQueries, type Chain } from "./chain.ts";
 import { WITH_OUR_UTXOS, collateralTarget, signedHex, type SeedWallet } from "./client.ts";
 import { assertKeepsFloor, assertRepays, repaymentOutput } from "./repay.ts";
@@ -74,8 +74,8 @@ export async function buildClaimTx(b: ClaimBuilder, batch: ClaimLine[]): Promise
   batch.forEach(({ v }, i) => {
     tx = tx.collectFrom({ inputs: [v.utxo], redeemer: i === 0 ? Redeemer.main(steps) : Redeemer.defer() });
   });
-  const ref = b.referenceScript ? await b.chain.getUnspent(b.referenceScript) : undefined;
-  tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: validator.script });
+  const ref = referenceFor(b.referenceScript ? await b.chain.getUnspent(b.referenceScript) : undefined, validator);
+  tx = ref ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: validator.script });
   const rows: ClaimRow[] = [];
   let redeemed = Assets.zero;
   for (const { channelId, totalClaimed, v } of batch) {
@@ -139,8 +139,8 @@ export async function buildEndTx(b: ClaimBuilder, v: ChannelView): Promise<strin
   if (v.datum.constants.provider !== b.providerKeyHash) throw new Error("R3: only the channel's own provider signs its End, and the provider key here is another's");
   const validator = validatorOf(v);
   let tx = b.wallet.newTx().collectFrom({ inputs: [v.utxo], redeemer: Redeemer.main([Step.end()]) });
-  const ref = b.referenceScript ? await b.chain.getUnspent(b.referenceScript) : undefined;
-  tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: validator.script });
+  const ref = referenceFor(b.referenceScript ? await b.chain.getUnspent(b.referenceScript) : undefined, validator);
+  tx = ref ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: validator.script });
   tx = tx.payToAddress(repaymentOutput(sponsor, v.ref)).addSigner({ keyHash: KeyHash.fromHex(b.providerKeyHash) });
   const availableUtxos = (await unspentOf(b)).filter((u) => Assets.hasOnlyLovelace(u.assets));
   const change = b.payout === "delegated" ? await b.wallet.address() : Address.fromBech32(b.payTo);

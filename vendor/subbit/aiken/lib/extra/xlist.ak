@@ -1,3 +1,7 @@
+// Modified from kompact-io/subbit-xyz @ 66648db: `ordered_insert` takes a smaller item, the one line
+// `Greater -> [item, x, ..xs]` where 66648db has `Greater -> fail @"Impossible"`. This is the fix upstream
+// merged in its pull request #10 (main at 74c20d2); see vendor/subbit/PROVENANCE.md.
+
 use aiken/builtin.{head_list, tail_list}
 use aiken/primitive/bytearray
 
@@ -50,7 +54,7 @@ pub fn ordered_insert(xs: List<ByteArray>, item: ByteArray) {
       when bytearray.compare(x, item) is {
         Less -> [x, ..ordered_insert(xs, item)]
         Equal -> [x, ..xs]
-        Greater -> fail @"Impossible"
+        Greater -> [item, x, ..xs]
       }
     _ -> [item]
   }

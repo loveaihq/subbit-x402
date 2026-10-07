@@ -9,14 +9,16 @@
 // signed and submitted as the next round's top-up. A Mutual refund closes the channel at the end.
 // `npm run evalrace -- [rounds]` (default 5), state in out/evalrace.json.
 import { Address, Assets, Client, InlineDatum, KeyHash, Transaction, TransactionHash, TxOut, UTxO, preprod } from "@evolution-sdk/evolution";
-import { Redeemer, Step, channelAddress, inlineDatum, newIouSigner, subbitScript, tagFromInput, type Constants } from "../../src/subbit.ts";
-import { txHashOf } from "../../src/x402/cardano.ts";
+import { Redeemer, Step, UPSTREAM, channelAddress, inlineDatum, newIouSigner, subbitScript, tagFromInput, type Constants } from "../../src/subbit.ts";
+import { referenceFor, txHashOf } from "../../src/x402/cardano.ts";
 import { BlockfrostChain, causeChain } from "../../src/x402/chain.ts";
 import { collateralTarget, signedHex } from "../../src/x402/client.ts";
-import { BF_BASE, ada, inputOf, keyHashHex, load, log, must, run, save } from "../chain.ts";
+import { BF_BASE, REF_STATE, ada, inputOf, keyHashHex, load, log, must, run, save } from "../chain.ts";
 
 const NETWORK = "cardano:preprod";
-const REFERENCE_SCRIPT = "544752f68665183e51c8ecb6e0a835543aec64a6ec8e7588d34470ddfd12cdb5#0";
+/** The reference-script output `npm run refscript -- deploy` recorded for the validator these runs use, if any: the output is read only when it carries that validator. */
+const deployed = load<{ out?: { txHash: string; index: number } }>(REF_STATE).out;
+const REFERENCE_SCRIPT = deployed ? `${deployed.txHash}#${deployed.index}` : undefined;
 const DEPOSIT = 2_000_000n;
 const ADD = 100_000n;
 const ACCOUNT = { consumer: 3, provider: 1 } as const;
@@ -67,9 +69,9 @@ const atChannel = (o: TxOut.TransactionOutput) => Address.toBech32(o.address) ==
 
 async function topUp(channel: UTxO.UTxO, change: UTxO.UTxO, pass: boolean) {
   const me = await consumer.address();
-  const ref = await chain.getUnspent(REFERENCE_SCRIPT);
+  const ref = referenceFor(REFERENCE_SCRIPT ? await chain.getUnspent(REFERENCE_SCRIPT) : undefined, UPSTREAM);
   let tx = consumer.newTx().collectFrom({ inputs: [channel], redeemer: Redeemer.main([Step.add()]) });
-  tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
+  tx = ref ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
   tx = tx
     .payToAddress({ address: channel.address, assets: Assets.fromLovelace(Assets.lovelaceOf(channel.assets) + ADD), datum: channel.datumOption as InlineDatum.InlineDatum })
     .addSigner({ keyHash: KeyHash.fromHex(keyHashHex(me)) });
@@ -131,13 +133,13 @@ run(async () => {
   await new Promise((res) => setTimeout(res, 20_000)); // Blockfrost's address index, for the SDK's own reads
   const channel = ours(hex, indexOf(hex, atChannel));
   const change = ours(hex, indexOf(hex, mine));
-  const ref = await chain.getUnspent(REFERENCE_SCRIPT);
+  const ref = referenceFor(REFERENCE_SCRIPT ? await chain.getUnspent(REFERENCE_SCRIPT) : undefined, UPSTREAM);
   let tx = consumer
     .newTx()
     .collectFrom({ inputs: [channel], redeemer: Redeemer.mutual() })
     .addSigner({ keyHash: KeyHash.fromHex(constants.consumer) })
     .addSigner({ keyHash: KeyHash.fromHex(constants.provider) });
-  tx = ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
+  tx = ref ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: subbitScript });
   const sb = await tx.build({ changeAddress: me, availableUtxos: [change], setCollateral: collateralTarget([change]), passAdditionalUtxos: true });
   const witnessed = await sb.assemble([await sb.partialSign(), await provider.signTx(await sb.toTransaction())]);
   const refund = TransactionHash.toHex(await witnessed.submit());

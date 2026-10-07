@@ -24,8 +24,11 @@
 //
 // Usage: npm run x402 -- <phase|all>   (`all` is step 4's sequence; topup and autosettle run on their own)
 // Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID; SUBBIT_CURRENCY=token prices the
-//        route in the sUSDM stand-in (`npm run mint -- mint`) instead of lovelace, state in out/x402-token/;
-//        X402_OUT=<name> keeps a run's state in out/<name>/ instead
+//        route in the sUSDM stand-in (`npm run mint -- mint`) instead of lovelace, state in out/x402-token-<hash>/;
+//        X402_OUT=<name> keeps a run's state in out/<name>/ instead; SPIKE_CONSUMER=<account> makes
+//        another account the paying client (spike/chain.ts). The validator is upstream's fixed build,
+//        6d877463… (RESULTS.md step 18): the state of a run at it is in out/x402-<hash>/ by default,
+//        and step 4's, at 62ce4309…, in out/x402/.
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { rmSync, existsSync } from "node:fs";
@@ -58,7 +61,7 @@ const DEL_PORT = 7412;
 const URL_DELEGATED = `http://127.0.0.1:${DEL_PORT}/delegated`;
 /** Shared by the keyless server and the facilitator holding its key; both run in this process. */
 const DELEGATION_SECRET = randomBytes(32).toString("hex");
-const OUT = new URL(`../../out/${process.env.X402_OUT ?? (TOKEN ? "x402-token" : "x402")}/`, import.meta.url);
+const OUT = new URL(`../../out/${process.env.X402_OUT ?? `${TOKEN ? "x402-token" : "x402"}-${SUBBIT_HASH.slice(0, 8)}`}/`, import.meta.url);
 const ASSET = TOKEN ? token!.unit : "lovelace";
 const dir = (p: string) => fileURLToPath(new URL(p, OUT));
 const RESULTS = new URL("results.json", OUT);

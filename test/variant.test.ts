@@ -3,6 +3,10 @@
 // facilitator give a validator, what the facilitator refuses at an opening, and the builders: an
 // opening that names the seller, the exits that repay the sponsor, and the server's End. The
 // builders run for real, on an SDK client whose provider is answered from a table (offline.ts).
+// The registry has three validators: Subbit's fixed one (UPSTREAM, 6d877463), Subbit's before the
+// fix (UPSTREAM_66648DB, 62ce4309), where earlier channels still sit, and the variant. The builders'
+// tests that name a validator run at both of Subbit's, so a channel opened before the fix goes on
+// being followed, claimed, closed, refunded and recovered, the compiled scripts included.
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -36,6 +40,8 @@ import {
   SUBBIT_HASH,
   Step,
   UPSTREAM,
+  UPSTREAM_66648DB,
+  UPSTREAM_VALIDATORS,
   VALIDATORS,
   addressData,
   channelAddress,
@@ -52,9 +58,9 @@ import {
   type Stage,
   type Validator,
 } from "../src/subbit.ts";
-import { channelReserve, constantsOf, datumBindingError, readChannel, sameAddress, sponsoredChannel, txHashOf, type ChannelView } from "../src/x402/cardano.ts";
+import { channelReserve, constantsOf, datumBindingError, readChannel, referenceFor, sameAddress, sponsoredChannel, txHashOf, type ChannelView } from "../src/x402/cardano.ts";
 import { BlockfrostChain, type Chain } from "../src/x402/chain.ts";
-import { BatchSettlementCardanoClient, EXIT_FEE_ADA, EXIT_TOKEN_OUTPUT_ADA, FileClientStorage, assertExitFunds, derivedIouSigner, iouRootOf, minAdaOutput, serverKey } from "../src/x402/client.ts";
+import { BatchSettlementCardanoClient, EXIT_FEE_ADA, EXIT_TOKEN_OUTPUT_ADA, FileClientStorage, assertExitFunds, derivedIouSigner, iouRootOf, minAdaOutput, serverKey, signedHex } from "../src/x402/client.ts";
 import { buildClaimTx, buildEndTx, type ClaimBuilder } from "../src/x402/claimtx.ts";
 import { BatchSettlementCardanoFacilitator } from "../src/x402/facilitator.ts";
 import { ChannelManager } from "../src/x402/manager.ts";
@@ -63,6 +69,7 @@ import { BatchSettlementCardanoServer, InMemoryChannelStorage } from "../src/x40
 import { SponsorPool, checkSponsoredOpen, type FeeSponsorOffer } from "../src/x402/sponsor.ts";
 import { TxCheckError, checkDeposit, checkTopUp, spendRedeemers } from "../src/x402/txcheck.ts";
 import { Err, delegationMac, parseClientPayload, parseExtra, type ChannelConfig } from "../src/x402/types.ts";
+import { buildMixedBatch, type Order } from "../spike/x402/mixed.ts";
 import { OFFLINE_BASE, offlineBlockfrost, offlineWallet } from "./offline.ts";
 
 const NETWORK = "cardano:preprod";
@@ -102,6 +109,8 @@ const iou = iouSignerFromSeed(new Uint8Array(32).fill(1));
 const cfg = (over: Partial<ChannelConfig> = {}): ChannelConfig => ({ payer: buyer.keyHash, payerAuthorizer: iou.publicKey, receiver: PAY_TO, receiverAuthorizer: seller.keyHash, token: TUSDM, withdrawDelay: 900, ...over });
 const chan = channelAddress(0, undefined, SPONSORED);
 const chanUp = channelAddress(0);
+/** A channel opened at Subbit's validator before its fix: another address, the same datum. */
+const chanOld = channelAddress(0, undefined, UPSTREAM_66648DB);
 /** The buyer's UTxO an opening spends, and so the tag of its channel (ADR tag.md). */
 const seedInput = input(0xb0, 1);
 const TAG = tagFromInput(seedInput);
@@ -110,22 +119,29 @@ const constantsFor = (over: Partial<Constants> = {}): Constants => ({ ...constan
 
 // ---- the validators ------------------------------------------------------------------------
 
-test("validators: Subbit's and the variant's hashes and scripts, the registry, and the addresses", () => {
-  assert.equal(UPSTREAM.hash, "62ce4309e37e09e5c633c96c6ae68061c434f122d32626d6912d7c2a");
+test("validators: Subbit's two builds and the variant's hashes and scripts, the registry, and the addresses", () => {
+  assert.equal(UPSTREAM.hash, "6d8774631fece31d0c768afb960c9a8a9957f8a85fa31deae1159094");
+  assert.equal(UPSTREAM_66648DB.hash, "62ce4309e37e09e5c633c96c6ae68061c434f122d32626d6912d7c2a");
   assert.equal(SPONSORED.hash, "20b64ee22a509c164e0e16ad1189b12be7f0a497b0eb096180c923ea");
-  assert.deepEqual([UPSTREAM.sponsored, SPONSORED.sponsored], [false, true]);
-  // The names this package has always exported are upstream's.
+  assert.deepEqual([UPSTREAM.sponsored, UPSTREAM_66648DB.sponsored, SPONSORED.sponsored], [false, false, true]);
+  assert.deepEqual(VALIDATORS.map((v) => v.name), ["upstream", "upstream-66648db", "sponsored"]);
+  assert.deepEqual(UPSTREAM_VALIDATORS, [UPSTREAM, UPSTREAM_66648DB]);
+  // The names this package has always exported are upstream's, the fixed build.
   assert.equal(SUBBIT_HASH, UPSTREAM.hash);
   assert.equal(subbitScript, UPSTREAM.script);
   for (const v of VALIDATORS) assert.equal(ScriptHash.toHex(ScriptHash.fromScript(v.script)), v.hash, `${v.name}'s script hashes to its blueprint's hash`);
   assert.equal(validatorByHash(SPONSORED.hash.toUpperCase()), SPONSORED);
+  assert.equal(validatorByHash(UPSTREAM_66648DB.hash), UPSTREAM_66648DB);
   assert.equal(validatorByHash("00".repeat(28)), undefined);
   for (const v of VALIDATORS) assert.equal(ScriptHash.toHex(channelAddress(0, undefined, v).paymentCredential as ScriptHash.ScriptHash), v.hash);
-  assert.equal(Address.toBech32(channelAddress(0)), Address.toBech32(chanUp), "a channel is upstream's unless the validator is named");
+  assert.equal(Address.toBech32(channelAddress(0)), Address.toBech32(chanUp), "a channel is upstream's, fixed, unless the validator is named");
   assert.notEqual(Address.toBech32(chan), Address.toBech32(chanUp));
+  assert.notEqual(Address.toBech32(chanOld), Address.toBech32(chanUp), "the build before the fix is an address of its own");
   // The delegation part is the consumer's choice, as before.
   assert.equal(Address.toBech32(channelAddress(0, kh(buyer.keyHash), SPONSORED)).startsWith("addr_test1z"), true);
   assert.ok("error" in readChannel(utxoAt(chanUp, 1, 0, Assets.fromLovelace(1n)), SPONSORED.hash), "a UTxO at one validator is not a channel of the other");
+  assert.ok("error" in readChannel(utxoAt(chanUp, 1, 0, Assets.fromLovelace(1n)), UPSTREAM_66648DB.hash), "nor of Subbit's other build");
+  assert.ok("error" in readChannel(utxoAt(chanOld, 1, 0, Assets.fromLovelace(1n)), UPSTREAM.hash));
 });
 
 // ---- the datum on the wire: Aiken's pinned bytes ----------------------------------------------
@@ -135,8 +151,9 @@ const AIKEN = readFileSync(new URL("../variant/sponsored/aiken/lib/mark/sponsore
 
 // What the Aiken fixture is built from (lib/mark/fixture.ak, vectors.ak): key A's IOU key, the tag of the input ab..ab#0,
 // USDM at the policy 0x33.., consumer 0x11.., provider 0x22.., a one-hour close period, the sponsor's base address of the
-// keys 0x66.. and 0x77.. with a floor of 1,200,000. The fixture's own_hash is upstream's, so the variant is asked for
-// its datum under that hash, which is the one thing it changes.
+// keys 0x66.. and 0x77.. with a floor of 1,200,000. The fixture's own_hash is upstream's at 66648db (62ce4309): the
+// variant's Aiken vectors were written then and are not Subbit's to change, so the variant is asked for its datum
+// under that hash, which is the one thing it changes.
 const fixtureConstants = (): Constants => ({
   tag: tagFromInput(new TransactionInput.TransactionInput({ transactionId: TransactionHash.fromHex("ab".repeat(32)), index: 0n })),
   currency: { kind: "asset", policy: "33".repeat(28), name: Buffer.from("USDM").toString("hex") },
@@ -146,22 +163,22 @@ const fixtureConstants = (): Constants => ({
   closePeriodMs: 3_600_000n,
   sponsor: { address: bech(kh("66".repeat(28)), kh("77".repeat(28))), floor: 1_200_000n },
 });
-const asFixture: Validator = { ...SPONSORED, hash: UPSTREAM.hash };
+const asFixture: Validator = { ...SPONSORED, hash: UPSTREAM_66648DB.hash };
 
 test("the sponsored datum is byte for byte the Aiken test's, and reads back", () => {
   const vector = /const datum_opened_sponsored: ByteArray =\s*#"([0-9a-f]+)"/.exec(AIKEN)?.[1];
   assert.ok(vector, "the vector is where this test looks for it");
   const stage: Stage = { kind: "opened", subbed: 2_500_000n };
   assert.equal(Data.toCBORHex(datumData(fixtureConstants(), stage, asFixture)), vector);
-  assert.deepEqual(parseDatum(Data.fromCBORHex(vector), asFixture, 0), { ownHash: UPSTREAM.hash, constants: fixtureConstants(), stage });
+  assert.deepEqual(parseDatum(Data.fromCBORHex(vector), asFixture, 0), { ownHash: UPSTREAM_66648DB.hash, constants: fixtureConstants(), stage });
   // Under its own hash the datum is the same but for the `own_hash` it names.
-  assert.equal(Data.toCBORHex(datumData(fixtureConstants(), stage, SPONSORED)), vector.replace(UPSTREAM.hash, SPONSORED.hash));
+  assert.equal(Data.toCBORHex(datumData(fixtureConstants(), stage, SPONSORED)), vector.replace(UPSTREAM_66648DB.hash, SPONSORED.hash));
   // No sponsor is `None`, the three bytes `d87a80` that end the constants: the vector with its `Some((address, floor))` taken out.
   const { sponsor: _sponsor, ...bare } = fixtureConstants();
   const noSponsor = vector.replace(/1a0036ee80d8799f9f[0-9a-f]+1a00124f80ffffff/, "1a0036ee80d87a80ff");
   assert.notEqual(noSponsor, vector);
   assert.equal(Data.toCBORHex(datumData(bare, stage, asFixture)), noSponsor);
-  assert.deepEqual(parseDatum(Data.fromCBORHex(noSponsor), asFixture, 0), { ownHash: UPSTREAM.hash, constants: bare, stage });
+  assert.deepEqual(parseDatum(Data.fromCBORHex(noSponsor), asFixture, 0), { ownHash: UPSTREAM_66648DB.hash, constants: bare, stage });
 });
 
 test("the repayment's datum is byte for byte the Aiken test's, for every width of the index", () => {
@@ -177,7 +194,7 @@ test("the repayment's datum is byte for byte the Aiken test's, for every width o
   assert.throws(() => repaymentDatum(`${"cafe".repeat(16)}#01`), /not an output reference/);
 });
 
-test("datums round-trip through Data and CBOR at both validators, for every stage, currency and sponsor", () => {
+test("datums round-trip through Data and CBOR at every validator, for every stage, currency and sponsor", () => {
   const key = (n: string) => kh(n.repeat(28));
   const script = (n: string) => ScriptHash.fromHex(n.repeat(28));
   const sponsors: Array<Sponsor | undefined> = [
@@ -207,12 +224,13 @@ test("datums round-trip through Data and CBOR at both validators, for every stag
       }
     }
   }
-  assert.equal(n, 4 * 2 * (1 + 5));
-  // The constants have seven entries at the variant, six at upstream, whatever the sponsor.
+  assert.equal(n, 4 * 2 * (UPSTREAM_VALIDATORS.length * 1 + 5));
+  // The constants have seven entries at the variant, six at either build of upstream's, whatever the sponsor.
   const constantsOf7 = (d: Data.Data) => ((d as Data.Data[])[1] as Data.Data[]).length;
   assert.equal(constantsOf7(datumData(fixtureConstants(), stages[0]!, SPONSORED)), 7);
   assert.equal(constantsOf7(datumData(constantsFor(), stages[0]!, SPONSORED)), 7);
   assert.equal(constantsOf7(datumData(constantsFor(), stages[0]!, UPSTREAM)), 6);
+  assert.equal(constantsOf7(datumData(constantsFor(), stages[0]!, UPSTREAM_66648DB)), 6);
 });
 
 test("a sponsor's address is read on the channel's network: the datum holds the credentials, not the network", () => {
@@ -234,9 +252,11 @@ test("a datum with the other validator's number of constants, or an address that
   assert.throws(() => parseDatum(sixAtTheVariant, SPONSORED, 0), /6 where the sponsored validator reads 7: no step could read this datum, so whatever it holds is locked for good/);
   assert.throws(() => parseDatum(six, SPONSORED, 0), /6 where the sponsored validator reads 7/);
   assert.throws(() => parseDatum(seven, UPSTREAM, 0), /7 where the upstream validator reads 6/);
+  assert.throws(() => parseDatum(seven, UPSTREAM_66648DB, 0), /7 where the upstream-66648db validator reads 6/);
   assert.throws(() => parseDatum(seven), /7 where the upstream validator reads 6/);
   assert.doesNotThrow(() => parseDatum(six));
   assert.throws(() => datumData(fixtureConstants(), stage, UPSTREAM), /the upstream validator has no sponsor constant/);
+  assert.throws(() => datumData(fixtureConstants(), stage, UPSTREAM_66648DB), /the upstream-66648db validator has no sponsor constant/);
   assert.throws(() => datumData({ ...fixtureConstants(), sponsor: { address: bech(kh("66".repeat(28))), floor: -1n } }, stage, SPONSORED), /must not be negative/);
   // A reward address, or a pointer stake credential, is no address a repayment can go to.
   assert.throws(() => addressData("stake_test1upnxvenxvenxvenxvenxvenxvenxvenxvenxvenxvenxveshap7dm"), /Invalid address prefix/);
@@ -292,10 +312,12 @@ const req = (scriptHash: string, over: Partial<PaymentRequirements> = {}): Payme
 });
 const newStorage = () => new FileClientStorage(mkdtempSync(join(tmpdir(), "variant-")));
 
-test("trust: a client opens, tops up and pays only at a validator it trusts, upstream's alone by default", async () => {
+test("trust: a client opens, tops up and pays only at a validator it trusts, Subbit's two builds by default", async () => {
   // A wallet and a chain that would throw on first use: the refusal comes before either is touched.
   const bare = new BatchSettlementCardanoClient({ wallet: {} as never, storage: newStorage(), chain: {} as never });
-  await assert.rejects(bare.createPaymentPayload(2, req(SPONSORED.hash)), /server asks for a validator this client does not trust: 20b64ee2.* \(it trusts 62ce4309/);
+  await assert.rejects(bare.createPaymentPayload(2, req(SPONSORED.hash)), /server asks for a validator this client does not trust: 20b64ee2.* \(it trusts 6d877463.*, 62ce4309/);
+  // Both of Subbit's pass the check, the fixed one that new channels open at and the one before its fix (and on to the wallet, which here is nothing).
+  for (const v of UPSTREAM_VALIDATORS) await assert.rejects(bare.createPaymentPayload(2, req(v.hash)), (e: Error) => !/does not trust/.test(e.message), v.name);
   await assert.rejects(bare.createPaymentPayload(2, req("ab".repeat(28))), /does not trust: abababab/);
   const pr: PaymentRequired = { x402Version: 2, resource: { url: "http://seller.invalid/refund" }, accepts: [req(SPONSORED.hash)] };
   await assert.rejects(bare.refundPayload(pr), /does not trust/);
@@ -305,9 +327,13 @@ test("trust: a client opens, tops up and pays only at a validator it trusts, ups
   const both = new BatchSettlementCardanoClient({ wallet: {} as never, storage: newStorage(), chain: {} as never, trustedValidators: [UPSTREAM, SPONSORED] });
   await assert.rejects(both.createPaymentPayload(2, req(SPONSORED.hash)), (e: Error) => !/does not trust/.test(e.message));
   await assert.rejects(both.createPaymentPayload(2, req("ab".repeat(28))), /does not trust/);
-  // Trusting the variant alone refuses upstream's.
+  // Trusting the variant alone refuses both of upstream's.
   const only = new BatchSettlementCardanoClient({ wallet: {} as never, storage: newStorage(), chain: {} as never, trustedValidators: [SPONSORED] });
-  await assert.rejects(only.createPaymentPayload(2, req(UPSTREAM.hash)), /does not trust: 62ce4309/);
+  await assert.rejects(only.createPaymentPayload(2, req(UPSTREAM.hash)), /does not trust: 6d877463/);
+  await assert.rejects(only.createPaymentPayload(2, req(UPSTREAM_66648DB.hash)), /does not trust: 62ce4309/);
+  // And a client that trusts only the fixed one is not moved by a server that names the old: its channels there are for another client.
+  const fixed = new BatchSettlementCardanoClient({ wallet: {} as never, storage: newStorage(), chain: {} as never, trustedValidators: [UPSTREAM] });
+  await assert.rejects(fixed.createPaymentPayload(2, req(UPSTREAM_66648DB.hash)), /does not trust: 62ce4309/);
 });
 
 test("recover: a client finds its channels at every validator it trusts, or at the one it is told", async () => {
@@ -316,9 +342,9 @@ test("recover: a client finds its channels at every validator it trusts, or at t
   const view = (v: Validator, tag: string) => {
     const at = channelAddress(0, undefined, v);
     const constants = { ...constantsOf(cfg({ payer: me }), tag), consumer: me };
-    return { ref: `${txid(v.sponsored ? 0xe1 : 0xe0)}#0`, address: at, lovelace: 2_500_000n, amount: 1_000n, datum: { ownHash: v.hash, constants, stage: { kind: "opened", subbed: 0n } } } as unknown as ChannelView;
+    return { ref: `${txid(0xe0 + VALIDATORS.indexOf(v))}#0`, address: at, lovelace: 2_500_000n, amount: 1_000n, datum: { ownHash: v.hash, constants, stage: { kind: "opened", subbed: 0n } } } as unknown as ChannelView;
   };
-  const views = { [UPSTREAM.hash]: view(UPSTREAM, "a1".repeat(32)), [SPONSORED.hash]: view(SPONSORED, "b2".repeat(32)) };
+  const views = { [UPSTREAM.hash]: view(UPSTREAM, "a1".repeat(32)), [UPSTREAM_66648DB.hash]: view(UPSTREAM_66648DB, "a2".repeat(32)), [SPONSORED.hash]: view(SPONSORED, "b2".repeat(32)) };
   const asked: string[] = [];
   const chain = {
     network: NETWORK,
@@ -333,18 +359,26 @@ test("recover: a client finds its channels at every validator it trusts, or at t
     const found = await client.recover(NETWORK, hash);
     return { asked: [...asked], found: found.map((c) => c.scriptHash) };
   };
-  assert.deepEqual(await run(undefined), { asked: [UPSTREAM.hash], found: [UPSTREAM.hash] });
+  const both = [UPSTREAM.hash, UPSTREAM_66648DB.hash];
+  // By default, at Subbit's two builds: a channel opened before the fix comes back with the ones after it.
+  assert.deepEqual(await run(undefined), { asked: both, found: both });
+  assert.deepEqual(await run(undefined, UPSTREAM_66648DB.hash), { asked: [UPSTREAM_66648DB.hash], found: [UPSTREAM_66648DB.hash] });
+  assert.deepEqual(await run(undefined, UPSTREAM.hash), { asked: [UPSTREAM.hash], found: [UPSTREAM.hash] });
   assert.deepEqual(await run([UPSTREAM, SPONSORED]), { asked: [UPSTREAM.hash, SPONSORED.hash], found: [UPSTREAM.hash, SPONSORED.hash] });
+  assert.deepEqual(await run([...UPSTREAM_VALIDATORS, SPONSORED]), { asked: [...both, SPONSORED.hash], found: [...both, SPONSORED.hash] });
   assert.deepEqual(await run([UPSTREAM, SPONSORED], SPONSORED.hash), { asked: [SPONSORED.hash], found: [SPONSORED.hash] });
   assert.deepEqual(await run([SPONSORED]), { asked: [SPONSORED.hash], found: [SPONSORED.hash] });
 });
 
-test("server: its configured validator's hash is what its 402 names, and one this package does not know is refused", async () => {
-  const server = (scriptHash: string) => new BatchSettlementCardanoServer({ payTo: PAY_TO, receiverAuthorizer: seller.keyHash, scriptHash, chain: {} as never });
+test("server: its configured validator's hash is what its 402 names, the fixed one when none is given, and one this package does not know is refused", async () => {
+  const server = (scriptHash?: string) => new BatchSettlementCardanoServer({ payTo: PAY_TO, receiverAuthorizer: seller.keyHash, ...(scriptHash ? { scriptHash } : {}), chain: {} as never });
   for (const v of VALIDATORS) {
     const enhanced = await server(v.hash).enhancePaymentRequirements(req(UPSTREAM.hash), { x402Version: 2, scheme: "batch-settlement", network: NETWORK }, []);
     assert.equal(parseExtra(enhanced).scriptHash, v.hash);
   }
+  // New channels open at the fixed validator unless the server is told its channels are at another.
+  const unnamed = await server().enhancePaymentRequirements(req(UPSTREAM_66648DB.hash), { x402Version: 2, scheme: "batch-settlement", network: NETWORK }, []);
+  assert.equal(parseExtra(unnamed).scriptHash, UPSTREAM.hash);
   assert.throws(() => server("ab".repeat(28)), /not a validator this package knows/);
 });
 
@@ -394,16 +428,22 @@ test("facilitator, an opening at the variant: a sponsored one passes when it nam
   // A buyer that pays its own reserve names no sponsor, and the variant takes that too.
   const own = channelReserve(chan, constantsFor(), CPB);
   assert.equal(deposit(opening(plainDatum(), tokens(1_000_000n, own))).capacity, 1_000_000n);
-  // At upstream's address, upstream's datum is as it was.
-  const upstreamReserve = channelReserve(chanUp, constantsFor(), CPB);
-  assert.equal(deposit(opening(plainDatum(UPSTREAM), tokens(1_000_000n, upstreamReserve), chanUp), { scriptHash: UPSTREAM.hash }).capacity, 1_000_000n);
+  // At either of upstream's addresses, upstream's datum is as it was.
+  for (const [v, at] of [[UPSTREAM, chanUp], [UPSTREAM_66648DB, chanOld]] as const) {
+    const upstreamReserve = channelReserve(at, constantsFor(), CPB);
+    assert.equal(deposit(opening(plainDatum(v), tokens(1_000_000n, upstreamReserve), at), { scriptHash: v.hash }).capacity, 1_000_000n, v.name);
+    // Its datum names its own hash: a channel at one address naming the other's hash is nobody's.
+    const other = v === UPSTREAM ? UPSTREAM_66648DB : UPSTREAM;
+    refuses(() => deposit(opening(plainDatum(other), tokens(1_000_000n, upstreamReserve), at), { scriptHash: v.hash }), /channel datum does not match the channel config/, Err.channelState);
+  }
 });
 
 test("facilitator, an opening at the variant: each way a datum could lock funds or cheat the sponsor is refused with its reason", () => {
   const six = datumData(constantsFor(), opened, { ...UPSTREAM, hash: SPONSORED.hash });
   refuses(() => deposit(opening(six, tokens(1_000_000n, RESERVE))), /channel datum: constants: 6 where the sponsored validator reads 7.*locked for good/);
-  // And upstream's address takes no seven.
+  // And upstream's address takes no seven, at either build of it.
   refuses(() => deposit(opening(sponsoredDatum(), tokens(1_000_000n, RESERVE), chanUp), { scriptHash: UPSTREAM.hash }), /channel datum: constants: 7 where the upstream validator reads 6/);
+  refuses(() => deposit(opening(sponsoredDatum(), tokens(1_000_000n, RESERVE), chanOld), { scriptHash: UPSTREAM_66648DB.hash }), /channel datum: constants: 7 where the upstream-66648db validator reads 6/);
   // R0: a sponsored channel in ADA could only be spent by Mutual.
   const ada = { ...SPONSORED_OPENING.constants, currency: { kind: "ada" } as const, sponsor: { address: PAY_TO, floor: RESERVE } };
   refuses(() => deposit(opening(datumData(ada, opened, SPONSORED), Assets.fromLovelace(1_000_000n + RESERVE)), { config: cfg({ token: "lovelace" }) }), /currency must be a token \(R0\)/);
@@ -435,12 +475,14 @@ test("facilitator: it serves the validators it is given, and reads an opening at
   const good = opening(sponsoredDatum(), tokens(1_000_000n, RESERVE));
   const variant = req(SPONSORED.hash);
 
-  // By default only upstream's: a payment at the variant is for a validator it does not serve.
+  // By default only Subbit's, both builds: a payment at the variant is for a validator it does not serve.
   const plain = new BatchSettlementCardanoFacilitator(chain, {});
   const refused = await plain.verify(pay(variant, good), variant);
   assert.deepEqual([refused.isValid, refused.invalidReason], [false, Err.extra]);
-  assert.match(refused.invalidMessage ?? "", /serves script 62ce4309/);
-  assert.equal((await new BatchSettlementCardanoFacilitator(chain, { scriptHash: SUBBIT_HASH }).verify(pay(variant, good), variant)).invalidReason, Err.extra, "the old option still names upstream's alone");
+  assert.match(refused.invalidMessage ?? "", /serves script 6d877463.*, 62ce4309/);
+  assert.equal((await new BatchSettlementCardanoFacilitator(chain, { scriptHash: SUBBIT_HASH }).verify(pay(variant, good), variant)).invalidReason, Err.extra, "the old option still names one validator alone");
+  assert.match((await new BatchSettlementCardanoFacilitator(chain, { scriptHash: SUBBIT_HASH }).verify(pay(variant, good), variant)).invalidMessage ?? "", /serves script 6d877463[0-9a-f]{48}$/, "which is now the fixed one, not the one before it");
+  assert.match((await new BatchSettlementCardanoFacilitator(chain, { scriptHash: UPSTREAM_66648DB.hash }).verify(pay(variant, good), variant)).invalidMessage ?? "", /serves script 62ce4309[0-9a-f]{48}$/, "and can still name the old one");
   assert.throws(() => new BatchSettlementCardanoFacilitator(chain, { scriptHash: "ab".repeat(28) }), /not a validator this package knows/);
 
   const serving = new BatchSettlementCardanoFacilitator(chain, { validators: [UPSTREAM, SPONSORED] });
@@ -569,7 +611,7 @@ test("R2: an ending is repaid only by an output at the sponsor's whole address, 
 const WALLET_TOKENS = 20_000_000n;
 
 /** A wallet with tUSDM and ADA, and a 402 for `scriptHash` that may carry the seller's fee-sponsor offer. */
-async function openingWorld(scriptHash: string, withOffer: boolean, trusted: Validator[] = [UPSTREAM, SPONSORED]) {
+async function openingWorld(scriptHash: string, withOffer: boolean, trusted: readonly Validator[] = [...UPSTREAM_VALIDATORS, SPONSORED]) {
   const offline = offlineBlockfrost();
   const wallet = offlineWallet();
   const me = await wallet.address();
@@ -646,20 +688,26 @@ test("an opening at the variant with no offer names no sponsor: the buyer's rese
   }
 });
 
-test("an opening at upstream's validator is as it was, an offer or not: six constants, upstream's reserve", async () => {
-  for (const withOffer of [true, false]) {
-    const w = await openingWorld(UPSTREAM.hash, withOffer);
-    try {
-      const { p, hex, channel } = await w.open();
-      const datum = parseDatum((channel.datumOption as InlineDatum.InlineDatum).data);
-      assert.equal(datum.constants.sponsor, undefined);
-      assert.equal((((channel.datumOption as InlineDatum.InlineDatum).data as Data.Data[])[1] as Data.Data[]).length, 6);
-      assert.equal(Assets.lovelaceOf(channel.assets), channelReserve(chanUp, datum.constants, CPB));
-      assert.equal(deposit(hex, { config: p.channelConfig, channelId: p.voucher.channelId, amount: BigInt(p.deposit.amount), scriptHash: UPSTREAM.hash }).capacity, BigInt(p.deposit.amount));
-    } finally {
-      w.offline.restore();
+test("an opening at upstream's validator is as it was, an offer or not: six constants, upstream's reserve, at either build of it", async () => {
+  for (const [v, at] of [[UPSTREAM, chanUp], [UPSTREAM_66648DB, chanOld]] as const) {
+    for (const withOffer of [true, false]) {
+      const w = await openingWorld(v.hash, withOffer);
+      try {
+        const { p, hex, channel } = await w.open();
+        const datum = parseDatum((channel.datumOption as InlineDatum.InlineDatum).data, v, 0);
+        assert.equal(datum.ownHash, v.hash, "the datum names the validator the channel is at");
+        assert.equal(datum.constants.sponsor, undefined);
+        assert.equal((((channel.datumOption as InlineDatum.InlineDatum).data as Data.Data[])[1] as Data.Data[]).length, 6);
+        assert.equal(Address.toBech32(channel.address), Address.toBech32(at));
+        assert.equal(Assets.lovelaceOf(channel.assets), channelReserve(at, datum.constants, CPB));
+        assert.equal(deposit(hex, { config: p.channelConfig, channelId: p.voucher.channelId, amount: BigInt(p.deposit.amount), scriptHash: v.hash }).capacity, BigInt(p.deposit.amount));
+      } finally {
+        w.offline.restore();
+      }
     }
   }
+  // The reserve is the same at both: the datum is as long, the hash being as long.
+  assert.equal(channelReserve(chanUp, constantsFor(), CPB), channelReserve(chanOld, constantsFor(), CPB));
 });
 
 test("seller: an opening that spends its offer at the variant must name it as sponsor, or the reserve it pays is not coming back", async () => {
@@ -791,14 +839,21 @@ test("the chain reads a channel at the variant by the variant's datum, and a six
     const plain = utxoAt(chan, 0xc1, 0, tokens(5n, 3_000_000n), plainDatum());
     const six = utxoAt(chan, 0xc2, 0, tokens(5n, 3_000_000n), datumData(constantsFor(), opened, { ...UPSTREAM, hash: SPONSORED.hash }));
     const upstream = utxoAt(chanUp, 0xc3, 0, tokens(5n, 3_000_000n), plainDatum(UPSTREAM));
+    const before = utxoAt(chanOld, 0xc4, 0, tokens(5n, 3_000_000n), plainDatum(UPSTREAM_66648DB));
     offline.setUtxos(chan, [sponsored, plain, six]);
     offline.setUtxos(chanUp, [upstream]);
+    offline.setUtxos(chanOld, [before]);
     const chain = new BlockfrostChain(NETWORK, OFFLINE_BASE, "key", 1);
     const atVariant = await chain.channels(SPONSORED.hash);
     assert.deepEqual(atVariant.map((c) => c.ref), [refOf(0xc0, 1), refOf(0xc1, 0)], "the datum with six constants is no channel: nothing could spend it");
     assert.deepEqual(atVariant[0]!.datum.constants.sponsor, { address: PAY_TO, floor: RESERVE });
     assert.equal(atVariant[1]!.datum.constants.sponsor, undefined);
     assert.deepEqual((await chain.channels(UPSTREAM.hash)).map((c) => c.ref), [refOf(0xc3, 0)]);
+    // A channel opened before the fix is found and followed at its own validator, and only there.
+    assert.deepEqual((await chain.channels(UPSTREAM_66648DB.hash)).map((c) => c.ref), [refOf(0xc4, 0)]);
+    assert.equal((await chain.followChannel(refOf(0xc4, 0), UPSTREAM_66648DB.hash, TAG))?.datum.ownHash, UPSTREAM_66648DB.hash);
+    assert.equal(await chain.followChannel(refOf(0xc4, 0), UPSTREAM.hash, TAG), undefined);
+    assert.equal(await chain.followChannel(refOf(0xc3, 0), UPSTREAM_66648DB.hash, TAG), undefined);
     // Followed from a position of it, a channel is read the same way, and only at its own validator.
     const followed = await chain.followChannel(refOf(0xc0, 1), SPONSORED.hash, TAG);
     assert.equal(followed?.lovelace, RESERVE);
@@ -899,7 +954,7 @@ async function refundWorld(o: { validator: Validator; sponsored: boolean }) {
 }
 
 test("a refund spends the channel with Mutual and the script of the validator it is at, sponsored or not", async () => {
-  for (const [validator, sponsored] of [[UPSTREAM, false], [SPONSORED, false], [SPONSORED, true]] as const) {
+  for (const [validator, sponsored] of [[UPSTREAM, false], [UPSTREAM_66648DB, false], [SPONSORED, false], [SPONSORED, true]] as const) {
     const w = await refundWorld({ validator, sponsored });
     try {
       const made = await w.client.refundPayload(w.pr, TAG);
@@ -1119,8 +1174,8 @@ test("a buyer's close keeps the channel's value, the floor with it, and its spon
   }
 });
 
-test("exits of a channel nobody sponsors add no repayment, at the variant or at upstream's validator", async () => {
-  for (const [validator, exit] of [[SPONSORED, "elapse"], [SPONSORED, "end"], [UPSTREAM, "elapse"], [UPSTREAM, "end"]] as const) {
+test("exits of a channel nobody sponsors add no repayment, at the variant or at either build of upstream's validator", async () => {
+  for (const [validator, exit] of [[SPONSORED, "elapse"], [SPONSORED, "end"], [UPSTREAM, "elapse"], [UPSTREAM, "end"], [UPSTREAM_66648DB, "elapse"], [UPSTREAM_66648DB, "end"]] as const) {
     const w = await exitWorld({ validator, sponsored: false, stage: exit === "elapse" ? closed : settled, held: 1_000_000n });
     try {
       if (exit === "elapse") await w.client.elapse(TAG, { wait: false });
@@ -1193,7 +1248,7 @@ async function topUpWorld(o: { validator: Validator; sponsored: boolean; offer?:
 }
 
 test("a top-up keeps the channel's datum and its whole ADA, at either validator, sponsored or not, and the facilitator reads it as one", async () => {
-  for (const [validator, sponsored, offer] of [[UPSTREAM, false, false], [SPONSORED, false, false], [SPONSORED, true, true], [SPONSORED, true, false]] as const) {
+  for (const [validator, sponsored, offer] of [[UPSTREAM, false, false], [UPSTREAM_66648DB, false, false], [SPONSORED, false, false], [SPONSORED, true, true], [SPONSORED, true, false]] as const) {
     const w = await topUpWorld({ validator, sponsored, offer });
     const label = `${validator.name}${sponsored ? ", sponsored" : ""}${offer ? ", on the seller's offer" : ""}`;
     try {
@@ -1629,8 +1684,8 @@ test("the compiled variant accepts the steps that keep a sponsored channel going
   }
 });
 
-test("the compiled variant accepts the mutual refunds the client builds, and the compiled upstream the same refund of a channel at its own address", aiken, async () => {
-  for (const [validator, sponsored] of [[UPSTREAM, false], [SPONSORED, false], [SPONSORED, true]] as const) {
+test("the compiled variant accepts the mutual refunds the client builds, and the compiled upstream, both builds, the same refund of a channel at its own address", aiken, async () => {
+  for (const [validator, sponsored] of [[UPSTREAM, false], [UPSTREAM_66648DB, false], [SPONSORED, false], [SPONSORED, true]] as const) {
     const w = await refundWorld({ validator, sponsored });
     try {
       const p = parseClientPayload((await w.client.refundPayload(w.pr, TAG)).payload);
@@ -1642,8 +1697,8 @@ test("the compiled variant accepts the mutual refunds the client builds, and the
   }
 });
 
-test("the compiled validators accept a buyer's exit of a channel nobody sponsors, the variant's with no sponsor and upstream's, and the server's claims of them", aiken, async () => {
-  for (const [validator, exit] of [[SPONSORED, "elapse"], [SPONSORED, "end"], [UPSTREAM, "elapse"], [UPSTREAM, "end"]] as const) {
+test("the compiled validators accept a buyer's exit of a channel nobody sponsors, the variant's with no sponsor and upstream's, both builds, and the server's claims of them", aiken, async () => {
+  for (const [validator, exit] of [[SPONSORED, "elapse"], [SPONSORED, "end"], [UPSTREAM, "elapse"], [UPSTREAM, "end"], [UPSTREAM_66648DB, "elapse"], [UPSTREAM_66648DB, "end"]] as const) {
     const w = await exitWorld({ validator, sponsored: false, stage: exit === "elapse" ? closed : settled, held: 1_000_000n });
     try {
       if (exit === "elapse") await w.client.elapse(TAG, { wait: false });
@@ -1659,6 +1714,248 @@ test("the compiled validators accept a buyer's exit of a channel nobody sponsors
       const open = w.view(0xd1, opened, 1_000n);
       const { hex } = await buildClaimTx(w.builder, [{ channelId: TAG, totalClaimed: 400n, amount: 400n, signature: iou.sign(TAG, 400n), v: open }]);
       compiledAccepts(hex, [open.utxo, ...w.walletUtxos], `${validator.name} claim, nobody sponsors`);
+    } finally {
+      w.offline.restore();
+    }
+  }
+});
+
+// ---- the defect fixed upstream, at both of Subbit's builds ----------------------------------------------------------------
+
+/** A freshly opened ADA channel of `consumer` and `provider` at `validator`, holding `held`, its output the one of transaction `n`. */
+function adaChannel(validator: Validator, n: number, tag: string, held: bigint, consumer: string, provider: string): ChannelView {
+  const at = channelAddress(0, undefined, validator);
+  const constants: Constants = { tag, currency: { kind: "ada" }, iouKey: iou.publicKey, consumer, provider, closePeriodMs: 900_000n };
+  const stage: Stage = { kind: "opened", subbed: 0n };
+  const utxo = utxoAt(at, n, 0, Assets.fromLovelace(held), datumData(constants, stage, validator));
+  return { utxo, ref: refOf(n, 0), address: at, datum: { ownHash: validator.hash, constants, stage }, lovelace: held, amount: held } as unknown as ChannelView;
+}
+
+test("a batch whose signers come in descending order: the compiled build before upstream's fix refuses it, the fixed one takes it, and both take it in ascending order", aiken, async () => {
+  const offline = offlineBlockfrost();
+  try {
+    const wallet = offlineWallet(0);
+    const me = await wallet.address();
+    const consumer = KeyHash.toHex(me.paymentCredential as KeyHash.KeyHash);
+    const providerKeyHash = KeyHash.toHex((await offlineWallet(1).address()).paymentCredential as KeyHash.KeyHash);
+    const payTo = Address.toBech32(await offlineWallet(1).address());
+    const walletUtxos = [utxoAt(me, 0xb1, 0, Assets.fromLovelace(20_000_000n)), utxoAt(me, 0xb2, 0, Assets.fromLovelace(5_000_000n))];
+    offline.setUtxos(me, walletUtxos);
+    const ioua = (tag: string, owed: bigint) => iou.sign(tag, owed);
+    const taken = new Map<string, boolean>();
+    for (const validator of UPSTREAM_VALIDATORS) {
+      const a = adaChannel(validator, 0xd1, "d1".repeat(32), 3_000_000n, consumer, providerKeyHash);
+      const b = adaChannel(validator, 0xd2, "d2".repeat(32), 3_000_000n, consumer, providerKeyHash);
+      for (const order of ["descending", "ascending"] as const satisfies readonly Order[]) {
+        const label = `${validator.name}, ${order}`;
+        const { built, order: steps } = await buildMixedBatch({ wallet, validator, channels: [a, b], providerKeyHash, payTo, add: 500_000n, owed: 1_000_000n, iou: ioua, order, availableUtxos: walletUtxos });
+        // Two steps, two different signers, in the order asked: the first signer is the larger key, or the smaller.
+        assert.deepEqual(steps.map((s) => s.step).sort(), ["Add", "Sub"], label);
+        assert.equal(steps[0]!.signer > steps[1]!.signer, order === "descending", label);
+        assert.deepEqual(steps.map((s) => s.signer).sort(), [consumer, providerKeyHash].sort(), label);
+        const hex = await signedHex(built);
+        const tx = Transaction.fromCBORHex(hex);
+        assert.deepEqual((tx.body.requiredSigners ?? []).map((k) => KeyHash.toHex(k)).sort(), [consumer, providerKeyHash].sort(), `${label}: both sign`);
+        assert.deepEqual((tx.witnessSet.plutusV3Scripts ?? []).map((s) => ScriptHash.toHex(ScriptHash.fromScript(s))), [validator.hash], label);
+        const redeemers = spendRedeemers(tx);
+        assert.equal(redeemers.size, 2, `${label}: a Main and a Defer`);
+        const known = [a.utxo, b.utxo, ...walletUtxos];
+        const refused = validator === UPSTREAM_66648DB && order === "descending";
+        if (refused) compiledRefuses(hex, known, label);
+        else compiledAccepts(hex, known, label);
+        taken.set(label, !refused);
+      }
+    }
+    assert.deepEqual([...taken], [["upstream, descending", true], ["upstream, ascending", true], ["upstream-66648db, descending", false], ["upstream-66648db, ascending", true]]);
+  } finally {
+    offline.restore();
+  }
+});
+
+test("two consumers adding to their own channels in one batch, the keys in descending order: refused before the fix, taken after it", aiken, async () => {
+  // The Aiken suite's `two_consumers_in_descending_order`, on the compiled blueprints: no Sub, no provider's signature, two Adds.
+  const offline = offlineBlockfrost();
+  try {
+    const one = offlineWallet(0);
+    const two = offlineWallet(2);
+    const addresses = [await one.address(), await two.address()];
+    const keys = addresses.map((a) => KeyHash.toHex(a.paymentCredential as KeyHash.KeyHash));
+    const [low, high] = keys[0]! < keys[1]! ? ([0, 1] as const) : ([1, 0] as const);
+    const providerKeyHash = KeyHash.toHex((await offlineWallet(1).address()).paymentCredential as KeyHash.KeyHash);
+    const mine = utxoAt(addresses[0]!, 0xb1, 0, Assets.fromLovelace(20_000_000n));
+    const theirs = utxoAt(addresses[1]!, 0xb3, 0, Assets.fromLovelace(20_000_000n));
+    offline.setUtxos(addresses[0]!, [mine]);
+    for (const validator of UPSTREAM_VALIDATORS) {
+      // The channels' ledger order is the steps' order: the higher key's channel must come first for a descending batch.
+      const ch = (n: number, who: number) => adaChannel(validator, n, `${n.toString(16)}`.repeat(32).slice(0, 64), 3_000_000n, keys[who]!, providerKeyHash);
+      for (const [order, firstConsumer] of [["descending", high], ["ascending", low]] as const) {
+        const label = `${validator.name}, ${order}`;
+        const first = ch(0xd1, firstConsumer);
+        const second = ch(0xd2, firstConsumer === low ? high : low);
+        const at = first.address;
+        let tx = one.newTx().collectFrom({ inputs: [first.utxo], redeemer: Redeemer.main([Step.add(), Step.add()]) }).collectFrom({ inputs: [second.utxo], redeemer: Redeemer.defer() }).collectFrom({ inputs: [theirs] });
+        tx = tx.attachScript({ script: validator.script });
+        for (const v of [first, second]) tx = tx.payToAddress({ address: at, assets: Assets.fromLovelace(v.lovelace + 500_000n), datum: inlineDatum(v.datum.constants, v.datum.stage, validator) });
+        tx = tx.addSigner({ keyHash: KeyHash.fromHex(keys[0]!) }).addSigner({ keyHash: KeyHash.fromHex(keys[1]!) });
+        const built = await tx.build({ changeAddress: addresses[0]!, availableUtxos: [mine], setCollateral: 5_000_000n, passAdditionalUtxos: true });
+        const hex = await signedHex(built);
+        const known = [first.utxo, second.utxo, mine, theirs];
+        if (validator === UPSTREAM_66648DB && order === "descending") compiledRefuses(hex, known, label);
+        else compiledAccepts(hex, known, label);
+      }
+    }
+  } finally {
+    offline.restore();
+  }
+});
+
+// ---- a channel opened before the fix goes on as it did ------------------------------------------------------------------
+
+test("a buyer's close of a channel nobody sponsors, at either build of Subbit's validator, keeps its datum and names the validator it is at", async () => {
+  for (const validator of UPSTREAM_VALIDATORS) {
+    const w = await exitWorld({ validator, sponsored: false, stage: opened, held: 1_000_000n });
+    try {
+      const { transaction } = await w.client.close(TAG);
+      const tx = Transaction.fromCBORHex(w.submitted[0]!);
+      assert.equal(txHashOf(w.submitted[0]!), transaction);
+      const at = tx.body.outputs.filter((o) => Address.toBech32(o.address) === Address.toBech32(channelAddress(0, undefined, validator)));
+      assert.equal(at.length, 1, validator.name);
+      const after = parseDatum((at[0]!.datumOption as InlineDatum.InlineDatum).data, validator, 0);
+      assert.equal(after.ownHash, validator.hash, "the continuing datum names the validator its channel is at, not the default");
+      assert.deepEqual(after.constants, w.view.datum.constants, validator.name);
+      assert.equal(after.stage.kind, "closed", validator.name);
+      assert.deepEqual((tx.witnessSet.plutusV3Scripts ?? []).map((s) => ScriptHash.toHex(ScriptHash.fromScript(s))), [validator.hash], validator.name);
+      assert.equal(Assets.getByUnit(at[0]!.assets, UNIT), 1_000_000n);
+    } finally {
+      w.offline.restore();
+    }
+  }
+});
+
+test("the compiled validators accept a buyer's close, at either build of Subbit's, and a close that names the other build's hash is refused", aiken, async () => {
+  for (const validator of UPSTREAM_VALIDATORS) {
+    const w = await exitWorld({ validator, sponsored: false, stage: opened, held: 1_000_000n });
+    try {
+      await w.client.close(TAG);
+      const hex = w.submitted[0]!;
+      compiledAccepts(hex, w.known, `close at ${validator.name}`);
+      // The same close with its continuing datum under the other build's hash: the datum the validator reads back names another script.
+      const other = validator === UPSTREAM ? UPSTREAM_66648DB : UPSTREAM;
+      const wrong = alterAt(hex, channelAddress(0, undefined, validator), (o) => outputWith(o, { datum: datumData(w.view.datum.constants, { kind: "closed", subbed: 0n, elapseAt: 1_800_000_000_000n }, other) }));
+      compiledRefuses(wrong, w.known, `close at ${validator.name}, the datum naming ${other.name}`);
+    } finally {
+      w.offline.restore();
+    }
+  }
+});
+
+test("facilitator, by default: a claim over channels at either build of Subbit's validator is served, a delegated one finds its channel at whichever, and one served validator does not take the other's", async () => {
+  for (const validator of UPSTREAM_VALIDATORS) {
+    const w = await providerWorld({ validator, sponsored: false, stage: opened });
+    try {
+      const open = w.view(0xd1, opened, 1_000n);
+      const { hex } = await buildClaimTx(w.builder, [{ channelId: TAG, totalClaimed: 400n, amount: 400n, signature: iou.sign(TAG, 400n), v: open }]);
+      const inputs = new Map([[open.ref, open.utxo], [refOf(0xb1, 0), utxoAt(w.address, 0xb1, 0, Assets.fromLovelace(10_000_000n))]]);
+      const sent: string[] = [];
+      const asked: string[] = [];
+      const chain = {
+        network: NETWORK,
+        getUnspent: async (ref: string) => inputs.get(ref),
+        evaluate: async () => {},
+        submit: async (h: string) => (sent.push(h), txHashOf(h)),
+        awaitTx: async () => true,
+        followChannel: async (ref: string, hash: string) => (asked.push(hash), hash === validator.hash && ref === open.ref ? open : undefined),
+      } as unknown as Chain;
+      const claimReq: PaymentRequirements = { scheme: "batch-settlement", network: NETWORK, asset: "lovelace", amount: "0", payTo: w.payTo, maxTimeoutSeconds: 0, extra: {} };
+      const claim = (payload: Record<string, unknown>): PaymentPayload => ({ x402Version: 2, accepted: claimReq, payload });
+      const body = { type: "claim", transaction: Buffer.from(hex, "hex").toString("base64"), claims: [{ channelId: TAG, totalClaimed: "400" }] };
+
+      const ok = await new BatchSettlementCardanoFacilitator(chain, {}).settle(claim(body), claimReq);
+      assert.equal(ok.success, true, `${validator.name}: ${ok.errorMessage}`);
+      assert.deepEqual(sent, [hex]);
+      // The other build alone is not what this claim's channel is at: one validator served is one validator.
+      const other = validator === UPSTREAM ? UPSTREAM_66648DB : UPSTREAM;
+      const refused = await new BatchSettlementCardanoFacilitator(chain, { validators: [other] }).settle(claim(body), claimReq);
+      assert.equal(refused.success, false, validator.name);
+      assert.match(refused.errorMessage ?? "", /claims list 1 channels, transaction spends 0/);
+      assert.equal(sent.length, 1, "nothing more was broadcast");
+
+      // A claim the server asks the facilitator to build, for a provider key it holds: looked for at each build, the fixed one first.
+      const secret = "s3cret";
+      const claims = [{ channelId: TAG, totalClaimed: "400", channelRef: open.ref, voucher: { maxClaimableAmount: "400", signature: iou.sign(TAG, 400n) } }];
+      const delegated = { type: "claim", claims, delegationMac: delegationMac(secret, w.payTo, { type: "claim", claims }) };
+      asked.length = 0;
+      const delegating = new BatchSettlementCardanoFacilitator(chain, { delegates: [{ wallet: w.wallet, keyHash: w.providerKeyHash, payTo: w.payTo, secret }] });
+      const done = await delegating.settle(claim(delegated), claimReq);
+      assert.equal(done.success, true, `${validator.name}: ${done.errorMessage}`);
+      const upTo = UPSTREAM_VALIDATORS.slice(0, UPSTREAM_VALIDATORS.indexOf(validator) + 1).map((v) => v.hash);
+      assert.deepEqual(asked.slice(0, upTo.length), upTo);
+      const built = Transaction.fromCBORHex(sent.at(-1)!);
+      assert.equal(ScriptHash.toHex(ScriptHash.fromScript(built.witnessSet.plutusV3Scripts![0]!)), validator.hash, "the claim carries the script of the channel's own build");
+      const continuing = built.body.outputs.find((o) => o.datumOption instanceof InlineDatum.InlineDatum)!;
+      assert.equal(parseDatum((continuing.datumOption as InlineDatum.InlineDatum).data, validator, 0).ownHash, validator.hash);
+    } finally {
+      w.offline.restore();
+    }
+  }
+});
+
+test("a manager follows and claims the channels of the validator it is given, the fixed one by default, and those of the other build are not its to follow", async () => {
+  const w = await providerWorld({ validator: UPSTREAM_66648DB, sponsored: false, stage: opened });
+  try {
+    const open = w.view(0xd1, opened, 1_000n);
+    const storage = new InMemoryChannelStorage();
+    await storage.updateChannel(TAG, () => ({
+      channelId: TAG,
+      channelConfig: cfg({ receiver: w.payTo, receiverAuthorizer: w.providerKeyHash }),
+      channelRef: open.ref,
+      balance: "1000",
+      totalClaimed: "0",
+      withdrawRequestedAt: 1_700_000,
+      chargedCumulativeAmount: "400",
+      signedMaxClaimable: "400",
+      signature: iou.sign(TAG, 400n),
+      lastRequestTimestamp: Date.now(),
+    }));
+    const asked: string[] = [];
+    const chain = { ...w.chain, followChannel: async (ref: string, hash: string) => (asked.push(hash), hash === UPSTREAM_66648DB.hash && ref === open.ref ? open : undefined) } as unknown as Chain;
+    const manager = (scriptHash?: string) => new ChannelManager({ storage, wallet: w.wallet, providerKeyHash: w.providerKeyHash, chain, facilitator: {} as never, network: NETWORK, payTo: w.payTo, ...(scriptHash ? { scriptHash } : {}) });
+    assert.deepEqual((await manager().claimable()).map((c) => c.v.ref), [], "by default it works at the fixed validator, where this channel is not");
+    assert.deepEqual(asked, [UPSTREAM.hash]);
+    assert.deepEqual((await manager(UPSTREAM.hash).claimable()).map((c) => c.v.ref), []);
+    const old = await manager(UPSTREAM_66648DB.hash).claimable();
+    assert.deepEqual(old.map((c) => c.v.ref), [open.ref], "named, it claims what it did before the fix");
+    const built = await manager(UPSTREAM_66648DB.hash).buildClaim(old);
+    const tx = Transaction.fromCBORHex(built.hex);
+    assert.equal(ScriptHash.toHex(ScriptHash.fromScript(tx.witnessSet.plutusV3Scripts![0]!)), UPSTREAM_66648DB.hash);
+    assert.deepEqual(built.rows.map((r) => r.taken), [400n]);
+  } finally {
+    w.offline.restore();
+  }
+});
+
+test("a reference script is read only when it carries the validator at hand: an output made for the other build is not, and the script is attached instead", async () => {
+  const at = Address.fromBech32(PAY_TO);
+  const holding = (v: Validator | undefined, n: number) => new UTxO.UTxO({ transactionId: TransactionHash.fromHex(txid(n)), index: 0n, address: at, assets: Assets.fromLovelace(15_000_000n), ...(v ? { scriptRef: v.script } : {}) });
+  assert.equal(referenceFor(holding(UPSTREAM, 0xf0), UPSTREAM)?.index, 0n);
+  assert.equal(referenceFor(holding(UPSTREAM_66648DB, 0xf1), UPSTREAM_66648DB)?.index, 0n);
+  assert.equal(referenceFor(holding(UPSTREAM_66648DB, 0xf1), UPSTREAM), undefined, "the build before the fix is no reference for the fixed one");
+  assert.equal(referenceFor(holding(UPSTREAM, 0xf0), UPSTREAM_66648DB), undefined);
+  assert.equal(referenceFor(holding(SPONSORED, 0xf2), UPSTREAM), undefined);
+  assert.equal(referenceFor(holding(undefined, 0xf3), UPSTREAM), undefined, "an output with no script is none");
+  assert.equal(referenceFor(undefined, UPSTREAM), undefined);
+
+  // What a builder does with each: the claim of a channel at the fixed validator, with a reference output of either build.
+  for (const [carries, reads] of [[UPSTREAM, true], [UPSTREAM_66648DB, false]] as const) {
+    const w = await providerWorld({ validator: UPSTREAM, sponsored: false, stage: opened });
+    try {
+      const open = w.view(0xd1, opened, 1_000n);
+      const ref = holding(carries, 0xf4);
+      const chain = { ...w.chain, getUnspent: async (r: string) => (r === refOf(0xf4, 0) ? ref : undefined) } as unknown as Chain;
+      const { hex } = await buildClaimTx({ ...w.builder, chain, referenceScript: refOf(0xf4, 0) }, [{ channelId: TAG, totalClaimed: 400n, amount: 400n, signature: iou.sign(TAG, 400n), v: open }]);
+      const tx = Transaction.fromCBORHex(hex);
+      assert.deepEqual((tx.body.referenceInputs ?? []).map((i) => `${TransactionHash.toHex(i.transactionId)}#${i.index}`), reads ? [refOf(0xf4, 0)] : [], carries.name);
+      assert.deepEqual((tx.witnessSet.plutusV3Scripts ?? []).map((s) => ScriptHash.toHex(ScriptHash.fromScript(s))), reads ? [] : [UPSTREAM.hash], carries.name);
     } finally {
       w.offline.restore();
     }

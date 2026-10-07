@@ -2,6 +2,9 @@
 // its 3,046 bytes to every transaction that spends a channel. Here it goes on chain once, in an
 // output account 2 holds, and steps 1 and 2 are run again reading it from there
 // (SUBBIT_SCRIPT=ref), so each channel transaction can be set beside its inline twin.
+// It deploys the validator spike/chain.ts runs at: upstream's fixed build, 3,058 bytes, hash 6d877463…
+// (RESULTS.md, step 18); the output is recorded in out/refscript-6d877463.json. Step 3's, the build
+// before the fix, is in out/refscript.json and was swept at the end of step 17.
 //
 //   deploy   the consumer pays the validator into one output at account 2, at its min-UTxO
 //   check    reads that output back through the SDK, as every ref-mode transaction does
@@ -11,7 +14,8 @@
 // Usage: npm run refscript -- <deploy|check|report>
 //        between check and report: SUBBIT_SCRIPT=ref npm run spike -- all
 //                                  SUBBIT_SCRIPT=ref npm run lifecycle -- all
-// Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID
+// Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID; REFSCRIPT_FROM=<account> pays the
+//        deploy from that account instead of the consumer's (step 18: account 1)
 import { Address, Assets, TransactionHash } from "@evolution-sdk/evolution";
 import { SUBBIT_HASH, subbitScript } from "../src/subbit.ts";
 import {
@@ -19,6 +23,7 @@ import {
   ada,
   bf,
   consumer,
+  wallet,
   expectEq,
   load as loadFile,
   log,
@@ -42,6 +47,9 @@ interface State {
   before?: { consumer: bigint; provider: bigint };
 }
 
+/** Whose ADA pays for the deploy: the consumer's, or `REFSCRIPT_FROM`'s. The output goes to account 2 either way. */
+const funder = process.env.REFSCRIPT_FROM === undefined ? consumer : wallet(Number(process.env.REFSCRIPT_FROM));
+
 const load = () => loadFile<State>(REF_STATE);
 const save = (s: State) => saveFile(REF_STATE, s);
 
@@ -57,12 +65,12 @@ async function deploy() {
   if (st.out) return log(`deploy: already done, ${st.out.txHash}#${st.out.index}`);
   const holder = await refHolder.address();
   const before = await walletsAda();
-  const sb = await consumer
+  const sb = await funder
     .newTx()
     // autoMinUtxo solves for the least lovelace the output's own size, script included, allows.
     .payToAddress({ address: holder, assets: Assets.fromLovelace(0n), script: subbitScript, autoMinUtxo: true })
-    .build({ changeAddress: await consumer.address() });
-  const txHash = await submit("deploy", await sb.sign(), consumer);
+    .build({ changeAddress: await funder.address() });
+  const txHash = await submit("deploy", await sb.sign(), funder);
 
   const outs = ((await bf(`/txs/${txHash}/utxos`)) as BfUtxos).outputs.filter((o) => o.address === Address.toBech32(holder));
   if (outs.length !== 1) throw new Error(`expected one output at account 2, found ${outs.length}`);
@@ -82,7 +90,7 @@ async function check() {
   const bytes = await scriptBytes(SUBBIT_HASH);
   log(`check: ${TransactionHash.toHex(u.transactionId)}#${u.index} at ${Address.toBech32(u.address)}`);
   log(`  ok  the SDK reads it back carrying script ${SUBBIT_HASH}`);
-  log(`  script ${bytes} bytes by Blockfrost's count; the blueprint's compiled code is 3046`);
+  log(`  script ${bytes} bytes by Blockfrost's count; the blueprint's compiled code is ${(subbitScript as unknown as { bytes: Uint8Array }).bytes.length}`);
   log(`  holds ${ada(lovelace)} tADA = ${p.coinsPerByte} × ${lovelace / p.coinsPerByte} bytes (160 of them the ledger's per-entry overhead)${lovelace % p.coinsPerByte ? `, remainder ${lovelace % p.coinsPerByte}` : ""}`);
   log(`  a transaction that reads it pays ${p.refPerByte} × ${bytes} = ${ada(p.refPerByte * bytes)} tADA for it`);
 }
@@ -193,7 +201,7 @@ async function cost(hash: string): Promise<Cost> {
     if (!i.collateral && i.reference_script_hash) refBytes += await scriptBytes(i.reference_script_hash);
   }
   // The ledger prices reference-script bytes in tiers of 25,600, each 1.2× the last; one
-  // 3,046-byte validator stays inside the first.
+  // 3,058-byte validator (3,046 before the fix) stays inside the first.
   if (refBytes >= 25_600n) throw new Error(`${hash}: ${refBytes} reference-script bytes, past the first price tier`);
   const size = BigInt(tx.size);
   const { priceMem: pm, priceStep: ps } = p;

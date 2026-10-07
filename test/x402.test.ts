@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createPrivateKey, createPublicKey, sign as edSign, verify as edVerify } from "node:crypto";
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import { Address, Assets, Client, KeyHash, TransactionHash, TxOut, preprod, type Transaction, type UTxO } from "@evolution-sdk/evolution";
-import { SUBBIT_HASH, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, parseDatum, datumData, type Stage } from "../src/subbit.ts";
+import { SUBBIT_HASH, UPSTREAM, UPSTREAM_66648DB, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, parseDatum, datumData, type Stage } from "../src/subbit.ts";
 import { capacityOf, channelReserve, constantsOf, currencyOf, datumBindingError, planTokens, refOf, valueFor, type ChannelView } from "../src/x402/cardano.ts";
 import { BlockfrostChain, causeChain, isNetworkError, retryQueries, type Chain, type ChainCursor } from "../src/x402/chain.ts";
 import { ChannelManager, type WatchEvent } from "../src/x402/manager.ts";
@@ -616,6 +616,36 @@ test("watcher, polling: rolled-back claims and closes are followed back; a recor
     assert.deepEqual(events.map((e) => e.kind), ["reopened", "gone", "gone"]);
   } finally {
     w.stop();
+  }
+});
+
+test("watcher: it reads the chain at the validator its manager is given, the fixed one by default and Subbit's build before the fix when named", async () => {
+  for (const [named, expected] of [[undefined, UPSTREAM.hash], [UPSTREAM.hash, UPSTREAM.hash], [UPSTREAM_66648DB.hash, UPSTREAM_66648DB.hash]] as const) {
+    for (const mode of ["follow", "poll"] as const) {
+      const storage = new InMemoryChannelStorage();
+      const A = "a1".repeat(32);
+      const ref = `${"0a".repeat(32)}#0`;
+      await storage.updateChannel(A, () => ({ channelId: A, channelConfig: config, channelRef: ref, balance: "20000", totalClaimed: "3000", withdrawRequestedAt: 0, chargedCumulativeAmount: "3000", signedMaxClaimable: "3000", signature: "00".repeat(64), onchainSyncedAt: Date.now(), lastRequestTimestamp: Date.now() }));
+      const asked = new Set<string>();
+      const chain = {
+        followChannel: async (r: string, script: string, tag: string) => (asked.add(script), { ref: r, datum: { constants: constantsOf(config, tag), stage: { kind: "opened", subbed: 3000n } } }),
+        tipHeight: async () => 100,
+        txHeight: async () => 90,
+        scriptTip: async (script: string) => (asked.add(script), { hash: "00".repeat(32), height: 1, index: 0 }),
+        scriptActivity: async (script: string) => (asked.add(script), []),
+        channelMoves: async (_hash: string, script: string) => (asked.add(script), { spent: [] }),
+        exitOf: async (_ref: string, script: string) => (asked.add(script), undefined),
+      } as unknown as Chain;
+      const manager = new ChannelManager({ storage, providerKeyHash: PROVIDER, chain, facilitator: {} as never, network: "cardano:preprod", payTo: PAY_TO, ...(named ? { scriptHash: named } : {}) });
+      const w = manager.watch({ intervalMs: 3_600_000, mode });
+      try {
+        await w.tick();
+        await w.tick();
+      } finally {
+        w.stop();
+      }
+      assert.deepEqual([...asked], [expected], `${mode}, ${named?.slice(0, 8) ?? "by default"}`);
+    }
   }
 });
 

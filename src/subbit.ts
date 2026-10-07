@@ -1,8 +1,10 @@
-// Off-chain side of Subbit.xyz (kompact-io/subbit-xyz @ 66648db): the datum,
-// redeemer and IOU encodings its validator checks, and the checks a provider
-// must make itself because opening a channel runs no validator. Two validators
-// are known: Subbit's own, and this repository's sponsor-safe variant
-// (variant/sponsored/DESIGN.md), whose datum has a seventh constant.
+// Off-chain side of Subbit.xyz (kompact-io/subbit-xyz): the datum, redeemer and IOU encodings its
+// validator checks, and the checks a provider must make itself because opening a channel runs no
+// validator. Three validators are known. Subbit's own, as upstream's main has it (74c20d2, with
+// the `ordered_insert` fix of its pull request #10), is the default, `UPSTREAM`. Subbit's own as
+// it was at 66648db, before that fix, is `UPSTREAM_66648DB`: channels opened there still sit at
+// its address. Third is this repository's sponsor-safe variant (variant/sponsored/DESIGN.md),
+// whose datum has a seventh constant.
 import { readFileSync } from "node:fs";
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify, type KeyObject } from "node:crypto";
 import { blake2b } from "@noble/hashes/blake2.js";
@@ -12,8 +14,11 @@ import { Address, Data, InlineDatum, KeyHash, PlutusV3, ScriptHash, TransactionI
 
 /** One build of the Subbit spend validator: what a channel's address, datum and script depend on. */
 export interface Validator {
-  /** `upstream`: Subbit's, six constants. `sponsored`: this repository's variant, seven. */
-  readonly name: "upstream" | "sponsored";
+  /**
+   * `upstream`: Subbit's as fixed at 74c20d2, six constants. `upstream-66648db`: Subbit's before the
+   * fix, six constants, the same datum under another hash. `sponsored`: this repository's variant, seven.
+   */
+  readonly name: "upstream" | "upstream-66648db" | "sponsored";
   /** The spend validator's script hash, lowercase hex. */
   readonly hash: string;
   readonly script: PlutusV3.PlutusV3;
@@ -34,14 +39,28 @@ function loadValidator(name: Validator["name"], blueprintUrl: URL, sponsored: bo
   return { name, hash: spend.hash, script, sponsored };
 }
 
-/** Subbit's validator, vendor/subbit/plutus.json: six constants, nothing audited. */
+/**
+ * Subbit's validator as upstream's main has it, 74c20d2, vendor/subbit/plutus.json: six constants,
+ * nothing audited. Its hash is `6d877463…`. A batch whose signers come in descending order passes
+ * here; at `UPSTREAM_66648DB` it failed. A channel opens here unless it is told otherwise.
+ */
 export const UPSTREAM: Validator = loadValidator("upstream", new URL("../vendor/subbit/plutus.json", import.meta.url), false);
+/**
+ * Subbit's validator as this package first used it, 66648db, vendor/subbit/plutus-62ce4309.json: the
+ * same six constants, hash `62ce4309…`. Every channel this package opened before the fix is here, and
+ * it is spent, claimed, closed and refunded as before, by the same builders. A batch with two
+ * different signers, the later one's key sorting first, fails here (RESULTS.md, step 15); nothing
+ * else does, and no funds were ever at risk by it.
+ */
+export const UPSTREAM_66648DB: Validator = loadValidator("upstream-66648db", new URL("../vendor/subbit/plutus-62ce4309.json", import.meta.url), false);
 /** The sponsor-safe variant, variant/sponsored/plutus.json: seven constants, nothing audited; run on preprod (RESULTS.md, step 17). */
 export const SPONSORED: Validator = loadValidator("sponsored", new URL("../variant/sponsored/plutus.json", import.meta.url), true);
 /** Every validator this package can build a transaction for. A client or facilitator serves the ones it is told to trust. */
-export const VALIDATORS: readonly Validator[] = [UPSTREAM, SPONSORED];
+export const VALIDATORS: readonly Validator[] = [UPSTREAM, UPSTREAM_66648DB, SPONSORED];
+/** Subbit's own, both builds: what a client trusts and a facilitator serves unless it is told otherwise. */
+export const UPSTREAM_VALIDATORS: readonly Validator[] = [UPSTREAM, UPSTREAM_66648DB];
 
-/** Upstream's, under the names this package has always exported them by. */
+/** Upstream's fixed validator, under the names this package has always exported them by. */
 export const SUBBIT_HASH = UPSTREAM.hash;
 export const subbitScript = UPSTREAM.script;
 

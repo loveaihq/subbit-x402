@@ -1,7 +1,12 @@
 // Chain plumbing shared by the spike's steps: the preprod wallets, where transactions get
 // the validator from, submitting and waiting, reading results back from Blockfrost, slot
 // arithmetic, build-only validator checks, and the checks a provider makes before serving
-// a channel it did not open.
+// a channel it did not open. The validator is upstream's fixed build (hash 6d877463…, RESULTS.md
+// step 18). Steps 1 to 16 ran at its predecessor, 62ce4309…; the state they left in out/ keeps
+// its names, and what a run at this build keeps is suffixed with the build's hash.
+//
+// Env: WALLET_MNEMONIC, BLOCKFROST_PROJECT_ID; SPIKE_CONSUMER=<account> makes another account the
+// consumer (account 0 by default); accounts 6 and 9 are not this project's and are refused.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import {
   Address,
@@ -16,7 +21,7 @@ import {
   preprod,
   type UTxO,
 } from "@evolution-sdk/evolution";
-import { SUBBIT_HASH, channelAddress, parseDatum, subbitScript, type Constants } from "../src/subbit.ts";
+import { UPSTREAM, channelAddress, parseDatum, type Constants } from "../src/subbit.ts";
 
 export const NETWORK_ID = 0;
 export const BF_BASE = "https://cardano-preprod.blockfrost.io/api/v0";
@@ -24,19 +29,36 @@ export const BF_BASE = "https://cardano-preprod.blockfrost.io/api/v0";
 const MNEMONIC = must("WALLET_MNEMONIC");
 const BF_KEY = must("BLOCKFROST_PROJECT_ID");
 
-const wallet = (accountIndex: number) =>
-  Client.make(preprod).withBlockfrost({ baseUrl: BF_BASE, projectId: BF_KEY }).withSeed({ mnemonic: MNEMONIC, accountIndex });
-export const consumer = wallet(0);
+/** Accounts 6 and 9 of the test mnemonic hold another project's funds: nothing here signs with them or spends from them. */
+const FORBIDDEN_ACCOUNTS = new Set([6, 9]);
+export const wallet = (accountIndex: number) => {
+  if (FORBIDDEN_ACCOUNTS.has(accountIndex)) throw new Error(`account ${accountIndex} is not this project's`);
+  return Client.make(preprod).withBlockfrost({ baseUrl: BF_BASE, projectId: BF_KEY }).withSeed({ mnemonic: MNEMONIC, accountIndex });
+};
+/** The consumer: account 0, or the account `SPIKE_CONSUMER` names (never 8, which holds the stablecoin-only buyer's tokens). */
+export const CONSUMER_ACCOUNT = consumerAccount();
+export const consumer = wallet(CONSUMER_ACCOUNT);
 export const provider = wallet(1);
 export type Wallet = typeof consumer;
-export const chan = channelAddress(NETWORK_ID);
+
+/** The validator these runs use, and the suffix the state of a run at it carries. */
+export const VALIDATOR = UPSTREAM;
+const SUBBIT_HASH = VALIDATOR.hash;
+const SUFFIX = `-${VALIDATOR.hash.slice(0, 8)}`;
+export const chan = channelAddress(NETWORK_ID, undefined, VALIDATOR);
+
+function consumerAccount(): number {
+  const n = Number(process.env.SPIKE_CONSUMER ?? 0);
+  if (!Number.isInteger(n) || n < 0 || n > 20 || n === 8) throw new Error(`SPIKE_CONSUMER must be an account index other than 8, not ${process.env.SPIKE_CONSUMER}`);
+  return n;
+}
 
 // ---- where a transaction gets the validator from --------------------------
 
 /**
  * `SUBBIT_SCRIPT=ref` has every transaction that spends a channel read the validator from the
  * reference-script output `npm run refscript -- deploy` made. The default, `inline`, attaches
- * its 3,046 bytes to each such transaction, as steps 1 and 2 did.
+ * its 3,058 bytes to each such transaction (3,046 at the build steps 1 and 2 ran at).
  */
 export const SCRIPT_MODE = scriptMode();
 /**
@@ -47,17 +69,18 @@ export const SCRIPT_MODE = scriptMode();
 export const refHolder = wallet(2);
 /** Account 3: the provider key a facilitator holds for a server that has none (x402 step 9). */
 export const delegateWallet = wallet(3);
-export const REF_STATE = new URL("../out/refscript.json", import.meta.url);
+/** Where the reference-script output for `VALIDATOR` is recorded: one per build, since each is another script. */
+export const REF_STATE = new URL(`../out/refscript${SUFFIX}.json`, import.meta.url);
 
-/** A step's state file. Each mode keeps its own, so a run in one never resumes the other's. */
-export const stateFile = (step: string, mode = SCRIPT_MODE) => new URL(`../out/${step}${mode === "ref" ? "-ref" : ""}.json`, import.meta.url);
+/** A step's state file. Each mode keeps its own, so a run in one never resumes the other's; so does each build of the validator. */
+export const stateFile = (step: string, mode = SCRIPT_MODE) => new URL(`../out/${step}${SUFFIX}${mode === "ref" ? "-ref" : ""}.json`, import.meta.url);
 
 type TxBuilder = ReturnType<Wallet["newTx"]>;
 let refUtxo: Promise<UTxO.UTxO> | undefined;
 
 /** Gives a transaction that spends a channel its validator: attached, or by reference, per SUBBIT_SCRIPT. */
 export async function withSubbit(tx: TxBuilder): Promise<TxBuilder> {
-  if (SCRIPT_MODE === "inline") return tx.attachScript({ script: subbitScript });
+  if (SCRIPT_MODE === "inline") return tx.attachScript({ script: VALIDATOR.script });
   refUtxo ??= refScriptUtxo();
   return tx.readFrom({ referenceInputs: [await refUtxo] });
 }
@@ -71,7 +94,7 @@ export async function refScriptUtxo(): Promise<UTxO.UTxO> {
     const [u] = await refHolder.getUtxosByOutRef([outRef(ref.txHash, ref.index)]).catch(() => []);
     if (u?.scriptRef) {
       const hash = ScriptHash.toHex(ScriptHash.fromScript(u.scriptRef));
-      if (hash !== SUBBIT_HASH) throw new Error(`${at} carries script ${hash}, not the Subbit validator`);
+      if (hash !== SUBBIT_HASH) throw new Error(`${at} carries script ${hash}, not the Subbit validator ${SUBBIT_HASH}`);
       return u;
     }
     // Right after the deploy the indexer may not have the output yet, and the SDK drops a

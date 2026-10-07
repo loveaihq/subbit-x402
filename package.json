@@ -32,6 +32,7 @@
   "files": [
     "dist",
     "vendor/subbit/plutus.json",
+    "vendor/subbit/plutus-62ce4309.json",
     "vendor/subbit/PROVENANCE.md",
     "variant/sponsored/plutus.json",
     "variant/sponsored/PROVENANCE.md",
@@ -45,6 +46,7 @@
     "refscript": "tsx spike/refscript.ts",
     "x402": "tsx spike/x402/e2e.ts",
     "sponsored": "tsx spike/x402/sponsored.ts",
+    "fixed": "tsx spike/x402/fixed.ts",
     "variant": "tsx spike/x402/variant.ts",
     "evalrace": "tsx spike/x402/evalrace.ts",
     "mint": "tsx spike/mint.ts",

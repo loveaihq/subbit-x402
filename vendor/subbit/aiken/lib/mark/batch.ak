@@ -1,6 +1,7 @@
 //// Batches (ADR batching.md, l1-spec.md "Batch tx"): the first channel input carries
 //// `Main(steps)` for every channel in the transaction, the others `Defer`; inputs, steps and
-//// continuing outputs pair up in order. Includes a bug: see `bug_` below.
+//// continuing outputs pair up in order. Includes a defect that 66648db had and this copy has fixed:
+//// see "signers come in descending order" below.
 
 use aiken/collection/list
 use aiken/fuzz
@@ -198,15 +199,17 @@ test bad_datum_cannot_join_a_batch() fail {
   )
 }
 
-// ---- bug: a batch whose signers come in descending order ------------------------------------
+// ---- a batch whose signers come in descending order (a bug at 66648db, fixed here) -----------
 //
 // main.ak gathers each step's required signer with xlist.ordered_insert, whose doc says it
-// inserts "into the correct place", but which fails with "Impossible" on an item smaller than
-// one already in the list. l1-spec.md says of batches "There is no restriction on which steps
-// appears", and each step only needs its own signer. So a batch needing two different signers
-// fails whenever the later step's signer sorts first, with every signature present; step order
-// is input order, so the builder cannot choose. Fail-closed: no funds at risk, but such batches
-// cannot be made. The fix is one line: `Greater -> [item, x, ..xs]`.
+// inserts "into the correct place", but which, at 66648db, failed with "Impossible" on an item
+// smaller than one already in the list. l1-spec.md says of batches "There is no restriction on
+// which steps appears", and each step only needs its own signer. So a batch needing two different
+// signers failed whenever the later step's signer sorts first, with every signature present;
+// step order is input order, so the builder cannot choose. Fail-closed: no funds at risk, but
+// such batches could not be made. The fix is one line, `Greater -> [item, x, ..xs]`, which
+// upstream merged in its pull request #10 (main at 74c20d2) and this copy has too. The three
+// tests below pinned the defect with `fail`, under a `bug_` name (RESULTS.md, step 15); they pass now.
 
 /// Two channels, the first stepped by `first`, the second by `second`; both parties sign.
 fn mixed(first: t.Step, second: t.Step, outs: List<Output>) -> Bool {
@@ -235,9 +238,9 @@ test batch_passes_when_signers_ascend() {
   )
 }
 
-/// The same two steps the other way round: provider, then consumer. Both have signed, and the
-/// transaction fails on "Impossible".
-test bug_batch_fails_when_signers_descend() fail {
+/// The same two steps the other way round: provider, then consumer. Both have signed. At 66648db
+/// the transaction failed on "Impossible"; with the fix it passes.
+test batch_passes_when_signers_descend() {
   mixed(
     sub(5_000_000, iou(0)),
     add,
@@ -301,8 +304,8 @@ test two_consumers_in_ascending_order(keys via two_keys()) {
   two_adds(low, high)
 }
 
-/// Any two consumers whose keys come in descending order: every such batch fails.
-test bug_two_consumers_in_descending_order(keys via two_keys()) fail {
+/// Any two consumers whose keys come in descending order: at 66648db, every such batch failed.
+test two_consumers_in_descending_order(keys via two_keys()) {
   let (low, high) = keys
   two_adds(high, low)
 }
@@ -311,22 +314,8 @@ test ordered_insert_upwards() {
   xlist.ordered_insert([#"11"], #"22") == [#"11", #"22"]
 }
 
-test bug_ordered_insert_refuses_a_smaller_item() fail {
+test ordered_insert_takes_a_smaller_item() {
   xlist.ordered_insert([#"22"], #"11") == [#"11", #"22"]
-}
-
-/// `xlist.ordered_insert` as it is, but for the one-line fix: `Greater -> [item, x, ..xs]`
-/// where it fails. (`xs` is the tail there, as in the original.)
-fn fixed_insert(xs: List<ByteArray>, item: ByteArray) -> List<ByteArray> {
-  when xs is {
-    [x, ..xs] ->
-      when bytearray.compare(x, item) is {
-        Less -> [x, ..fixed_insert(xs, item)]
-        Equal -> [x, ..xs]
-        Greater -> [item, x, ..xs]
-      }
-    _ -> [item]
-  }
 }
 
 fn ascending(xs: List<ByteArray>) -> Bool {
@@ -341,7 +330,7 @@ fn ascending(xs: List<ByteArray>) -> Bool {
 test fix_gathers_any_signers(
   keys via fuzz.list_between(fuzz.bytearray_fixed(1), 1, 8),
 ) {
-  let set = list.foldl(keys, [], fn(k, acc) { fixed_insert(acc, k) })
+  let set = list.foldl(keys, [], fn(k, acc) { xlist.ordered_insert(acc, k) })
   and {
     ascending(set),
     list.all(keys, fn(k) { list.has(set, k) }),

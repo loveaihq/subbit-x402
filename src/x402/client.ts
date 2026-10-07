@@ -19,7 +19,7 @@ import type {
 } from "@x402/core/types";
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
 import { Address, Assets, Client, InlineDatum, KeyHash, ScriptHash, Transaction, TransactionHash, TransactionInput, TransactionWitnessSet, TxOut, preprod, type UTxO } from "@evolution-sdk/evolution";
-import { Redeemer, Step, UPSTREAM, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, parseDatum, tagFromInput, type Currency, type Validator } from "../subbit.ts";
+import { Redeemer, Step, UPSTREAM_VALIDATORS, channelAddress, iouBody, iouSignerFromSeed, inlineDatum, newIouSigner, parseDatum, tagFromInput, type Currency, type Validator } from "../subbit.ts";
 import {
   amountIn,
   assetOf,
@@ -33,6 +33,7 @@ import {
   networkIdOf,
   onlyCurrency,
   planTokens,
+  referenceFor,
   refOf,
   sameAddress,
   slotAtOrAfter,
@@ -217,8 +218,9 @@ export interface ClientOptions {
   /**
    * The validators this client trusts a channel with: it opens, tops up and pays only at a
    * `scriptHash` among them, and refuses a 402 that names any other (spec: Client verification
-   * rules). The default is Subbit's own. The sponsor-safe variant (`SPONSORED`) is unaudited, so it
-   * is trusted only when named here.
+   * rules). The default is Subbit's own, both builds: the fixed one (`UPSTREAM`) that new channels
+   * open at, and the one before the fix (`UPSTREAM_66648DB`), where earlier channels still sit. The
+   * sponsor-safe variant (`SPONSORED`) is unaudited, so it is trusted only when named here.
    */
   trustedValidators?: readonly Validator[];
 }
@@ -253,7 +255,7 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   private readonly trusted: ReadonlyMap<string, Validator>;
 
   constructor(private readonly o: ClientOptions) {
-    const trusted = o.trustedValidators ?? [UPSTREAM];
+    const trusted = o.trustedValidators ?? UPSTREAM_VALIDATORS;
     if (trusted.length === 0) throw new Error("trustedValidators is empty: this client would trust no validator");
     this.trusted = new Map(trusted.map((v) => [v.hash, v]));
     this.spent = o.spentInputs ?? new Map<string, number>();
@@ -395,8 +397,8 @@ export class BatchSettlementCardanoClient implements SchemeNetworkClient {
   }
 
   private async withValidator(tx: ReturnType<SeedWallet["newTx"]>, v: Validator, referenceScript?: string) {
-    const ref = referenceScript ? await this.o.chain.getUnspent(referenceScript) : undefined;
-    return ref?.scriptRef ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: v.script });
+    const ref = referenceFor(referenceScript ? await this.o.chain.getUnspent(referenceScript) : undefined, v);
+    return ref ? tx.readFrom({ referenceInputs: [ref] }) : tx.attachScript({ script: v.script });
   }
 
   /**

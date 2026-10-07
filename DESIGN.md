@@ -10,7 +10,11 @@ draft, in x402's format: `specs/scheme_batch_settlement_cardano.md`. It follows 
 (generic spec, EVM binding, SVM draft) and `@x402/core` / `@x402/evm` 2.27.0, and reuses the
 Cardano conventions of `@x402/cardano` 2.27.0 (`exact`). Subbit is kompact-io/subbit-xyz @
 66648db, as vendored; every Subbit fact below is from its Aiken source at that commit or from
-steps 1–3 of this spike (`RESULTS.md`).
+steps 1–3 of this spike (`RESULTS.md`). The vendored source has since had one line changed, the
+`ordered_insert` fix that upstream merged (`vendor/subbit/PROVENANCE.md`, `RESULTS.md` steps 15 and
+18): it makes a batch with two signers in descending order possible, and changes nothing else a fact
+below rests on. The validator it compiles to, `6d877463…`, is the default; the build before it,
+`62ce4309…`, which steps 1–16 ran at, is kept, and channels opened there are served as before.
 
 ## 1. How the two fit
 
@@ -65,7 +69,7 @@ Two Subbit properties shape the design:
 | `scriptHash` | hex, 28 B | yes | Subbit validator hash the server accepts; pins the validator version and the channel's payment credential |
 | `receiverAuthorizer` | hex, 28 B | yes | key hash that goes into the datum's `provider` field and must sign every redemption. Milestone 1: the payment key of `payTo`, held by the resource server |
 | `withdrawDelay` | integer seconds | yes | the channel's close period; datum `close_period` = `withdrawDelay × 1000`. Range 900 – 2,592,000 and ≥ `maxTimeoutSeconds`, as EVM/SVM. Must match exactly |
-| `referenceScript` | `txHash#index` | no | an output carrying the validator as a reference script (step 3's `544752f6…#0`). Clients and the server may read it instead of attaching 3,046 bytes; its script hash must equal `scriptHash` |
+| `referenceScript` | `txHash#index` | no | an output carrying the validator as a reference script (`ff61e3f4…#0` for `6d877463…`, step 18; step 3's `544752f6…#0` for `62ce4309…`). Clients and the server may read it instead of attaching 3,058 bytes (3,046 at `62ce4309…`); its script hash must equal `scriptHash`, and an output that carries another script is not read: the validator is attached |
 | `minDeposit` | atomic string | no | deposit-size hint, ≥ `amount`, as EVM. Never enforced by the facilitator |
 | `confirmationPolicy` | `{l1Confirmations}` | no | as Cardano `exact`: evidence required before a deposit counts. Milestone 1 default: 0 (in a block) |
 | `channelState`, `voucherState` | object | corrective 402 only | as EVM/SVM (§6) |

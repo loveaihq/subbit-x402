@@ -1,12 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Address } from "@evolution-sdk/evolution";
-import { SUBBIT_HASH, channelAddress } from "../src/subbit.ts";
+import { UPSTREAM_VALIDATORS, channelAddress } from "../src/subbit.ts";
 import { KoiosChain } from "../src/x402/koios.ts";
 
 const h = (c: string) => c.repeat(64);
 const WALLET = "addr_test1qqqt0pru382hy9vjlsxv3ye02z50sfvt8xunscg5pgden77z73dpdfng2ctw2ekqplqgrljelz7h4dneac27nn3qx3rqqpavzj";
 const SCRIPT = Address.toBech32(channelAddress(0));
+/** The address of each of Subbit's two builds: channels opened before its fix are at the second, and are followed the same way. */
+const scriptOf = (v: (typeof UPSTREAM_VALIDATORS)[number]) => Address.toBech32(channelAddress(0, undefined, v));
 
 /** Koios on a table: each path answers from the request's JSON body; anything else is a 404. */
 function koios(routes: Record<string, (body: Record<string, unknown>, url: URL) => unknown>) {
@@ -62,18 +64,20 @@ test("koios: the transaction in a block that spent an output, found among its ad
   }
 });
 
-test("koios: a channel's exit, when the transaction that spent its position does not continue it", async () => {
-  const k = koios({
-    "/utxo_info": (b) => (b._utxo_refs as string[]).map((r) => utxo(r.split("#")[0]!, 0, SCRIPT, 200, true)),
-    "/address_txs": () => [{ tx_hash: h("f"), block_height: 201 }, { tx_hash: h("e"), block_height: 200 }],
-    // The refund pays the wallet and leaves nothing at the script.
-    "/tx_info": (b) => (b._tx_hashes as string[]).filter((x) => x === h("f")).map((x) => ({ tx_hash: x, block_height: 201, tx_block_index: 3, inputs: [{ tx_hash: h("e"), tx_index: 0 }], outputs: [out(0, WALLET, "1744477")] })),
-  });
-  try {
-    assert.equal(await chain().followChannel(`${h("e")}#0`, SUBBIT_HASH, h("1")), undefined);
-    assert.deepEqual(await chain().exitOf(`${h("e")}#0`, SUBBIT_HASH, h("1")), { txHash: h("f"), height: 201 });
-  } finally {
-    k.restore();
+test("koios: a channel's exit, when the transaction that spent its position does not continue it, at either build of Subbit's validator", async () => {
+  for (const v of UPSTREAM_VALIDATORS) {
+    const k = koios({
+      "/utxo_info": (b) => (b._utxo_refs as string[]).map((r) => utxo(r.split("#")[0]!, 0, scriptOf(v), 200, true)),
+      "/address_txs": () => [{ tx_hash: h("f"), block_height: 201 }, { tx_hash: h("e"), block_height: 200 }],
+      // The refund pays the wallet and leaves nothing at the script.
+      "/tx_info": (b) => (b._tx_hashes as string[]).filter((x) => x === h("f")).map((x) => ({ tx_hash: x, block_height: 201, tx_block_index: 3, inputs: [{ tx_hash: h("e"), tx_index: 0 }], outputs: [out(0, WALLET, "1744477")] })),
+    });
+    try {
+      assert.equal(await chain().followChannel(`${h("e")}#0`, v.hash, h("1")), undefined, v.name);
+      assert.deepEqual(await chain().exitOf(`${h("e")}#0`, v.hash, h("1")), { txHash: h("f"), height: 201 }, v.name);
+    } finally {
+      k.restore();
+    }
   }
 });
 
@@ -86,21 +90,23 @@ test("koios: the script's activity in chain order, which only tx_info's block in
     { tx_hash: h("1"), block_height: 10 },
   ];
   const index: Record<string, [number, number]> = { [h("1")]: [10, 0], [h("2")]: [10, 3], [h("3")]: [11, 1], [h("4")]: [11, 0] };
-  const k = koios({
-    "/address_txs": (b, url) => {
-      assert.equal((b._addresses as string[])[0], SCRIPT);
-      const from = b._after_block_height as number | undefined;
-      return listed.filter((r) => from === undefined || r.block_height >= from).slice(0, Number(url.searchParams.get("limit")));
-    },
-    "/tx_info": (b) => (b._tx_hashes as string[]).map((x) => ({ tx_hash: x, block_height: index[x]![0], tx_block_index: index[x]![1], outputs: [] })),
-  });
-  try {
-    assert.deepEqual(await chain().scriptTip(SUBBIT_HASH), { hash: h("3"), height: 11, index: 1 });
-    const after = { hash: h("1"), height: 10, index: 0 };
-    assert.deepEqual((await chain().scriptActivity(SUBBIT_HASH, after)).map((c) => c.hash), [h("2"), h("4"), h("3")]);
-    assert.deepEqual((await chain().scriptActivity(SUBBIT_HASH)).map((c) => c.hash), [h("1"), h("2"), h("4"), h("3")]);
-  } finally {
-    k.restore();
+  for (const v of UPSTREAM_VALIDATORS) {
+    const k = koios({
+      "/address_txs": (b, url) => {
+        assert.equal((b._addresses as string[])[0], scriptOf(v));
+        const from = b._after_block_height as number | undefined;
+        return listed.filter((r) => from === undefined || r.block_height >= from).slice(0, Number(url.searchParams.get("limit")));
+      },
+      "/tx_info": (b) => (b._tx_hashes as string[]).map((x) => ({ tx_hash: x, block_height: index[x]![0], tx_block_index: index[x]![1], outputs: [] })),
+    });
+    try {
+      assert.deepEqual(await chain().scriptTip(v.hash), { hash: h("3"), height: 11, index: 1 }, v.name);
+      const after = { hash: h("1"), height: 10, index: 0 };
+      assert.deepEqual((await chain().scriptActivity(v.hash, after)).map((c) => c.hash), [h("2"), h("4"), h("3")], v.name);
+      assert.deepEqual((await chain().scriptActivity(v.hash)).map((c) => c.hash), [h("1"), h("2"), h("4"), h("3")], v.name);
+    } finally {
+      k.restore();
+    }
   }
 });
 

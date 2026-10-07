@@ -8,7 +8,7 @@
 import { TransactionWitnessSet } from "@evolution-sdk/evolution";
 import type { PaymentPayload, PaymentRequirements, SchemeNetworkFacilitator, SettleResponse, VerifyResponse } from "@x402/core/types";
 import { Address, Data, KeyHash, ScriptHash, Transaction, TransactionHash, type UTxO } from "@evolution-sdk/evolution";
-import { UPSTREAM, validatorByHash, type Validator } from "../subbit.ts";
+import { UPSTREAM_VALIDATORS, validatorByHash, type Validator } from "../subbit.ts";
 import { capacityOf, channelStateOf, datumBindingError, readChannel, txHashOf, verifyVoucherSignature, type ChannelView } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
 import { buildClaimTx, compareRefs, type ClaimLine } from "./claimtx.ts";
@@ -38,8 +38,10 @@ export interface FacilitatorOptions {
   scriptHash?: string;
   /**
    * Every validator it serves: it refuses a payment whose `extra.scriptHash` is another. The
-   * default is upstream's alone (or `scriptHash`, when that is given). The sponsored variant
-   * (`SPONSORED`) is unaudited, so it is served only when named here or in `scriptHash`.
+   * default is Subbit's own, both builds (`UPSTREAM_VALIDATORS`: the fixed one new channels open at,
+   * and the one before the fix, where earlier channels sit), or `scriptHash` alone, when that is
+   * given. The sponsored variant (`SPONSORED`) is unaudited, so it is served only when named here or
+   * in `scriptHash`.
    */
   validators?: readonly Validator[];
   /** How long `/settle` waits for a transaction to reach a block before answering `settlement_pending`. */
@@ -81,7 +83,7 @@ export class BatchSettlementCardanoFacilitator implements SchemeNetworkFacilitat
     const named = options.scriptHash === undefined ? undefined : validatorByHash(options.scriptHash);
     if (options.scriptHash !== undefined && !named) throw new Error(`script ${options.scriptHash} is not a validator this package knows`);
     const served = [...(options.validators ?? []), ...(named ? [named] : [])];
-    this.served = new Map((served.length ? served : [UPSTREAM]).map((v) => [v.hash, v]));
+    this.served = new Map((served.length ? served : UPSTREAM_VALIDATORS).map((v) => [v.hash, v]));
     for (const d of options.delegates ?? []) {
       if (this.delegates.has(d.payTo)) throw new Error(`two delegated keys for ${d.payTo}`);
       this.delegates.set(d.payTo, { d, spent: new Map() });

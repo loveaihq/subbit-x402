@@ -167,14 +167,14 @@ only.**
 
 With upstream's validator the reserve is the buyer's to keep when it exits alone (the last row of
 section 2's table). [`variant/sponsored/`](variant/sponsored/DESIGN.md) is a fork of Subbit's
-validator (spend hash `20b64ee2…`; upstream's is `62ce4309…`) that sends it back. Its datum has a
+validator (spend hash `20b64ee2…`; upstream's is `6d877463…`, and was `62ce4309…` before its fix) that sends it back. Its datum has a
 seventh constant, `sponsor: Option<(Address, floor)>`, and a sponsored channel must keep `floor`
 lovelace in every continuing output (R1), repay the sponsor at least `floor` when it ends (R2), and,
 when it holds none of its currency, be ended by its provider (R3).
 
 | | Upstream's validator | The variant |
 |---|---|---|
-| The 402's `extra.scriptHash` | `62ce4309…` | `20b64ee2…`. The client must be told to trust it (`trustedValidators: [UPSTREAM, SPONSORED]`), the facilitator to serve it (`validators`), the server to name it (`scriptHash: SPONSORED.hash`) |
+| The 402's `extra.scriptHash` | `6d877463…` | `20b64ee2…`. The client must be told to trust it (`trustedValidators: [UPSTREAM, SPONSORED]`, or `[...UPSTREAM_VALIDATORS, SPONSORED]` to go on trusting channels at `62ce4309…` too), the facilitator to serve it (`validators`), the server to name it (`scriptHash: SPONSORED.hash`) |
 | Opening on the seller's offer | six constants | seven, with `sponsor = (payTo, floor)` and `floor` the channel's whole reserve. The client writes it; the facilitator and the seller each refuse an opening that does not |
 | Opening the buyer pays for | as before | `sponsor = None` |
 | A token channel's reserve | 2.13 tADA | 2.53 tADA for a base-address `payTo`, 2.36 for an enterprise one: the datum carries the address and the floor |

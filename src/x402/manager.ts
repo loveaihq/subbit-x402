@@ -9,6 +9,7 @@
 // that it paid `payTo` everything it redeemed.
 import type { FacilitatorClient } from "@x402/core/server";
 import type { PaymentRequirements } from "@x402/core/types";
+import { UPSTREAM } from "../subbit.ts";
 import { sameAddress, subbedOf, type ChannelView } from "./cardano.ts";
 import type { Chain } from "./chain.ts";
 import { buildClaimTx, buildEndTx, compareRefs, type ClaimLine, type ClaimRow } from "./claimtx.ts";
@@ -30,7 +31,13 @@ export interface ManagerOptions {
   facilitator: FacilitatorClient;
   network: CardanoNetwork;
   payTo: string;
-  scriptHash: string;
+  /**
+   * The validator whose channels it follows, claims and ends: Subbit's as fixed upstream
+   * (`UPSTREAM.hash`) unless told otherwise. A server whose channels were opened at Subbit's earlier
+   * build names `UPSTREAM_66648DB.hash` and claims them as before. The channels of a validator
+   * other than this one are not followed: the manager at that validator takes them.
+   */
+  scriptHash?: string;
   referenceScript?: string;
   /**
    * Whether `claim` ends a sponsored channel its settle leaves empty, as provider (R3), to bring the
@@ -59,7 +66,12 @@ export class ChannelManager {
    */
   private readonly spent = new Map<string, number>();
 
-  constructor(private readonly o: ManagerOptions) {}
+  /** The validator it works at. */
+  private readonly scriptHash: string;
+
+  constructor(private readonly o: ManagerOptions) {
+    this.scriptHash = o.scriptHash ?? UPSTREAM.hash;
+  }
 
   /**
    * Channels with charges not yet redeemed, oldest reference first: open ones (a `Sub` takes
@@ -71,7 +83,7 @@ export class ChannelManager {
       if (channelIds && !channelIds.includes(c.channelId)) continue;
       if (!c.channelRef) continue;
       if (BigInt(c.chargedCumulativeAmount) <= BigInt(c.totalClaimed)) continue;
-      const v = await this.o.chain.followChannel(c.anchorRef ?? c.channelRef, this.o.scriptHash, c.channelId);
+      const v = await this.o.chain.followChannel(c.anchorRef ?? c.channelRef, this.scriptHash, c.channelId);
       if (!v || v.datum.stage.kind === "settled") continue;
       if (BigInt(c.chargedCumulativeAmount) <= v.datum.stage.subbed) continue;
       out.push({ c, v });
@@ -199,7 +211,7 @@ export class ChannelManager {
   /** Where a channel sits once `txHash` has spent it, waiting out an index that still shows it unspent. */
   private async after(v: ChannelView, channelId: string, txHash: string): Promise<ChannelView | undefined> {
     for (let i = 0; ; i++) {
-      const now = await this.o.chain.followChannel(v.ref, this.o.scriptHash, channelId);
+      const now = await this.o.chain.followChannel(v.ref, this.scriptHash, channelId);
       if (!now || now.ref !== v.ref) return now;
       if (i === 6) throw new Error(`channel ${channelId.slice(0, 16)}… still shows at ${v.ref} after ${txHash}`);
       await new Promise((r) => setTimeout(r, 5_000));
@@ -251,6 +263,7 @@ export interface WatchOptions {
  * index can hide a live channel, and the record holds the only copy of the latest voucher.
  */
 export function watchChannels(manager: ChannelManager, o: ManagerOptions, opts: WatchOptions = {}): Watcher {
+  const scriptHash = o.scriptHash ?? UPSTREAM.hash;
   let running: Promise<void> | undefined;
   const depth = opts.depth ?? 3;
   const drop = async (channelId: string) => {
@@ -279,9 +292,9 @@ export function watchChannels(manager: ChannelManager, o: ManagerOptions, opts: 
     const tip = await o.chain.tipHeight();
     const byRef = new Map((await o.storage.list()).filter((c) => c.channelRef).map((c) => [c.anchorRef ?? c.channelRef, c] as const));
     const closed: string[] = [];
-    for (const t of await o.chain.scriptActivity(o.scriptHash, cursor)) {
+    for (const t of await o.chain.scriptActivity(scriptHash, cursor)) {
       if (tip - t.height < depth) break; // the rest next pass, once they are deep enough
-      const moves = await o.chain.channelMoves(t.hash, o.scriptHash, (ref) => byRef.has(ref));
+      const moves = await o.chain.channelMoves(t.hash, scriptHash, (ref) => byRef.has(ref));
       for (const ref of moves.spent) {
         const c = byRef.get(ref);
         if (!c) continue;
@@ -305,7 +318,7 @@ export function watchChannels(manager: ChannelManager, o: ManagerOptions, opts: 
     if (opts.mode === "follow") {
       if (synced) return follow();
       // Where the address stands before reading every channel once, so nothing slips in between.
-      const tip = await o.chain.scriptTip(o.scriptHash);
+      const tip = await o.chain.scriptTip(scriptHash);
       await poll();
       cursor = tip;
       synced = true;
@@ -329,10 +342,10 @@ export function watchChannels(manager: ChannelManager, o: ManagerOptions, opts: 
     for (const c of await o.storage.list()) {
       if (!c.channelRef) continue;
       const from = c.anchorRef ?? c.channelRef;
-      const v = await o.chain.followChannel(from, o.scriptHash, c.channelId);
+      const v = await o.chain.followChannel(from, scriptHash, c.channelId);
       if (!v) {
         // Gone, or the index lags: the transaction that ended it decides, once deep enough to stay.
-        const exit = await o.chain.exitOf(from, o.scriptHash, c.channelId);
+        const exit = await o.chain.exitOf(from, scriptHash, c.channelId);
         if (exit && tip - exit.height >= depth) await drop(c.channelId);
         continue;
       }
