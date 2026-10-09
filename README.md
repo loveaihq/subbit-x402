@@ -24,7 +24,7 @@ fixed one), which is why their hashes and fees differ a little from what the def
 
 | Path | What |
 |---|---|
-| [`specs/scheme_batch_settlement_cardano.md`](specs/scheme_batch_settlement_cardano.md) | the binding, in x402's spec format (draft v0.9) |
+| [`specs/scheme_batch_settlement_cardano.md`](specs/scheme_batch_settlement_cardano.md) | the binding, in x402's spec format (draft v0.10) |
 | `src/x402/` | client, resource-server and facilitator schemes for `@x402/core` 2.27, and the server's channel manager: batched claims, and idle claims or a watcher to settle the channels their consumers close |
 | `src/subbit.ts` | Subbit's datum, redeemers and IOU encoding |
 | `spike/` | the preprod runs (`run.ts`, `lifecycle.ts`, `refscript.ts`, `mint.ts`, `x402/e2e.ts`, `x402/sponsored.ts`, `x402/variant.ts`, `x402/fixed.ts`) |
