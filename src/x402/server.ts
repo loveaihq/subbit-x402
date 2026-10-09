@@ -71,6 +71,11 @@ export interface ServerChannel {
    * `channelRef` moved on is simply not found again. Absent in older records: `channelRef` serves.
    */
   anchorRef?: string;
+  /**
+   * Where this server's latest claim left the channel, until a read finds it deep enough to stay;
+   * a claim rolled back before then is found from `anchorRef`, and its charges are claimable again.
+   */
+  claimedRef?: string;
   balance: string;
   totalClaimed: string;
   withdrawRequestedAt: number;
@@ -178,7 +183,20 @@ export interface ServerConfig {
   referenceScript?: string;
   withdrawDelay?: number;
   storage?: ChannelStorage;
+  /**
+   * TTL: how long a channel's view, from a chain read or a `/verify`, serves for checking its
+   * vouchers locally; past it the next voucher goes to `/verify`, which finds a close. At most
+   * `clamp(withdrawDelay / 3, 30 s, 5 min)`; default `clamp(withdrawDelay / 15, 30 s, 5 min)`, 60 s
+   * at the 900 s minimum. A server that makes idle claims instead of watching keeps TTL + T within
+   * half the close period (`ChannelManager.idleClaims`), and a short TTL is the cheap side of that.
+   */
   onchainStateTtlMs?: number;
+  /**
+   * Called once when `/verify` finds a channel closed that the server held open: what it owes is
+   * to be settled now, e.g. `() => void idle.tick()` with the manager's idle claims. The server has
+   * already marked it, so its vouchers are refused from then on.
+   */
+  onChannelClosed?: (channelId: string) => void;
   /**
    * How long the answer to each channel's latest paid request is kept, for a retry of that very
    * voucher (a client whose response was lost); 0 keeps none. Default 10 minutes.
@@ -221,6 +239,8 @@ interface RequestContext {
   replay?: Replay;
   /** The deposit or refund uses the fee-sponsor offer, bound to this transaction. */
   sponsor?: { offer: FeeSponsorOffer; txHash: string; opening: boolean };
+  /** When the server handed this voucher to `/verify`: the view its answer gives is dated from then. */
+  askedAt?: number;
 }
 
 /** A channel's latest paid request: its voucher, the handler's response, and the settlement answered. */
@@ -250,7 +270,8 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   readonly schemeHooks: SchemeServerHooks;
   readonly withdrawDelay: number;
   readonly storage: ChannelStorage;
-  private readonly ttlMs: number;
+  /** TTL, in ms: see `ServerConfig.onchainStateTtlMs`. */
+  readonly ttlMs: number;
   /** When each channel was last re-read for a voucher above its recorded balance. */
   private readonly resyncedAt = new Map<string, number>();
   private readonly contexts = new WeakMap<object, RequestContext>();
@@ -270,13 +291,16 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
     this.withdrawDelay = config.withdrawDelay ?? MIN_WITHDRAW_DELAY;
     this.replayTtlMs = config.replayTtlMs ?? 10 * 60_000;
     this.storage = config.storage ?? new InMemoryChannelStorage();
-    this.ttlMs = config.onchainStateTtlMs ?? Math.min(300_000, Math.max(30_000, Math.floor((this.withdrawDelay * 1000) / 3)));
+    const maxTtl = clamp(Math.floor((this.withdrawDelay * 1000) / 3), 30_000, 300_000);
+    this.ttlMs = config.onchainStateTtlMs ?? clamp(Math.floor((this.withdrawDelay * 1000) / 15), 30_000, 300_000);
+    if (this.ttlMs > maxTtl) throw new Error(`onchainStateTtlMs ${this.ttlMs} is above ${maxTtl}, clamp(withdrawDelay / 3, 30 s, 5 min)`);
     this.schemeHooks = {
       onBeforeVerify: (ctx) => this.beforeVerify(ctx.paymentPayload, ctx.requirements),
       onAfterVerify: (ctx) => this.afterVerify(ctx.paymentPayload, ctx.requirements, ctx.result),
       onBeforeSettle: (ctx) => this.beforeSettle(ctx.paymentPayload, ctx.requirements),
       onAfterSettle: (ctx) => this.afterSettle(ctx.paymentPayload, ctx.requirements, ctx.result),
       onVerifyFailure: async (ctx) => {
+        if ((ctx.error as { invalidReason?: string } | undefined)?.invalidReason === Err.channelClosed) await this.noteClosed(ctx.paymentPayload);
         await this.clearPending(ctx.paymentPayload);
       },
       onSettleFailure: async (ctx) => {
@@ -356,6 +380,7 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
         this.merge(payload, { localVerify: true });
         return { skip: true as const, result };
       }
+      this.merge(payload, { askedAt: Date.now() });
     } catch {
       return { abort: true as const, reason: Err.verificationStateUnavailable, message: "channel state unavailable" };
     }
@@ -376,6 +401,7 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
   private async afterVerify(payload: Payload, req: PaymentRequirements, result: VerifyResponse) {
     const replay = this.contexts.get(payload)?.replay;
     if (replay) return { skipHandler: true as const, response: { contentType: replay.contentType, body: replay.body } };
+    if (!result.isValid && result.invalidReason === Err.channelClosed && !this.contexts.get(payload)?.localVerify) await this.noteClosed(payload);
     if (!result.isValid || !result.payer) return;
     const p = parseClientPayload(payload.payload);
     const ctx = this.contexts.get(payload);
@@ -409,8 +435,9 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
         chargedCumulativeAmount: base,
         signedMaxClaimable: p.voucher.maxClaimableAmount,
         signature: p.voucher.signature,
-        onchainSyncedAt: ctx.localVerify ? current?.onchainSyncedAt : now,
-        lastRequestTimestamp: now,
+        onchainSyncedAt: ctx.localVerify ? current?.onchainSyncedAt : (ctx.askedAt ?? now),
+        // Moves when a voucher is committed, not when one is only reserved: idle claims count from it.
+        lastRequestTimestamp: current?.lastRequestTimestamp ?? now,
         pendingRequest: { pendingId, signedMaxClaimable: p.voucher.maxClaimableAmount, expiresAt: now + clamp(req.maxTimeoutSeconds * 1000, MIN_PENDING_TTL_MS, MAX_PENDING_TTL_MS) },
       };
     });
@@ -839,6 +866,26 @@ export class BatchSettlementCardanoServer implements SchemeNetworkServer {
     if (now - (this.resyncedAt.get(ch.channelId) ?? 0) < RESYNC_MS) return false;
     this.resyncedAt.set(ch.channelId, now);
     return true;
+  }
+
+  /**
+   * `/verify` found the channel closed: the consumer has closed it on chain. From here its vouchers
+   * are refused, here for the next TTL and at `/verify` after that, and what it owes is settled now
+   * (`onChannelClosed`). Until a read gives the close's own value, `withdrawRequestedAt` holds when
+   * the server learnt of it; a `/verify` that finds the channel open again sets it back to 0.
+   */
+  private async noteClosed(payload: Payload) {
+    let channelId: string;
+    try {
+      channelId = parseClientPayload(payload.payload).voucher.channelId;
+    } catch {
+      return;
+    }
+    const askedAt = this.contexts.get(payload)?.askedAt ?? Date.now();
+    const upd = await this.storage.updateChannel(channelId, (cur) =>
+      cur && cur.withdrawRequestedAt === 0 && cur.channelRef !== "" ? { ...cur, withdrawRequestedAt: Math.floor(Date.now() / 1000), onchainSyncedAt: askedAt } : cur,
+    );
+    if (upd.status === "updated") this.config.onChannelClosed?.(channelId);
   }
 
   private fresh(ch: ServerChannel) {

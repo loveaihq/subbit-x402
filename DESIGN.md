@@ -231,7 +231,9 @@ Since done (RESULTS.md): token channels in step 5, the spec draft
 (`specs/scheme_batch_settlement_cardano.md`), top-ups and the automatic settle in step 6, token
 UTxO folding in step 7, recovery after state loss (IOU keys derived from the wallet) in step 8,
 the response kept for retries and provider-key delegation in step 9, Moneta's tUSDM in step 10,
-the watcher following the chain in step 11, and surviving rollbacks in step 12.
+the watcher following the chain in step 11, and surviving rollbacks in step 12. Step 19 drops the
+watcher as a requirement: idle claims, and `/verify` once the server's view is TTL old, find every
+close in time (spec v0.9).
 
 In step 13, through ada-agent-wallet's MCP demo, a paid MCP tool's result is kept for its retry
 as well, when `@x402/mcp` can give it back unchanged: one text block, or structured content with

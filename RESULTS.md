@@ -1543,8 +1543,92 @@ defaults, the two blueprints' hashes and bytes, the client's trust, `recover` an
 the manager at either, a close, exits, refunds, top-ups and claims at both builds (compiled too), the two batches
 above on both compiled blueprints, and a reference script of the wrong build.
 
+## Step 19: a server with no watcher
+
+On x402-foundation/x402#3579, Kammerlo asked whether the binding needs the server to watch its channels at all.
+He proposed two rules: verify vouchers locally only while the server's view of a channel is younger than a TTL,
+then send them to `/verify`, which finds a close; and claim every channel that goes quiet for T. Spec v0.9 takes
+them, and makes watching optional (*Claim and settlement strategy*): a close that lands at t is settled by
+t + L + TTL + T + C, which must stay below the close period, and the reference keeps TTL + T within half of
+it. In code: `ChannelManager.idleClaims` claims, and the server marks a channel that `/verify` finds closed and
+calls `onChannelClosed`, which has the idle claimer run a pass at once. `npm run x402 -- idle`, three runs,
+state in `out/x402-step19/`, `out/x402-step19b/` and `out/x402-step19c/`, 2026-10-09.
+
+**The settings**, all defaults at the 900 s close period: TTL 60 s (the server's default TTL is now
+`clamp(close period / 15, 30 s, 5 min)`, down from `/ 3`), T 390 s (half the close period less TTL), and a pass
+every 30 s. A channel is due once its last committed voucher is T − 30 s old, so the pass that claims it comes
+no later than T. A close's `elapse_at` is its validity's upper bound plus the close period; the client sets
+that bound 300 s ahead, so the column that matters is "inside close + 900 s", the worst case: a close whose
+bound is the slot it lands in.
+
+**Three channels** per run, at `6d877463…`, each opened by its first of six paid requests of 0.001 tADA.
+Account 0 pays; account 1 is the provider and signs its own claims:
+- **paying**: its consumer closes it, and a copy of its records from before the close goes on paying every
+  10 s, as a consumer that closes and keeps paying would.
+- **quiet**: its consumer closes it and pays nothing more.
+- **paused**: pays nothing more.
+
+| Run | Channel | Close | Claim | Step | Claimed | Claim sent after the last request | Settled after the close | Inside close + 900 s |
+|---|---|---|---|---|---:|---:|---:|---:|
+| 1 | paying | `91baef64…` | `bd5be181…` | `Settle` | 0.007000 | | 36 s | 864 s |
+| 1 | quiet | `be4e209e…` | `54a22c9d…` | `Settle` | 0.006000 | about 415 s (landed 436 s) | 333 s | 567 s |
+| 1 | paused | | `701e32ad…` | `Sub` | 0.006000 | about 380 s (landed 398 s) | | |
+| 2 | paying | `391b9a22…` | `5136ea3e…` | `Settle` | 0.006000 | | 35 s | 865 s |
+| 2 | quiet | `229129b1…` | `2ebe2c71…` | `Settle` | 0.006000 | about 415 s (landed 435 s) | 280 s | 620 s |
+| 2 | paused | | `81e28830…` | `Sub` | 0.006000 | about 390 s (landed 451 s) | | |
+| 3 | paying | `fe8e584d…` | `309c1b0a…` | `Settle` | 0.010000 | | 65 s | 835 s |
+| 3 | quiet | `50be0b49…` | `6e8eba99…` | `Settle` | 0.006000 | 369 s (landed 374 s) | 188 s | 712 s |
+| 3 | paused | | `814a1a18…` | `Sub` | 0.006000 | 376 s (landed 385 s) | | |
+
+Run 3 timed each claim as the facilitator received it. Runs 1 and 2 are estimated from the passes' times.
+
+- **A consumer that closes and goes on paying.** In run 3 the view the server had from the opening was about
+  25 s old when the close was in a block: the server took requests 7 to 10 locally, after the close, and sent
+  request 11, at 71 s, to `/verify`, which answered `channel_closed`. The server marked the channel and the
+  idle claimer settled it at once, the claim with the facilitator 6 s later: 10,000, the four vouchers taken
+  after the close redeemed with the rest. Run 1 took one voucher after the close (2 s after its block, the
+  view 58 s old). Run 2 took none: the view was already past TTL when the close landed. Each time the record
+  went once the settle was 3 blocks deep.
+- **A consumer that closes and goes quiet** is settled by its idle claim, which reads the channel and finds
+  it closed: 188 to 333 s after the close, 567 to 712 s inside the worst case.
+- **Lateness, found and fixed.** In runs 1 and 2 the quiet channel's claim went out about 25 s past T. The
+  pass before it was waiting for the paused channel's claim to confirm, 33 s in run 1 and 71 s in run 2 (a
+  58 s gap between blocks). Run 1 also dropped the timer tick that fell inside that pass. After run 1, a
+  timer tick during a pass ran one more pass as soon as it ended. That helped in run 2, but the pass still
+  waited for the block. After run 2, a pass only reads and starts its claims; they confirm on their own, and
+  a channel whose claim is still out is neither read nor claimed again. In run 3 every claim went out within
+  T. The safety margin held in all three runs.
+- **Exits.** The consumer ended each settled channel and refunded each paused one through x402: run 1
+  `f64ec28c…`, `7c478f45…`, `e1517a52…`; run 2 `6d89a52f…`, `b5c7e248…`, `056384d9…`; run 3 `9351ce67…`,
+  `69f04b0a…`, `72e08668…`. A paused channel's refund gave back 1.513895 tADA.
+- **Fees**: 11 transactions a run, 2.492862, 2.492863 and 2.492859 tADA. Claiming one channel cost
+  0.256907 to 0.258571, the same for a `Sub` and a `Settle`; a close 0.250191 to 0.250193, an end 0.231134,
+  a refund 0.232725, an opening 0.175005 to 0.176589. **Reconciled** to the lovelace each time: consumer
+  30.261761 → 28.520785 → 26.780807 → 25.038413, provider 9,960.531128 → 9,959.779242 → 9,959.026357 →
+  9,958.275892.
+
+**Chain-free tests**, 4 new, 120 in all:
+- The server: past TTL a voucher goes to `/verify`, and the view it gets is dated from the asking, not the
+  answer. A reservation does not move `lastRequestTimestamp`; a committed voucher does. `channel_closed`, as
+  a result or as a facilitator's `VerifyError`, marks the channel once and calls `onChannelClosed` once, and
+  the next voucher is refused locally. A TTL above `clamp(close period / 3, 30 s, 5 min)` is refused.
+- Idle claims: of six channels, one quiet and owing, one quiet but owing under the minimum, one owing
+  nothing, one busy, and two marked closed (one of them under the minimum), the first pass claims the quiet,
+  owing one and settles the two closed ones, in one transaction. A pass right after claims nothing. When
+  the chain loses that claim, the next pass finds each channel back at its anchor and claims all three
+  again. Once the second claim is 3 blocks deep, the open channel's anchor moves to it and the settled
+  channels' records go. TTL + T above half the close period, and a T no longer than the interval, are refused.
+- A claim waiting for its block holds back no later pass, and its channel is not claimed twice.
+- A pass that outlasts the interval is followed at once by the pass its timer tick asked for.
+- Each was checked against the code with one line broken: the view dated from the answer, closed channels
+  not due, `claimedRef` never cleared, a pass that waits for its claims, in-flight channels claimed again,
+  the dropped tick. Each break failed its test (the timing one in four runs out of four).
+
 ## What this does not show yet
 
+- Idle claims with the provider key delegated: step 19 ran with the server signing its own claims, and
+  the delegated case only in the chain-free tests. Nor a channel coming due while another's claim waits
+  for its block, on a chain: in step 19's third run the claims did not overlap.
 - Rollbacks deeper than the watcher's depth (3 blocks), and rollbacks on the client's side: a
   client whose own transaction is rolled back re-reads its channel from the last position it
   recorded, which may then be gone; its funds stay safe, and `recover` finds the channel again.
@@ -1718,6 +1802,9 @@ npm run fixed -- sweep-e2e
 npm run fixed -- fund && npm run fixed -- open                                         # (b): account 5, four channels
 npm run fixed -- batch                                                                 # evaluates at both builds, sends one batch, at 6d877463…
 npm run fixed -- refund && npm run fixed -- sweep && npm run fixed -- report
+
+# step 19: no watcher. Account 0 pays, account 1 provides; about 13 minutes a run.
+X402_OUT=x402-step19c npm run x402 -- idle && X402_OUT=x402-step19c npm run x402 -- report
 ```
 
 `npm run lifecycle -- <phase>` runs one phase at a time (`b-open`, `b-close`, `a-open`, `a-sub`,

@@ -11,6 +11,8 @@
 //   batch-refund  close the 10 batch channels with Mutual
 //   topup       a channel with room for 10 requests serves 15: a claim after the 5th, a top-up (Add) at the 11th
 //   autosettle  the consumer closes a channel alone; the server's watcher settles it; the consumer ends it
+//   idle        no watcher (step 19): idle claims and /verify find closes. One channel pauses, one
+//               closes and goes quiet, one closes and goes on paying from a copy of its records
 //   recover     after losing its records the client finds its channels again: one with a derived
 //               IOU key goes on serving; one with a random key can only be closed, settled and ended
 //   recover-elapse  both sides lose their records; the consumer closes and, ~20 min on, elapses
@@ -22,7 +24,7 @@
 //   wallets [label]  how each wallet's UTxOs are split, recorded under the label
 //   report      every transaction's fee, and the wallets reconciled
 //
-// Usage: npm run x402 -- <phase|all>   (`all` is step 4's sequence; topup and autosettle run on their own)
+// Usage: npm run x402 -- <phase|all>   (`all` is step 4's sequence; topup, autosettle and idle run on their own)
 // Env:   WALLET_MNEMONIC (preprod only), BLOCKFROST_PROJECT_ID; SUBBIT_CURRENCY=token prices the
 //        route in the sUSDM stand-in (`npm run mint -- mint`) instead of lovelace, state in out/x402-token-<hash>/;
 //        X402_OUT=<name> keeps a run's state in out/<name>/ instead; SPIKE_CONSUMER=<account> makes
@@ -31,7 +33,7 @@
 //        and step 4's, at 62ce4309…, in out/x402/.
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { rmSync, existsSync } from "node:fs";
+import { cpSync, rmSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { x402Facilitator } from "@x402/core/facilitator";
 import { HTTPFacilitatorClient, x402HTTPResourceServer, x402ResourceServer, type HTTPAdapter, type RoutesConfig } from "@x402/core/server";
@@ -90,6 +92,12 @@ interface Results {
   replay?: { channelId: string; lost: string; retried: string; httpCalls: number; chargedBefore: string; chargedAfter: string };
   scale?: { channels: number; pollPass: number; followSync: number; followIdle: number; closeSeen: number; closeSettled: number };
   autosettle?: { channelId: string; close: string; settle: string; end: string; closeToSettleSec: number; settleBeforeElapseSec: number; watchIntervalMs: number };
+  idle?: {
+    ttlMs: number;
+    idleMs: number;
+    intervalMs: number;
+    channels: Array<{ label: string; channelId: string; charged: string; afterClose?: number; close?: string; claim: string; step: "Sub" | "Settle"; lastPaidToSentSec?: number; lastPaidToClaimSec?: number; closeToSettleSec?: number; settleBeforeElapseSec?: number; marginToWorstCaseSec?: number; exit: string }>;
+  };
   checks?: Array<{ phase: string; what: string; outcome: string }>;
   /** Wallet housekeeping during the run (a `mint -- tidy`), so the report counts its fee. */
   other?: Array<{ what: string; transaction: string }>;
@@ -123,6 +131,8 @@ async function stack() {
 
   // Facilitator: no key of its own; it holds account 3's for the keyless server below.
   const delegateKeyHash = keyHashHex(await delegateWallet.address());
+  /** Told of each claim the facilitator is handed, before it is sent: when the claimer acted, apart from the block's wait. */
+  const claimHook: { fn?: (channelIds: string[]) => void } = {};
   const delegates = [{ wallet: delegateWallet, keyHash: delegateKeyHash, payTo, secret: DELEGATION_SECRET, ...(referenceScript ? { referenceScript } : {}) }];
   const facilitator = new x402Facilitator().register(NETWORK, new BatchSettlementCardanoFacilitator(chain, { scriptHash: SUBBIT_HASH, confirmationTimeoutMs: 120_000, delegates }));
   const facServer = await listen(FAC_PORT, async (req, res) => {
@@ -130,6 +140,8 @@ async function stack() {
     if (req.method === "GET" && url.pathname === "/supported") return json(res, 200, facilitator.getSupported());
     if (req.method === "POST" && (url.pathname === "/verify" || url.pathname === "/settle")) {
       const { paymentPayload, paymentRequirements } = JSON.parse((await body(req)) || "{}");
+      const claim = paymentPayload?.payload as { type?: string; claims?: { channelId: string }[] } | undefined;
+      if (url.pathname === "/settle" && claim?.type === "claim") claimHook.fn?.(claim.claims?.map((c) => c.channelId) ?? []);
       const out = url.pathname === "/verify" ? await facilitator.verify(paymentPayload, paymentRequirements) : await facilitator.settle(paymentPayload, paymentRequirements);
       if ((out as { isValid?: boolean; success?: boolean }).isValid === false || (out as { success?: boolean }).success === false) {
         log(`  facilitator ${url.pathname}: ${JSON.stringify(out).slice(0, 300)}`);
@@ -140,6 +152,7 @@ async function stack() {
   });
 
   // Resource server: the provider key signs refunds here; the manager redeems.
+  const closedHook: { fn?: (channelId: string) => void } = {};
   const facilitatorClient = new HTTPFacilitatorClient({ url: `http://127.0.0.1:${FAC_PORT}`, timeoutMs: 300_000 });
   const storage = new FileChannelStorage(dir("server"));
   const scheme = new BatchSettlementCardanoServer({
@@ -151,6 +164,7 @@ async function stack() {
     storage,
     signAsProvider: walletProviderSigner(provider),
     chain,
+    onChannelClosed: (id: string) => closedHook.fn?.(id),
     ...(TOKEN ? { assetDecimals: { [ASSET]: token!.decimals } } : {}),
   });
   const resource = new x402ResourceServer(facilitatorClient).register(NETWORK, scheme);
@@ -211,6 +225,9 @@ async function stack() {
   return {
     payTo,
     storage,
+    server: scheme,
+    closedHook,
+    claimHook,
     manager,
     facilitator,
     delegated: { storage: dStorage, manager: dManager, keyHash: delegateKeyHash },
@@ -513,7 +530,7 @@ async function phaseAutoSettle(s: Stack) {
         log(`autosettle: watcher: ${e.channelId.slice(0, 16)}… needs nothing more from the server; record dropped`);
         if (e.channelId === channelId) got.goneAt ??= Date.now();
       } else if (e.kind === "reopened") log(`autosettle: watcher: ${e.channelId.slice(0, 16)}… is open again (its close rolled back)`);
-      else log(`autosettle: watcher: a pass failed, the next one retries: ${String((e.error as Error)?.message ?? e.error).slice(0, 240)}`);
+      else if (e.kind === "error") log(`autosettle: watcher: a pass failed, the next one retries: ${String((e.error as Error)?.message ?? e.error).slice(0, 240)}`);
     },
   });
   let close: string;
@@ -553,6 +570,156 @@ async function phaseAutoSettle(s: Stack) {
     r.autosettle = { channelId, close, settle, end, closeToSettleSec, settleBeforeElapseSec, watchIntervalMs: intervalMs };
   });
   log(`autosettle: the consumer ended ${channelId.slice(0, 16)}… in ${end}: ${ada(view.amount)} ${unitName}${TOKEN ? ` and ${ada(view.lovelace)} tADA` : ""} back`);
+}
+
+// ---- step 19: idle claims instead of a watcher --------------------------------------------
+
+/**
+ * No watcher (spec v0.9, *Claim and settlement strategy*): the manager makes idle claims, with the
+ * defaults at the 900 s close period (TTL 60 s, T 390 s, a pass every 30 s), and a voucher past
+ * TTL goes to /verify, whose `channel_closed` has the server settle at once. Three channels of six
+ * requests each:
+ *   paused  nothing more: an idle claim takes it with Sub, T after its last request
+ *   paying  its consumer closes it, and a copy of its records taken before the close goes on paying
+ *           every 10 s: the server takes those vouchers while its view is under TTL old, then
+ *           /verify finds the close and the server settles everything charged, those included
+ *   quiet   its consumer closes it and pays nothing more: the idle claim finds it closed and
+ *           settles it
+ * Then the consumer ends the two settled channels and refunds the paused one.
+ */
+async function phaseIdle(s: Stack) {
+  const before = await walletsAda();
+  record((r) => (r.before ??= before));
+  const ttlMs = s.server.ttlMs;
+  const intervalMs = 30_000;
+  const idleMs = 450_000 - ttlMs; // idleClaims' default: half the close period less TTL
+  const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+  type Row = ClaimResult["channels"][number];
+  const claimed = new Map<string, { tx: string; row: Row }>();
+  const gone = new Set<string>();
+  const idle = s.manager.idleClaims({
+    withdrawDelay: 900,
+    ttlMs,
+    intervalMs,
+    onEvent: (e) => {
+      if (e.kind === "claimed") {
+        for (const x of e.results) {
+          log(`idle: claim ${x.transaction}: ${x.channels.map((c) => `${c.channelId.slice(0, 16)}… ${ada(c.taken)} ${unitName}`).join(", ")}`);
+          for (const c of x.channels) if (!claimed.has(c.channelId)) claimed.set(c.channelId, { tx: x.transaction, row: c });
+        }
+      } else if (e.kind === "gone") {
+        gone.add(e.channelId);
+        log(`idle: ${e.channelId.slice(0, 16)}… settled deep enough; record dropped`);
+      } else if (e.kind === "closed") log(`idle: ${e.channelId.slice(0, 16)}… read closed, elapse_at ${iso(e.elapseAt)}`);
+      else if (e.kind === "reopened") log(`idle: ${e.channelId.slice(0, 16)}… is open again (its close rolled back)`);
+      else if (e.kind === "error") log(`idle: a claim failed, the next pass retries: ${String((e.error as Error)?.message ?? e.error).slice(0, 240)}`);
+    },
+  });
+  const sentAt = new Map<string, number>();
+  s.claimHook.fn = (ids) => {
+    for (const id of ids) if (!sentAt.has(id)) sentAt.set(id, Date.now());
+  };
+  s.closedHook.fn = (id) => {
+    log(`idle: /verify found ${id.slice(0, 16)}… closed; settling it now`);
+    void idle.tick();
+  };
+  log(`idle: no watcher; TTL ${ttlMs / 1000} s, T ${idleMs / 1000} s, a pass every ${intervalMs / 1000} s: TTL + T is ${(ttlMs + idleMs) / 1000} s of the 900 s close period`);
+  const lastPaid = new Map<string, number>();
+  const open = async (label: string) => {
+    const p = payer(`idle-${label}`, 20n * PRICE);
+    let channelId = "";
+    for (let i = 1; i <= 6; i++) {
+      const settle = await paid(p);
+      channelId = (settle.extra?.channelState as { channelId: string }).channelId;
+      if (i === 1) {
+        record((r) => (r.deposits ??= []).push({ channelId, transaction: settle.transaction }));
+        log(`idle: ${label}: request 1 opened ${channelId.slice(0, 16)}… in ${settle.transaction}`);
+      }
+    }
+    lastPaid.set(channelId, Date.now());
+    log(`idle: ${label}: 6 requests paid, ${ada(6n * PRICE)} ${unitName}`);
+    return { label, p, channelId };
+  };
+  const closes = new Map<string, { tx: string; elapseAt: bigint }>();
+  const close = async (c: { label: string; p: ReturnType<typeof payer>; channelId: string }) => {
+    const { transaction, elapseAt } = await c.p.scheme.close(c.channelId);
+    closes.set(c.channelId, { tx: transaction, elapseAt });
+    record((r) => (r.exits ??= []).push({ what: "close", channelId: c.channelId, transaction }));
+    log(`idle: ${c.label}: its consumer closed ${c.channelId.slice(0, 16)}… in ${transaction}, elapse_at ${iso(elapseAt)}`);
+  };
+  let afterClose = 0;
+  type Ch = Awaited<ReturnType<typeof open>>;
+  let copy!: ReturnType<typeof payer>;
+  let paused!: Ch, quiet!: Ch, paying!: Ch;
+  try {
+    paused = await open("paused");
+    quiet = await open("quiet");
+    paying = await open("paying");
+    // What a consumer that closes and goes on paying holds: its records from before the close.
+    cpSync(dir("idle-paying"), dir("idle-paying-copy"), { recursive: true });
+    copy = payer("idle-paying-copy", 20n * PRICE);
+    await close(paying);
+    for (let i = 0; i < 14; i++) {
+      try {
+        await paid(copy);
+        afterClose++;
+        lastPaid.set(paying.channelId, Date.now());
+        log(`idle: paying: request ${6 + afterClose} served after the close`);
+      } catch (e) {
+        log(`idle: paying: refused after ${afterClose} more: ${(e as Error).message.slice(0, 200)}`);
+        break;
+      }
+      await sleep(10_000);
+    }
+    await close(quiet);
+    const all = [paused, quiet, paying];
+    const deadline = Date.now() + 20 * 60_000;
+    while (Date.now() < deadline && !(all.every((c) => claimed.has(c.channelId)) && gone.has(quiet.channelId) && gone.has(paying.channelId))) await sleep(5_000);
+    if (!all.every((c) => claimed.has(c.channelId))) throw new Error(`not all claimed within 20 minutes: ${all.filter((c) => !claimed.has(c.channelId)).map((c) => c.label).join(", ")}`);
+  } finally {
+    idle.stop();
+    s.closedHook.fn = undefined;
+    s.claimHook.fn = undefined;
+  }
+  if (!gone.has(quiet.channelId) || !gone.has(paying.channelId)) log("idle: a settled channel's record is still there (not deep yet when the run stopped)");
+  const out: NonNullable<Results["idle"]>["channels"] = [];
+  for (const c of [paused, paying, quiet]) {
+    const { tx, row } = claimed.get(c.channelId)!;
+    const holder = c === paying ? copy : c.p;
+    const charged = BigInt((await holder.storage.get(c.channelId))!.chargedCumulativeAmount);
+    expectEq(`${c.label}: the claim took everything charged${c === paying ? ", the vouchers after the close included" : ""}`, row.taken, charged);
+    const { view } = await c.p.scheme.openView(c.channelId);
+    const step = view.datum.stage.kind === "settled" ? ("Settle" as const) : ("Sub" as const);
+    expectEq(`${c.label}: claimed with`, step, c === paused ? "Sub" : "Settle");
+    const ct = Number((await bf(`/txs/${tx}`)).block_time);
+    record((r) => (r.claims ??= []).push({ phase: `idle ${c.label}`, n: 1, transaction: tx }));
+    const entry: (typeof out)[number] = { label: c.label, channelId: c.channelId, charged: charged.toString(), claim: tx, step, exit: "" };
+    entry.lastPaidToSentSec = Math.round((sentAt.get(c.channelId)! - lastPaid.get(c.channelId)!) / 1000);
+    if (c !== paying) entry.lastPaidToClaimSec = ct - Math.floor(lastPaid.get(c.channelId)! / 1000);
+    if (c === paying) entry.afterClose = afterClose;
+    const cl = closes.get(c.channelId);
+    if (cl) {
+      const closeBt = Number((await bf(`/txs/${cl.tx}`)).block_time);
+      entry.close = cl.tx;
+      entry.closeToSettleSec = ct - closeBt;
+      entry.settleBeforeElapseSec = Number(cl.elapseAt / 1000n) - ct;
+      entry.marginToWorstCaseSec = closeBt + 900 - ct;
+      log(`idle: ${c.label}: settled ${entry.closeToSettleSec} s after the close, ${entry.settleBeforeElapseSec} s before elapse_at, ${entry.marginToWorstCaseSec} s inside the worst case (close + 900 s)`);
+    } else log(`idle: ${c.label}: claim sent ${entry.lastPaidToSentSec} s after its last request, landed ${entry.lastPaidToClaimSec} s after it`);
+    if (cl) log(`idle: ${c.label}: claim sent ${entry.lastPaidToSentSec} s after its last request`);
+    if (step === "Settle") {
+      entry.exit = await c.p.scheme.end(c.channelId);
+      record((r) => (r.exits ??= []).push({ what: "end", channelId: c.channelId, transaction: entry.exit }));
+      log(`idle: ${c.label}: the consumer ended it in ${entry.exit}`);
+    } else {
+      const settle = await c.p.scheme.refund(URL_DATA, fetch, c.channelId);
+      entry.exit = settle.transaction;
+      record((r) => (r.refunds ??= []).push({ channelId: c.channelId, transaction: settle.transaction }));
+      log(`idle: ${c.label}: refunded in ${settle.transaction}, ${ada(BigInt(settle.amount || "0"))} ${unitName} back`);
+    }
+    out.push(entry);
+  }
+  record((r) => (r.idle = { ttlMs, idleMs, intervalMs, channels: out }));
 }
 
 async function phaseWallets(label: string) {
@@ -1026,6 +1193,7 @@ async function main() {
     if (phase === "recover-elapse") await phaseRecoverElapse(s);
     if (phase === "topup") await phaseTopUp(s);
     if (phase === "autosettle") await phaseAutoSettle(s);
+    if (phase === "idle") await phaseIdle(s);
     if (phase === "report" || phase === "all") await phaseReport();
   } finally {
     await s.close();

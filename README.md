@@ -24,8 +24,8 @@ fixed one), which is why their hashes and fees differ a little from what the def
 
 | Path | What |
 |---|---|
-| [`specs/scheme_batch_settlement_cardano.md`](specs/scheme_batch_settlement_cardano.md) | the binding, in x402's spec format (draft v0.6) |
-| `src/x402/` | client, resource-server and facilitator schemes for `@x402/core` 2.27, and the server's channel manager: batched claims, a watcher that settles channels their consumers close |
+| [`specs/scheme_batch_settlement_cardano.md`](specs/scheme_batch_settlement_cardano.md) | the binding, in x402's spec format (draft v0.9) |
+| `src/x402/` | client, resource-server and facilitator schemes for `@x402/core` 2.27, and the server's channel manager: batched claims, and idle claims or a watcher to settle the channels their consumers close |
 | `src/subbit.ts` | Subbit's datum, redeemers and IOU encoding |
 | `spike/` | the preprod runs (`run.ts`, `lifecycle.ts`, `refscript.ts`, `mint.ts`, `x402/e2e.ts`, `x402/sponsored.ts`, `x402/variant.ts`, `x402/fixed.ts`) |
 | [`RESULTS.md`](RESULTS.md) | every run, every transaction hash, and each run's reconciliation of the wallets |
@@ -54,6 +54,7 @@ fixed one), which is why their hashes and fees differ a little from what the def
 | 14 | Buyer and seller through Koios, with no Blockfrost key |
 | 16 | Seller-sponsored channels: a buyer holding only tUSDM opens, tops up and is refunded without ADA of its own ([SPONSORSHIP.md](SPONSORSHIP.md)). From 0.2.1 the buyer checks the seller's offer against the chain before building with it; upgrade from 0.2.0 |
 | 18 | Subbit's fixed validator (`6d877463…`): the x402 flow on it, open, paid requests, claim and refund, and the batch of two signers that `62ce4309…` refuses and it takes, on the chain |
+| 19 | A server with no watcher: idle claims, and `/verify` once its view is TTL old, settle every channel its consumer closes in time (spec v0.9) |
 
 Each run's wallets reconcile to the lovelace against the fees of its transactions.
 
@@ -99,7 +100,7 @@ Subbit's validator is here in two builds, besides this repository's variant of i
 
 ```
 npm install
-npm test            # 116 chain-free tests; 9 of them run the compiled validators and need aiken on the PATH
+npm test            # 118 chain-free tests; 9 of them run the compiled validators and need aiken on the PATH
 npm run typecheck
 npm run validator   # the validator's Aiken tests; needs aiken 1.1.23 or later
 ```
@@ -116,7 +117,11 @@ voucher and deposit through its spend policy. The chain is read through `Blockfr
 (`chain`), with a Blockfrost key, or `KoiosChain` (`koios`), which needs none. A server sponsors
 token channels for buyers that hold no ADA by passing `sponsor: { pool: new SponsorPool({ wallet }) }`,
 with a wallet at a key of its own, not the provider key (`sponsor`, SPONSORSHIP.md); its
-facilitator must be this one, or another that merges `sponsorWitnesses`.
+facilitator must be this one, or another that merges `sponsorWitnesses`. A server settles the
+channels its consumers close either with `manager.watch()`, which reads the chain all along, or,
+without a watcher, with `manager.idleClaims({ withdrawDelay: server.withdrawDelay, ttlMs: server.ttlMs })`,
+which claims every channel that goes quiet; give the server `onChannelClosed: () => void idle.tick()`
+so that a close `/verify` finds is settled at once (spec, *Claim and settlement strategy*).
 
 The preprod runs take `WALLET_MNEMONIC`, a preprod test wallet (these used the public
 all-`abandon` test mnemonic, accounts 0 to 3 and, in step 16, 8 and 9, which anyone can spend from: keep nothing of value

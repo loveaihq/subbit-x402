@@ -649,6 +649,233 @@ test("watcher: it reads the chain at the validator its manager is given, the fix
   }
 });
 
+test("server: past TTL a voucher goes to /verify, its view dated from the asking; channel_closed marks the channel once and asks for its settle", async () => {
+  const closedCalls: string[] = [];
+  const storage = new InMemoryChannelStorage();
+  const server = new BatchSettlementCardanoServer({ payTo: PAY_TO, receiverAuthorizer: PROVIDER, scriptHash: SUBBIT_HASH, storage, chain: {} as never, onChannelClosed: (id) => closedCalls.push(id) });
+  // clamp(900 s / 15, 30 s, 5 min); at most clamp(900 s / 3, 30 s, 5 min).
+  assert.equal(server.ttlMs, 60_000);
+  assert.throws(() => new BatchSettlementCardanoServer({ payTo: PAY_TO, receiverAuthorizer: PROVIDER, scriptHash: SUBBIT_HASH, chain: {} as never, onchainStateTtlMs: 300_001 }), /above 300000/);
+  const req = await server.enhancePaymentRequirements(baseReq, { x402Version: 2, scheme: "batch-settlement", network: "cardano:preprod" }, []);
+  const ref = `${"cd".repeat(32)}#0`;
+  const stale = () => Date.now() - 61_000;
+  await storage.updateChannel(TAG, () => ({ channelId: TAG, channelConfig: config, channelRef: ref, balance: "1000000", totalClaimed: "0", withdrawRequestedAt: 0, chargedCumulativeAmount: "0", signedMaxClaimable: "0", signature: "00".repeat(64), onchainSyncedAt: stale(), lastRequestTimestamp: 1 }));
+  const h = server.schemeHooks;
+  const ask = async (amount: bigint) => {
+    const paymentPayload = payloadFor(req, voucher(amount));
+    assert.equal(await h.onBeforeVerify!({ paymentPayload, requirements: req, declaredExtensions: {} } as never), undefined, "to the facilitator");
+    return paymentPayload;
+  };
+  const p1 = await ask(1000n);
+  await new Promise((r) => setTimeout(r, 25));
+  const answeredAt = Date.now();
+  const open = { isValid: true, payer: config.payer, extra: { channelId: TAG, channelRef: ref, balance: "1000000", totalClaimed: "0", withdrawRequestedAt: 0 } };
+  assert.equal(await h.onAfterVerify!({ paymentPayload: p1, requirements: req, declaredExtensions: {}, result: open } as never), undefined);
+  const reserved = (await storage.get(TAG))!;
+  assert.ok(reserved.onchainSyncedAt! < answeredAt, "the view is as old as the asking, not the answer");
+  assert.equal(reserved.lastRequestTimestamp, 1, "a reservation is not a committed voucher");
+  await h.onBeforeSettle!({ paymentPayload: p1, requirements: req, declaredExtensions: {}, phase: "after-handler" } as never);
+  assert.ok((await storage.get(TAG))!.lastRequestTimestamp >= answeredAt);
+
+  // Stale again; the facilitator finds the channel closed.
+  await storage.updateChannel(TAG, (c) => ({ ...c!, onchainSyncedAt: stale() }));
+  const p2 = await ask(2000n);
+  const closed = { isValid: false, invalidReason: Err.channelClosed, payer: config.payer };
+  assert.equal(await h.onAfterVerify!({ paymentPayload: p2, requirements: req, declaredExtensions: {}, result: closed } as never), undefined);
+  assert.deepEqual(closedCalls, [TAG]);
+  assert.ok((await storage.get(TAG))!.withdrawRequestedAt > 0);
+  // Its vouchers are refused here now, and that refusal asks for nothing more.
+  const p3 = payloadFor(req, voucher(2000n));
+  const local = (await h.onBeforeVerify!({ paymentPayload: p3, requirements: req, declaredExtensions: {} } as never)) as { skip: true; result: { isValid: boolean; invalidReason: string } };
+  assert.equal(local.result.invalidReason, Err.channelClosed);
+  assert.equal(await h.onAfterVerify!({ paymentPayload: p3, requirements: req, declaredExtensions: {}, result: local.result } as never), undefined);
+  assert.deepEqual(closedCalls, [TAG]);
+
+  // Over HTTP a facilitator's refusal arrives as a VerifyError instead: the same.
+  await storage.updateChannel(TAG, (c) => ({ ...c!, withdrawRequestedAt: 0, onchainSyncedAt: stale() }));
+  const p4 = await ask(2000n);
+  await h.onVerifyFailure!({ paymentPayload: p4, requirements: req, declaredExtensions: {}, error: Object.assign(new Error("channel_closed"), { invalidReason: Err.channelClosed }) } as never);
+  assert.deepEqual(closedCalls, [TAG, TAG]);
+});
+
+test("idle claims: a channel quiet for nearly T is claimed, one known closed is settled whatever it owes, and a claim the chain loses is made again", async () => {
+  const storage = new InMemoryChannelStorage();
+  const [A, B, C, D, E, F] = ["a1", "b2", "c3", "d4", "e5", "f6"].map((x) => x.repeat(32)) as [string, string, string, string, string, string];
+  const start = (id: string) => `${"0" + id[1]}`.repeat(32) + "#0";
+  // The chain: each channel's current position and stage, and each transaction's height.
+  type OnChain = { ref: string; stage: Stage };
+  const onChain = new Map<string, OnChain>();
+  const heights = new Map<string, number>();
+  let tip = 100;
+  const elapseAt = 1_790_000_000_000n;
+  for (const id of [A, B, C, D, E, F]) {
+    onChain.set(id, { ref: start(id), stage: id === D || id === F ? { kind: "closed", subbed: 0n, elapseAt } : { kind: "opened", subbed: 0n } });
+    heights.set(start(id).split("#")[0]!, 50);
+  }
+  const original = new Map(onChain);
+  const chain = {
+    tipHeight: async () => tip,
+    txHeight: async (hash: string) => heights.get(hash),
+    followChannel: async (_ref: string, _s: string, tag: string) => {
+      const s = onChain.get(tag);
+      return s && ({ ref: s.ref, datum: { constants: constantsOf(config, tag), stage: s.stage } } as unknown as ChannelView);
+    },
+    exitOf: async () => undefined,
+    paidTo: async () => new Map([["lovelace", 10n ** 15n]]),
+  } as unknown as Chain;
+  // A facilitator holding the provider key: each claim moves its channels on, Sub or Settle.
+  const claims: string[][] = [];
+  const facilitator = {
+    settle: async (payload: PaymentPayload) => {
+      const p = payload.payload as { claims: { channelId: string; totalClaimed: string }[] };
+      claims.push(p.claims.map((c) => c.channelId));
+      const tx = (claims.length + 0x10).toString(16).repeat(32);
+      heights.set(tx, tip);
+      p.claims.forEach((c, i) => {
+        const s = onChain.get(c.channelId)!;
+        onChain.set(c.channelId, { ref: `${tx}#${i}`, stage: s.stage.kind === "closed" ? { kind: "settled" } : { kind: "opened", subbed: BigInt(c.totalClaimed) } });
+      });
+      return { success: true, transaction: tx, network: "cardano:preprod" };
+    },
+  };
+  const quiet = Date.now() - 10 * 60_000;
+  const now = Date.now();
+  const rec = (id: string, charged: string, last: number, withdrawRequestedAt = 0) => ({ channelId: id, channelConfig: config, channelRef: start(id), balance: "20000", totalClaimed: "0", withdrawRequestedAt, chargedCumulativeAmount: charged, signedMaxClaimable: charged, signature: "00".repeat(64), onchainSyncedAt: now, lastRequestTimestamp: last });
+  await storage.updateChannel(A, () => rec(A, "3000", quiet)); // quiet, owes 3,000: claimed
+  await storage.updateChannel(B, () => rec(B, "3000", now)); // busy: not yet
+  await storage.updateChannel(C, () => rec(C, "500", quiet)); // quiet, owes under the minimum: left
+  await storage.updateChannel(D, () => rec(D, "2000", now, 1_789_999_100)); // marked closed by /verify: settled
+  await storage.updateChannel(E, () => rec(E, "0", quiet)); // owes nothing
+  await storage.updateChannel(F, () => rec(F, "500", now, 1_789_999_100)); // closed, owing under the minimum: settled all the same
+  const manager = new ChannelManager({ storage, providerKeyHash: PROVIDER, delegationSecret: "s", chain, facilitator: facilitator as never, network: "cardano:preprod", payTo: PAY_TO, scriptHash: SUBBIT_HASH });
+  assert.throws(() => manager.idleClaims({ withdrawDelay: 900, ttlMs: 300_000, idleMs: 200_000 }), /more than half/);
+  assert.throws(() => manager.idleClaims({ withdrawDelay: 900, ttlMs: 60_000, idleMs: 20_000 }), /longer than/);
+  const events: WatchEvent[] = [];
+  const idle = manager.idleClaims({ withdrawDelay: 900, ttlMs: 60_000, minOwed: 1000n, intervalMs: 60_000, onEvent: (e) => events.push(e) });
+  try {
+    await idle.tick();
+    assert.deepEqual(claims, [[A, D, F]]);
+    const a = (await storage.get(A))!;
+    assert.equal(a.totalClaimed, "3000");
+    assert.equal(a.anchorRef, start(A));
+    assert.equal(a.claimedRef, onChain.get(A)!.ref);
+    // Nothing is owed now: a pass claims nothing, and the claims are not deep yet.
+    await idle.tick();
+    assert.equal(claims.length, 1);
+    assert.ok(await storage.get(D));
+
+    // The chain loses that claim: A owes again, D and F are closed again, owing.
+    for (const id of [A, D, F]) onChain.set(id, original.get(id)!);
+    heights.delete(a.claimedRef!.split("#")[0]!);
+    await idle.tick();
+    assert.deepEqual(claims, [[A, D, F], [A, D, F]]);
+
+    // Deep: A's anchor moves to where the claim left it; D's and F's records go.
+    tip += 10;
+    await idle.tick();
+    assert.equal(claims.length, 2);
+    const a2 = (await storage.get(A))!;
+    assert.equal(a2.anchorRef, onChain.get(A)!.ref);
+    assert.equal(a2.claimedRef, undefined);
+    assert.equal(await storage.get(D), undefined);
+    assert.equal(await storage.get(F), undefined);
+    assert.deepEqual((await storage.list()).map((c) => c.channelId), [A, B, C, E]);
+    assert.deepEqual(events.filter((e) => e.kind !== "claimed").map((e) => e.kind), ["gone", "gone"]);
+  } finally {
+    idle.stop();
+  }
+});
+
+test("idle claims: a pass that outlasts the interval is followed at once by the pass its timer tick asked for", async () => {
+  const storage = new InMemoryChannelStorage();
+  const A = "a1".repeat(32);
+  await storage.updateChannel(A, () => ({ channelId: A, channelConfig: config, channelRef: `${"0a".repeat(32)}#0`, claimedRef: `${"0a".repeat(32)}#0`, balance: "20000", totalClaimed: "0", withdrawRequestedAt: 0, chargedCumulativeAmount: "0", signedMaxClaimable: "0", signature: "00".repeat(64), onchainSyncedAt: Date.now(), lastRequestTimestamp: Date.now() }));
+  // Each pass reads the tip first, and that read takes 1.5 intervals: the next timer tick is ~100 ms after it ends.
+  const starts: number[] = [];
+  const ends: number[] = [];
+  const chain = {
+    tipHeight: async () => {
+      starts.push(Date.now());
+      await new Promise((r) => setTimeout(r, 300));
+      ends.push(Date.now());
+      return 100;
+    },
+    // The claim stays one block deep, so every pass follows the channel.
+    txHeight: async () => 99,
+    followChannel: async (ref: string, _s: string, tag: string) => ({ ref, datum: { constants: constantsOf(config, tag), stage: { kind: "opened", subbed: 0n } } }) as unknown as ChannelView,
+  } as unknown as Chain;
+  const manager = new ChannelManager({ storage, providerKeyHash: PROVIDER, chain, facilitator: {} as never, network: "cardano:preprod", payTo: PAY_TO, scriptHash: SUBBIT_HASH });
+  const idle = manager.idleClaims({ withdrawDelay: 900, ttlMs: 60_000, idleMs: 300_000, intervalMs: 200 });
+  const deadline = Date.now() + 10_000;
+  try {
+    while (starts.length < 3 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+  } finally {
+    idle.stop();
+  }
+  // Without the follow-up, the second pass would wait for the first timer tick after the first ended.
+  assert.ok(starts[1]! - ends[0]! < 50, `second pass began ${starts[1]! - ends[0]!} ms after the first ended`);
+  assert.ok(starts[2]! - ends[1]! < 50, `third pass began ${starts[2]! - ends[1]!} ms after the second ended`);
+});
+
+test("idle claims: a claim waiting for its block holds back no later pass, and is not made twice", async () => {
+  const storage = new InMemoryChannelStorage();
+  const [A, B] = ["a1", "b2"].map((x) => x.repeat(32)) as [string, string];
+  const onChain = new Map<string, { ref: string; subbed: bigint }>([
+    [A, { ref: `${"0a".repeat(32)}#0`, subbed: 0n }],
+    [B, { ref: `${"0b".repeat(32)}#0`, subbed: 0n }],
+  ]);
+  const chain = {
+    tipHeight: async () => 100,
+    txHeight: async () => 99,
+    followChannel: async (_ref: string, _s: string, tag: string) => {
+      const s = onChain.get(tag)!;
+      return { ref: s.ref, datum: { constants: constantsOf(config, tag), stage: { kind: "opened", subbed: s.subbed } } } as unknown as ChannelView;
+    },
+    exitOf: async () => undefined,
+    paidTo: async () => new Map([["lovelace", 10n ** 15n]]),
+  } as unknown as Chain;
+  // The first claim waits for a block until `release`; the others land at once.
+  const claims: string[][] = [];
+  let release!: () => void;
+  const block = new Promise<void>((r) => (release = r));
+  const facilitator = {
+    settle: async (payload: PaymentPayload) => {
+      const p = payload.payload as { claims: { channelId: string; totalClaimed: string }[] };
+      claims.push(p.claims.map((c) => c.channelId));
+      if (claims.length === 1) await block;
+      const tx = (claims.length + 0x10).toString(16).repeat(32);
+      p.claims.forEach((c, i) => onChain.set(c.channelId, { ref: `${tx}#${i}`, subbed: BigInt(c.totalClaimed) }));
+      return { success: true, transaction: tx, network: "cardano:preprod" };
+    },
+  };
+  const rec = (id: string, last: number) => ({ channelId: id, channelConfig: config, channelRef: onChain.get(id)!.ref, balance: "20000", totalClaimed: "0", withdrawRequestedAt: 0, chargedCumulativeAmount: "3000", signedMaxClaimable: "3000", signature: "00".repeat(64), onchainSyncedAt: Date.now(), lastRequestTimestamp: last });
+  await storage.updateChannel(A, () => rec(A, Date.now() - 10 * 60_000));
+  await storage.updateChannel(B, () => rec(B, Date.now()));
+  const manager = new ChannelManager({ storage, providerKeyHash: PROVIDER, delegationSecret: "s", chain, facilitator: facilitator as never, network: "cardano:preprod", payTo: PAY_TO, scriptHash: SUBBIT_HASH });
+  const idle = manager.idleClaims({ withdrawDelay: 900, ttlMs: 60_000, intervalMs: 60_000 });
+  const until = async (f: () => boolean) => {
+    const deadline = Date.now() + 5_000;
+    while (!f() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(f());
+  };
+  try {
+    await until(() => claims.length === 1); // A's claim is out, waiting for its block
+    await storage.updateChannel(B, (c) => ({ ...c!, lastRequestTimestamp: Date.now() - 10 * 60_000 }));
+    const t = idle.tick();
+    await until(() => claims.length === 2);
+    assert.deepEqual(claims, [[A], [B]], "B is claimed while A's claim waits, and A is not claimed again");
+    release();
+    await t;
+    assert.equal((await storage.get(A))!.totalClaimed, "3000");
+    assert.equal((await storage.get(B))!.totalClaimed, "3000");
+    await idle.tick();
+    assert.equal(claims.length, 2);
+  } finally {
+    release();
+    idle.stop();
+  }
+});
+
 test("server: one request per channel at a time", async () => {
   const { server, req } = await serverWithChannel();
   const h = server.schemeHooks;
